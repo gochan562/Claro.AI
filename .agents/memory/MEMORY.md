@@ -1,0 +1,1 @@
+- [Hugging Face loader boundary](hf-loader-boundary.md) — keep model loading runtime-architecture-driven and task templates independent.

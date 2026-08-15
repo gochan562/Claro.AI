@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Claro.AI – Sign Up</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', sans-serif;
+      background: radial-gradient(circle at 20% 30%, #0a0f2e, #050813 90%);
+      color: #d6e0f0;
+      overflow: hidden;
+      height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+
+    .background-blobs::before,
+    .background-blobs::after {
+      content: "";
+      position: absolute;
+      width: 300px;
+      height: 300px;
+      background: #476eff;
+      border-radius: 50%;
+      filter: blur(120px);
+      opacity: 0.25;
+      animation: float 10s infinite ease-in-out;
+    }
+
+    .background-blobs::after {
+      background: #32b263;
+      right: -100px;
+      top: 60%;
+    }
+
+    .background-blobs::before {
+      top: -100px;
+      left: -100px;
+    }
+
+    @keyframes float {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(20px); }
+    }
+
+    .signup-container {
+      position: relative;
+      background: rgba(14, 21, 39, 0.8);
+      padding: 40px;
+      border-radius: 18px;
+      backdrop-filter: blur(16px);
+      box-shadow: 0 12px 40px rgba(30, 60, 120, 0.4), 0 0 24px rgba(80, 140, 255, 0.1);
+      max-width: 420px;
+      width: 90%;
+      text-align: center;
+      animation: fadeIn 1s ease;
+      z-index: 1;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(30px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .signup-container h2 {
+      margin-bottom: 20px;
+      font-size: 28px;
+      color: #a4c3ff;
+      text-shadow: 0 0 6px #2a60c4aa;
+    }
+
+    .signup-container input {
+      width: 100%;
+      padding: 14px 16px;
+      margin: 10px 0;
+      border-radius: 12px;
+      border: 1px solid #3b4f77;
+      background: #0a101e;
+      color: #d6e0f0;
+      font-size: 15px;
+      transition: 0.2s ease;
+    }
+
+    .signup-container input:focus {
+      border-color: #4780ff;
+      outline: none;
+      box-shadow: 0 0 6px #3054d0aa;
+    }
+
+    .signup-container input::placeholder {
+      color: #7f92ac;
+    }
+
+    .signup-container button.signup {
+      width: 100%;
+      padding: 14px;
+      margin-top: 20px;
+      border: none;
+      border-radius: 12px;
+      background-color: #32b263;
+      color: white;
+      font-size: 16px;
+      cursor: pointer;
+      transition: 0.3s ease;
+      box-shadow: 0 0 12px #3ae67d66;
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { box-shadow: 0 0 12px #3ae67d66; }
+      50% { box-shadow: 0 0 18px #3ae67d88; }
+    }
+
+    .signup-container button.signup:hover {
+      background-color: #3ddc84;
+    }
+
+    .footer-text {
+      margin-top: 18px;
+      font-size: 13px;
+      color: #8ea3c1;
+    }
+
+    .footer-text a {
+      color: #a4c3ff;
+      text-decoration: none;
+    }
+
+    .footer-text a:hover {
+      text-decoration: underline;
+    }
+
+    .social-login {
+      margin-top: 30px;
+    }
+
+    .or {
+      margin-bottom: 12px;
+      font-size: 13px;
+      color: #7f92ac;
+    }
+
+    .social-buttons {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .social-buttons button {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 12px;
+      border-radius: 12px;
+      font-size: 14px;
+      border: none;
+      cursor: pointer;
+      transition: 0.2s ease;
+      background-color: #121b30;
+      color: #cbd8f0;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+    }
+
+    .social-buttons button:hover {
+      background-color: #1c2a48;
+    }
+
+    .social-buttons img {
+      width: 18px;
+      height: 18px;
+    }
+  </style>
+</head>
+<body>
+  <div class="background-blobs"></div>
+
+  <div class="signup-container">
+    <h2>Sign Up for Claro.AI</h2>
+    <input type="text" placeholder="👤 Username" id="username" required />
+    <input type="email" placeholder="📧 Email" id="email" required />
+    <input type="password" placeholder="🔑 Password" id="password" required />
+    <button class="signup">✅ Create Account</button>
+
+    <div class="social-login">
+      <p class="or">or</p>
+      <div class="social-buttons">
+        <button id="google-login">
+          <img src="https://www.seekpng.com/png/full/788-7887426_google-g-png-google-logo-white-png.png" alt="Google" />
+          Sign up with Google
+        </button>
+        <button id="github-login">
+          <img src="https://freepnglogo.com/images/all_img/github-mark-white-logo-b1c0.png" alt="GitHub" />
+          Sign up with GitHub
+        </button>
+      </div>
+    </div>
+
+    <div class="footer-text">
+      Already have an account? <a href="Login.html">Log in</a>
+    </div>
+  </div>
+
+  <!-- Firebase Auth Logic -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.1/firebase-app.js";
+    import { 
+      getAuth, 
+      createUserWithEmailAndPassword, 
+      signInWithPopup, 
+      GoogleAuthProvider, 
+      GithubAuthProvider, 
+      updateProfile 
+    } from "https://www.gstatic.com/firebasejs/10.12.1/firebase-auth.js";
+
+    const firebaseConfig = {
+      apiKey: "AIzaSyAMmOvrrnqs2zV9N_92TuvmGwkkIBgFWsE",
+      authDomain: "claro-ai-signup.firebaseapp.com",
+      projectId: "claro-ai-signup",
+      storageBucket: "claro-ai-signup.appspot.com",
+      messagingSenderId: "879903723540",
+      appId: "1:879903723540:web:d7f90ec1c91e0ec27bd701",
+      measurementId: "G-BXBJ7DX842"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+
+    document.querySelector(".signup").addEventListener("click", () => {
+      const username = document.getElementById("username").value.trim();
+      const email = document.getElementById("email").value.trim();
+      const password = document.getElementById("password").value;
+
+      if (!username || !email || !password) {
+        alert("⚠️ Fill in all fields!");
+        return;
+      }
+
+      if (!email.includes("@")) {
+        alert("⚠️ Invalid email format.");
+        return;
+      }
+
+      if (password.length < 6) {
+        alert("⚠️ Password should be at least 6 characters.");
+        return;
+      }
+
+      createUserWithEmailAndPassword(auth, email, password)
+        .then((userCredential) => {
+          const user = userCredential.user;
+          return updateProfile(user, { displayName: username });
+        })
+        .then(() => {
+          alert("✅ Account created!");
+          window.location.href = "Login.html";
+        })
+        .catch((error) => {
+          if (error.code === "auth/email-already-in-use") {
+            alert("⚠️ This email already exists. Try logging in.");
+          } else {
+            alert("⚠️ Error: " + error.message);
+          }
+        });
+    });
+
+    document.getElementById("google-login").addEventListener("click", () => {
+      const provider = new GoogleAuthProvider();
+      signInWithPopup(auth, provider)
+        .then(() => {
+          alert("✅ Signed in with Google!");
+          window.location.href = "Login.html";
+        })
+        .catch((error) => {
+          alert("⚠️ Google sign-in failed: " + error.message);
+          console.error(error);
+        });
+    });
+
+    document.getElementById("github-login").addEventListener("click", () => {
+      const provider = new GithubAuthProvider();
+      signInWithPopup(auth, provider)
+        .then(() => {
+          alert("✅ Signed in with GitHub!");
+          window.location.href = "Login.html";
+        })
+        .catch((error) => {
+          alert("⚠️ GitHub sign-in failed: " + error.message);
+          console.error(error);
+        });
+    });
+  </script>
+</body>
+</html>

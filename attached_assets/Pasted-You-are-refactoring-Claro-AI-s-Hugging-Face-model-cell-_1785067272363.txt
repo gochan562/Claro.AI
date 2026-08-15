@@ -1,0 +1,219 @@
+You are refactoring Claro.AI's Hugging Face model cell system.
+This is NOT a bug fix. This is an architectural redesign.
+The current implementation chooses the Hugging Face AutoModel... class based on the selected task (Text Generation, Question Answering, Translation, etc.).
+This approach is fundamentally incorrect because many Hugging Face models can perform the same task while requiring completely different loading classes.
+Examples:
+Question Answering + Llama-3 → AutoModelForCausalLM
+Question Answering + Gemma → AutoModelForCausalLM
+Question Answering + Qwen → AutoModelForCausalLM
+Question Answering + MSA-4B → AutoModelForCausalLM
+Question Answering + T5 → AutoModelForSeq2SeqLM
+Question Answering + BERT-SQuAD → AutoModelForQuestionAnswering
+The task is the same, but the loader is different.
+Goal
+Completely separate
+Task
+Model Architecture
+The selected task should ONLY decide:
+which inference template is generated
+which example code is generated
+notebook cell contents
+The selected task must NEVER decide which Hugging Face AutoModel class is imported.
+Remove the current architecture
+Delete every dependency on
+HF_AUTO_CLASS
+or any equivalent static mapping from
+task
+↓
+
+AutoModelForXXX
+The loader must never depend on the task.
+New architecture
+Create two independent systems.
+1. Task Templates
+Create one template for each task.
+Examples:
+Text Generation
+Translation
+Summarization
+Question Answering
+Token Classification
+Text Classification
+Image Classification
+Object Detection
+Image Segmentation
+Image to Text
+Text to Image
+Speech Recognition
+Audio Classification
+Depth Estimation
+Zero Shot Classification
+Fill Mask
+Sentence Similarity
+These templates should ONLY contain inference logic.
+Example:
+Question Answering template:
+question = ...
+context = ...
+
+...
+
+answer = ...
+NOT
+AutoModelForQuestionAnswering
+2. Model Loader
+Create a completely separate loader generator.
+This loader is responsible for
+imports
+processor
+tokenizer
+model class
+trust_remote_code
+dtype
+device
+The loader should be generated independently of the task.
+Auto Detect Hugging Face Architecture
+When the user selects a model ID,
+always inspect
+AutoConfig.from_pretrained(...)
+or the Hugging Face model metadata.
+Use
+config.model_type
+config.architectures
+config.is_encoder_decoder
+processor availability
+image/audio/text pipeline information
+to determine the correct loading class.
+Never guess from the selected task.
+Automatically choose the correct model class
+Support at least
+Decoder-only LLM
+Examples
+llama
+qwen
+mistral
+gemma
+phi
+falcon
+deepseek
+baichuan
+internlm
+glm
+msa
+yi
+exaone
+granite
+↓
+AutoModelForCausalLM
+Encoder-Decoder
+Examples
+T5
+mT5
+FLAN
+BART
+Pegasus
+Marian
+M2M100
+NLLB
+↓
+AutoModelForSeq2SeqLM
+Extractive QA
+Examples
+bert squad
+roberta squad
+deberta squad
+↓
+AutoModelForQuestionAnswering
+Sequence Classification
+↓
+AutoModelForSequenceClassification
+Token Classification
+↓
+AutoModelForTokenClassification
+Masked Language Model
+↓
+AutoModelForMaskedLM
+Image Classification
+↓
+AutoModelForImageClassification
+Semantic Segmentation
+↓
+AutoModelForSemanticSegmentation
+Object Detection
+↓
+AutoModelForObjectDetection
+Vision Language Generation
+↓
+AutoModelForVision2Seq
+Speech Recognition
+Whisper
+↓
+AutoModelForSpeechSeq2Seq
+Wav2Vec2
+↓
+AutoModelForCTC
+Audio Classification
+↓
+AutoModelForAudioClassification
+Depth Estimation
+↓
+AutoModelForDepthEstimation
+Automatically choose the correct processor
+Text
+↓
+AutoTokenizer
+Image
+↓
+AutoImageProcessor
+Vision-Language
+↓
+AutoProcessor
+Audio
+↓
+AutoProcessor
+Legacy audio models
+↓
+AutoFeatureExtractor
+trust_remote_code
+Automatically determine whether
+trust_remote_code=True
+is required.
+Do not always enable it.
+Do not always disable it.
+Device
+Generate
+device_map="auto"
+and
+torch_dtype=torch.float16
+only when appropriate.
+Use CPU-safe defaults if GPU is unavailable.
+Validation
+If the user selects
+Question Answering
+and enters
+meta-llama/Llama-3-8B-Instruct
+The generated notebook must use
+AutoModelForCausalLM
+NOT
+AutoModelForQuestionAnswering
+If the user selects
+Question Answering
+and enters
+google/flan-t5-large
+Use
+AutoModelForSeq2SeqLM
+If the user selects
+Question Answering
+and enters
+deepset/roberta-base-squad2
+Use
+AutoModelForQuestionAnswering
+The inference code should still be the Question Answering template in all three cases.
+Only the loader changes.
+Code Quality Requirements
+Do not hardcode model names except where required for architecture detection.
+Do not duplicate template code.
+Separate templates from loader generation.
+Make the design modular and easy to extend with future Hugging Face architectures.
+Preserve all existing Claro.AI functionality and UI.
+Refactor existing code instead of adding another layer of conditional logic on top of the current implementation.

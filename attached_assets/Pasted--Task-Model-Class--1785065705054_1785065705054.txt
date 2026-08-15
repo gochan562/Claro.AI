@@ -1,0 +1,20 @@
+| Task                         | Model Class                                                               | Processor                                 |
+| ---------------------------- | ------------------------------------------------------------------------- | ----------------------------------------- |
+| **Text Generation**          | `AutoModelForCausalLM`                                                    | `AutoTokenizer`                           |
+| **Text-to-Text**             | `AutoModelForSeq2SeqLM`                                                   | `AutoTokenizer`                           |
+| **Text Classification**      | `AutoModelForSequenceClassification`                                      | `AutoTokenizer`                           |
+| **Token Classification**     | `AutoModelForTokenClassification`                                         | `AutoTokenizer`                           |
+| **Question Answering**       | `AutoModelForQuestionAnswering`                                           | `AutoTokenizer`                           |
+| **Summarization**            | `AutoModelForSeq2SeqLM`                                                   | `AutoTokenizer`                           |
+| **Translation**              | `AutoModelForSeq2SeqLM`                                                   | `AutoTokenizer`                           |
+| **Fill Mask**                | `AutoModelForMaskedLM`                                                    | `AutoTokenizer`                           |
+| **Sentence Similarity**      | `AutoModel`                                                               | `AutoTokenizer`                           |
+| **Image Classification**     | `AutoModelForImageClassification`                                         | `AutoImageProcessor`                      |
+| **Image Segmentation**       | `AutoModelForSemanticSegmentation`                                        | `AutoImageProcessor`                      |
+| **Object Detection**         | `AutoModelForObjectDetection`                                             | `AutoImageProcessor`                      |
+| **Image to Text**            | `AutoModelForVision2Seq`                                                  | `AutoProcessor`                           |
+| **Text to Image**            | `AutoPipelineForText2Image` *(Diffusers)*                                 | —                                         |
+| **Speech Recognition**       | `AutoModelForSpeechSeq2Seq` *(Whisper)* or `AutoModelForCTC` *(Wav2Vec2)* | `AutoProcessor`                           |
+| **Audio Classification**     | `AutoModelForAudioClassification`                                         | `AutoFeatureExtractor` or `AutoProcessor` |
+| **Depth Estimation**         | `AutoModelForDepthEstimation`                                             | `AutoImageProcessor`                      |
+| **Zero-Shot Classification** | `AutoModelForSequenceClassification`                                      | `AutoTokenizer`                           |

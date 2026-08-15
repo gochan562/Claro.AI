@@ -1,0 +1,67 @@
+entrypoint = "index.html"
+modules = ["web", "python-3.11", "nodejs-20"]
+
+[nix]
+channel = "stable-24_11"
+packages = ["static-web-server"]
+
+[deployment]
+publicDir = "/"
+deploymentTarget = "static"
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Serve static"
+mode = "parallel"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = """
+echo \"Serving HTML, open the Preview to see your output.
+To see changes you make, you can hit the refresh button in the preview, you do \u001B[1mnot\u001B[0m have to stop and run again.
+Console logs are available in the Preview devtools or your browser devtools.\" && static-web-server -w ./.config/static-web-server.toml > /dev/null 2>&1
+"""
+waitForPort = 80
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "web-server"
+
+[[workflows.workflow]]
+name = "web-server"
+author = "agent"
+
+[workflows.workflow.metadata]
+outputType = "webview"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "node server.js"
+waitForPort = 5000
+
+[[ports]]
+localPort = 80
+externalPort = 8080
+
+[[ports]]
+localPort = 5000
+externalPort = 80
+
+[agent]
+expertMode = true
+
+[userenv]
+
+[userenv.shared]
+MODAL_URL = "https://gochan562--student-hf-trainer-start-training.modal.run/"
+MODAL_AUTH_SECRET = "Abdbh'&'82egh)(h490698NNdjbd)0-!2224csl;:"
+HUGGINGFACE_TOKEN = "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"
+MODAL_RUN_URL = "https://gochan562--student-hf-trainer-run-code.modal.run/"
+MODAL_STREAM_URL = "https://gochan562--student-hf-trainer-run-code-stream.modal.run/"

@@ -60,8 +60,3 @@ expertMode = true
 [userenv]
 
 [userenv.shared]
-MODAL_URL = "https://gochan562--student-hf-trainer-start-training.modal.run/"
-MODAL_AUTH_SECRET = "Abdbh'&'82egh)(h490698NNdjbd)0-!2224csl;:"
-HUGGINGFACE_TOKEN = "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"
-MODAL_RUN_URL = "https://gochan562--student-hf-trainer-run-code.modal.run/"
-MODAL_STREAM_URL = "https://gochan562--student-hf-trainer-run-code-stream.modal.run/"

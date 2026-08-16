@@ -22,11 +22,16 @@ def _loader_cell(model_id: str) -> str:
 
         MODEL_ID = {model_id!r}
         # Stable exports shared with the inference cell.  Keep these defined
-        # even when a repo uses a different modality.
+        # even when a repo uses a different modality.  `preprocessor` is the
+        # single canonical handle inference templates use; it is set to the
+        # active tokenizer/processor/feature_extractor (or None) below so
+        # templates never have to guess which one exists.
         model = None
         tokenizer = None
         processor = None
         feature_extractor = None
+        preprocessor = None
+        loaded_class = None
 
         DEVICE = torch.device(
             "cuda" if torch.cuda.is_available()
@@ -177,6 +182,7 @@ def _loader_cell(model_id: str) -> str:
             tokenizer = None
             processor = None
             feature_extractor = None
+            preprocessor = None
             loaded_class = "DiffusionPipeline"
         else:
             mapped_class = _auto_class_from_map()
@@ -267,6 +273,11 @@ def _loader_cell(model_id: str) -> str:
                 tokenizer = AutoTokenizer.from_pretrained(
                     MODEL_ID, trust_remote_code=trust_remote_code
                 )
+
+            # Single canonical handle the inference templates rely on.  The
+            # logic above already decided the modality; templates must never
+            # re-guess between tokenizer / processor / feature_extractor.
+            preprocessor = tokenizer or processor or feature_extractor
 
         print(f"Loaded {{loaded_class}} from {{MODEL_ID}} on {{DEVICE}} (dtype={{DTYPE}})")
         '''

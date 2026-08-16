@@ -20,7 +20,7 @@ def _is_extractive(m):
     return any(s in type(m).__name__ for s in ("QuestionAnswering",))
 
 # ---- Preprocessor handle (some models expose `processor`, others `tokenizer`)
-preprocessor = globals().get("processor") or tokenizer
+preprocessor = processor if processor is not None else tokenizer
 
 # ---- Branch 1: extractive QA head (start/end logits) ---------------------
 if _is_extractive(model):
@@ -59,7 +59,7 @@ TEXT_GEN_TEMPLATE = dedent('''
 """Task: Text generation. Assumes `model` and `tokenizer`/`processor` loaded."""
 import torch
 prompt = "Once upon a time"
-preprocessor = globals().get("processor") or tokenizer
+preprocessor = tokenizer
 inputs = preprocessor(prompt, return_tensors="pt").to(model.device)
 out = model.generate(**inputs, max_new_tokens=128, do_sample=True, temperature=0.7,
                      pad_token_id=getattr(preprocessor, "eos_token_id", None))
@@ -111,7 +111,7 @@ def render_template(task: str, **substitutions) -> str:
     The model loader already selected the model interface and preprocessor.
     """
     import torch
-    preprocessor = globals().get("processor") or globals().get("tokenizer")
+    preprocessor = processor if processor is not None else tokenizer
     if preprocessor is None:
         raise RuntimeError("This task needs a processor or tokenizer from Cell 1.")
     inputs = preprocessor("Hello, world!", return_tensors="pt").to(model.device)

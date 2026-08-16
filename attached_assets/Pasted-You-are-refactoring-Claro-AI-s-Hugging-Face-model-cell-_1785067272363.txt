@@ -184,7 +184,7 @@ Device
 Generate
 device_map="auto"
 and
-torch_dtype=torch.float16
+dtype=torch.float16
 only when appropriate.
 Use CPU-safe defaults if GPU is unavailable.
 Validation

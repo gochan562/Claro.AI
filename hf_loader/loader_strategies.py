@@ -38,7 +38,7 @@ class DiffusersStrategy(LoaderStrategy):
             preprocessor_classes=[],
             trust_remote_code=False,
             extra_imports=["from diffusers import DiffusionPipeline"],
-            loader_call=f"DiffusionPipeline.from_pretrained('{ctx.model_id}', torch_dtype=torch.float16)",
+            loader_call=f"DiffusionPipeline.from_pretrained('{ctx.model_id}', dtype=torch.float16)",
             preprocessor_call="",
             model_var="pipe",
             preprocessor_var="",

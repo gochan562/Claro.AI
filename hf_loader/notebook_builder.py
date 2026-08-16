@@ -21,6 +21,13 @@ def _loader_cell(model_id: str) -> str:
         from transformers import AutoConfig
 
         MODEL_ID = {model_id!r}
+        # Stable exports shared with the inference cell.  Keep these defined
+        # even when a repo uses a different modality.
+        model = None
+        tokenizer = None
+        processor = None
+        feature_extractor = None
+
         DEVICE = torch.device(
             "cuda" if torch.cuda.is_available()
             else "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
@@ -163,7 +170,7 @@ def _loader_cell(model_id: str) -> str:
         if _diffusers_repo:
             from diffusers import DiffusionPipeline
 
-            pipe_kwargs = {{"torch_dtype": DTYPE}} if DEVICE.type == "cuda" else {{}}
+            pipe_kwargs = {{"dtype": DTYPE}} if DEVICE.type == "cuda" else {{}}
             pipe = DiffusionPipeline.from_pretrained(MODEL_ID, **pipe_kwargs)
             pipe = pipe.to(DEVICE)
             model = None
@@ -215,7 +222,7 @@ def _loader_cell(model_id: str) -> str:
 
             model_kwargs = {{"trust_remote_code": trust_remote_code}}
             if DEVICE.type == "cuda":
-                model_kwargs.update(torch_dtype=DTYPE, device_map=DEVICE_MAP)
+                model_kwargs.update(dtype=DTYPE, device_map=DEVICE_MAP)
             model = ModelClass.from_pretrained(MODEL_ID, **model_kwargs)
             if DEVICE_MAP is None:
                 model = model.to(DEVICE)

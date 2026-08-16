@@ -1861,8 +1861,23 @@
       
       const cell = notebook.cells.find(c => c.id === cellId);
       if (!cell) return;
+      if (cell.status === 'running') return;
+
+      // Modal starts a fresh Python namespace for each request.  When an
+      // inference cell belongs to a model cell, execute the linked loader and
+      // inference together so loader exports remain available without
+      // downloading the model twice.
+      const loaderCell = cell.modelInfo?.role === 'inference'
+        ? notebook.cells.find(c =>
+            c.id === cell.modelInfo.loaderCellId && c.type === 'model'
+          )
+        : null;
+      const executionCode = loaderCell
+        ? `${loaderCell.content}\n\n${cell.content}`
+        : cell.content;
 
       const cellElement = document.getElementById(`cell-${cellId}`);
+      if (!cellElement) return;
       cellElement.classList.add('running');
       cell.status = 'running';
 
@@ -1907,7 +1922,7 @@
           cellElement.appendChild(interimDiv);
 
           try {
-            const result = await streamCellToTerminal(cell.content);
+            const result = await streamCellToTerminal(executionCode);
             output   = result.text || (result.ok ? '✅ Executed successfully (no output)' : 'No output captured.');
             hasError = !result.ok;
             cell.outputFormat = result.ok ? 'text' : 'error';
@@ -1956,8 +1971,33 @@
       const notebook = getActiveNotebook();
       if (!notebook) return;
       
-      for (const cell of notebook.cells) {
+      const executed = new Set();
+      for (const cell of [...notebook.cells]) {
+        if (executed.has(cell.id)) continue;
+
+        // A model cell and its linked inference cell form one notebook run.
+        // Skip the standalone model execution and let runCell(inference)
+        // execute both cells once in the same Python namespace.
+        if (cell.type === 'model') {
+          const inferenceId = cell.modelInfo?.inferenceCellId;
+          const inferenceCell = inferenceId
+            ? notebook.cells.find(c => c.id === inferenceId)
+            : null;
+          if (
+            inferenceCell &&
+            inferenceCell.modelInfo?.role === 'inference' &&
+            inferenceCell.modelInfo.loaderCellId === cell.id
+          ) {
+            await runCell(inferenceCell.id);
+            executed.add(cell.id);
+            executed.add(inferenceCell.id);
+            await new Promise(resolve => setTimeout(resolve, 100));
+            continue;
+          }
+        }
+
         await runCell(cell.id);
+        executed.add(cell.id);
         await new Promise(resolve => setTimeout(resolve, 100));
       }
     }
@@ -2653,6 +2693,10 @@ from transformers import AutoConfig
 MODEL_ID = ${JSON.stringify(modelId)}
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE = torch.float16 if DEVICE.type == "cuda" else torch.float32
+model = None
+tokenizer = None
+processor = None
+feature_extractor = None
 
 def has_diffusers_model_index():
     try:
@@ -2686,7 +2730,7 @@ processor = None
 feature_extractor = None
 if has_diffusers_model_index():
     from diffusers import DiffusionPipeline
-    pipe_kwargs = {"torch_dtype": DTYPE} if DEVICE.type == "cuda" else {}
+    pipe_kwargs = {"dtype": DTYPE} if DEVICE.type == "cuda" else {}
     pipe = DiffusionPipeline.from_pretrained(MODEL_ID, **pipe_kwargs).to(DEVICE)
     model = None
     loaded_class = "DiffusionPipeline"
@@ -2717,7 +2761,7 @@ else:
     ModelClass = getattr(transformers, model_class_name)
     model_kwargs = {"trust_remote_code": trust_remote_code}
     if DEVICE.type == "cuda":
-        model_kwargs.update(torch_dtype=DTYPE, device_map="auto")
+        model_kwargs.update(dtype=DTYPE, device_map="auto")
     model = ModelClass.from_pretrained(MODEL_ID, **model_kwargs)
     if DEVICE.type != "cuda":
         model = model.to(DEVICE)

@@ -72,9 +72,15 @@ def _loader_cell(model_id: str) -> str:
             if _config_requires_remote_code or not auto_map:
                 return _config_requires_remote_code
             transformers = importlib.import_module("transformers")
+            selected_key = next(
+                (key for key in auto_map if key.startswith("AutoModelFor")),
+                None,
+            )
             mapped_targets = []
             for key, target in auto_map.items():
-                if key.startswith("AutoModel"):
+                if key.startswith("AutoModel") and (
+                    selected_key is None or key == selected_key
+                ):
                     mapped_targets.extend(
                         target if isinstance(target, (list, tuple)) else [target]
                     )

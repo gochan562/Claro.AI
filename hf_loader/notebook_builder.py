@@ -49,33 +49,63 @@ def _loader_cell(model_id: str) -> str:
             except Exception:
                 return False
 
+        def _list_gguf_files():
+            # Detect GGUF purely from repo file contents (extension), never from
+            # the model family.  Returns the list of *.gguf files (case-insensitive).
+            try:
+                from huggingface_hub import HfApi
+                files = HfApi().list_repo_files(MODEL_ID)
+                return [f for f in files if f.lower().endswith(".gguf")]
+            except Exception:
+                return []
+
         _diffusers_repo = False
+        _gguf_repo = False
+        _gguf_files = _list_gguf_files()
         _config_requires_remote_code = False
 
-        # AutoConfig is the source of truth.  The order below is intentional:
-        # auto_map -> architectures -> model_type -> encoder/decoder structure.
-        try:
-            config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=False)
-        except Exception:
+        # Format detection runs BEFORE AutoConfig because GGUF repos do not
+        # carry a Transformers config and crash there with "Unrecognized model".
+        #   Diffusers -> model_index.json   (handled in the except below)
+        #   GGUF      -> any *.gguf file     (guarded here, never calls AutoConfig)
+        #   Transformers -> AutoConfig architecture resolver (unchanged)
+        if _gguf_files:
+            _gguf_repo = True
+            config = type(
+                "_GgufConfig",
+                (),
+                {{
+                    "auto_map": {{}},
+                    "architectures": [],
+                    "model_type": "gguf",
+                    "is_encoder_decoder": False,
+                }},
+            )()
+        else:
+            # AutoConfig is the source of truth.  The order below is intentional:
+            # auto_map -> architectures -> model_type -> encoder/decoder structure.
             try:
-                config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
-                _config_requires_remote_code = True
+                config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=False)
             except Exception:
-                # Pure Diffusers repos may not have a Transformers config at all.
-                # Check model_index.json only after AutoConfig has failed.
-                if not _has_diffusers_model_index():
-                    raise
-                _diffusers_repo = True
-                config = type(
-                    "_DiffusersConfig",
-                    (),
-                    {{
-                        "auto_map": {{}},
-                        "architectures": [],
-                        "model_type": "",
-                        "is_encoder_decoder": False,
-                    }},
-                )()
+                try:
+                    config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
+                    _config_requires_remote_code = True
+                except Exception:
+                    # Pure Diffusers repos may not have a Transformers config at all.
+                    # Check model_index.json only after AutoConfig has failed.
+                    if not _has_diffusers_model_index():
+                        raise
+                    _diffusers_repo = True
+                    config = type(
+                        "_DiffusersConfig",
+                        (),
+                        {{
+                            "auto_map": {{}},
+                            "architectures": [],
+                            "model_type": "",
+                            "is_encoder_decoder": False,
+                        }},
+                    )()
         auto_map = getattr(config, "auto_map", None) or {{}}
         architectures = list(getattr(config, "architectures", None) or [])
         model_type = str(getattr(config, "model_type", "") or "").lower()
@@ -169,10 +199,149 @@ def _loader_cell(model_id: str) -> str:
                 "vision-encoder-decoder": "AutoModelForVision2Seq",
             }}.get(model_type)
 
-        # Diffusers repos do not have a Transformers AutoModel.  Detection is
-        # repo-based rather than task-based, so text-to-image and future
-        # Diffusers tasks use the same loader cell.
-        if _diffusers_repo:
+        # Format dispatch.  GGUF is detected from repo file contents and never
+        # run through Transformers.  Diffusers detection is repo-based.  All
+        # other repos fall through to the unchanged Transformers resolver.
+        if _gguf_repo:
+            import os
+            from llama_cpp import Llama
+
+            def _pick_gguf(files):
+                # Prefer a repo-declared default, then common *quantization*
+                # conventions (file-format metadata, not model names).  If none
+                # match, return None so the caller forces the user to choose.
+                order = (
+                    "default", "Q4_K_M", "q4_k_m", "Q5_K_M", "q5_k_m",
+                    "Q4_K_S", "q4_k_s", "Q8_0", "q8_0", "Q6_K", "q6_k",
+                    "Q4_0", "q4_0", "F16", "f16", "BF16", "bf16",
+                )
+                for tag in order:
+                    for f in files:
+                        if tag.lower() in f.lower():
+                            return f
+                if len(files) == 1:
+                    return files[0]
+                return None
+
+            _gguf_files = sorted(_gguf_files, key=str.lower)
+            GGUF_FILE = os.environ.get("CLARO_GGUF_FILE", "").strip() or None
+            if GGUF_FILE is None:
+                GGUF_FILE = _pick_gguf(_gguf_files)
+            if GGUF_FILE is None:
+                raise RuntimeError(
+                    f"Multiple GGUF files found in {{MODEL_ID}}. Set the "
+                    f"CLARO_GGUF_FILE env var to one of: "
+                    + ", ".join(_gguf_files)
+                )
+            print(f"GGUF files available for {{MODEL_ID}}:")
+            for f in _gguf_files:
+                print(f"  {{'*' if f == GGUF_FILE else ' '}} {{f}}")
+            print(f"Using: {{GGUF_FILE}}  (override with env CLARO_GGUF_FILE)")
+
+            n_ctx = int(os.environ.get("CLARO_GGUF_NCTX", "4096"))
+            _llm_kwargs = {{"n_ctx": n_ctx}}
+            if DEVICE.type != "cpu":
+                _llm_kwargs["n_gpu_layers"] = int(
+                    os.environ.get("CLARO_GGUF_NGPULAYERS", "-1")
+                )
+
+            try:
+                _llm = Llama.from_pretrained(MODEL_ID, filename=GGUF_FILE, **_llm_kwargs)
+            except Exception:
+                # Older llama-cpp-python builds need a local path.
+                from huggingface_hub import hf_hub_download
+                _path = hf_hub_download(MODEL_ID, GGUF_FILE)
+                _llm = Llama(_path, **_llm_kwargs)
+
+            def _to_id_list(x):
+                if hasattr(x, "tolist"):
+                    return x.tolist()
+                return list(x)
+
+            class _GgufPreprocessor:
+                # Exposes the same surface the inference templates rely on:
+                # __call__(prompt, return_tensors=...) -> {{input_ids, ...}}
+                # plus .decode / .eos_token_id.
+                def __init__(self, llm):
+                    self._llm = llm
+
+                @property
+                def eos_token_id(self):
+                    try:
+                        return self._llm.token_eos()
+                    except Exception:
+                        return None
+
+                def __call__(self, prompt, return_tensors=None, **kw):
+                    if not isinstance(prompt, str):
+                        raise TypeError(
+                            "GGUF preprocessor expects a str prompt; "
+                            "batch/multimodal inputs are not supported."
+                        )
+                    ids = self._llm.tokenize(
+                        prompt.encode("utf-8"), add_bos=True, special=True
+                    )
+                    t = torch.tensor([ids], dtype=torch.long)
+                    return {{"input_ids": t, "attention_mask": torch.ones_like(t)}}
+
+                def decode(self, token_ids, skip_special_tokens=True):
+                    flat = _to_id_list(token_ids)
+                    if flat and isinstance(flat[0], list):
+                        flat = flat[0]
+                    return self._llm.detokenize(flat).decode("utf-8", errors="ignore")
+
+            class _GgufModel:
+                # Wraps llama-cpp-python so the existing text-generation
+                # template (model.generate(**inputs) + preprocessor.decode)
+                # works unchanged.  GGUF is not assumed to be Llama-based;
+                # llama.cpp reads the architecture from the GGUF metadata.
+                def __init__(self, llm):
+                    self._llm = llm
+                    self.device = torch.device("cpu")
+                    self.config = type(
+                        "_GgufCfg",
+                        (),
+                        {{"is_encoder_decoder": False, "model_type": "gguf"}},
+                    )()
+
+                def eval(self):
+                    return self
+
+                def to(self, *a, **k):
+                    return self
+
+                def generate(self, input_ids=None, attention_mask=None,
+                             max_new_tokens=128, do_sample=False,
+                             temperature=0.7, top_p=0.9, top_k=50,
+                             repetition_penalty=1.1, pad_token_id=None, **kw):
+                    ids = _to_id_list(input_ids)[0]
+                    prompt = self._llm.detokenize(ids).decode("utf-8", errors="ignore")
+                    args = {{"max_tokens": int(max_new_tokens)}}
+                    if do_sample:
+                        if temperature is not None:
+                            args["temperature"] = float(temperature)
+                        if top_p is not None:
+                            args["top_p"] = float(top_p)
+                        if top_k is not None and int(top_k) > 0:
+                            args["top_k"] = int(top_k)
+                        if repetition_penalty and float(repetition_penalty) != 1.0:
+                            args["repeat_penalty"] = float(repetition_penalty)
+                    resp = self._llm.create_completion(prompt, **args)
+                    new_text = resp["choices"][0]["text"]
+                    new_ids = self._llm.tokenize(
+                        new_text.encode("utf-8"), add_bos=False, special=False
+                    )
+                    full = ids + new_ids
+                    return [torch.tensor([full], dtype=torch.long)]
+
+            model = _GgufModel(_llm)
+            preprocessor = _GgufPreprocessor(_llm)
+            tokenizer = None
+            processor = None
+            feature_extractor = None
+            loaded_class = "GGUF (llama-cpp-python)"
+
+        elif _diffusers_repo:
             from diffusers import DiffusionPipeline
 
             pipe_kwargs = {{"dtype": DTYPE}} if DEVICE.type == "cuda" else {{}}

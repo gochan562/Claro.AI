@@ -9,6 +9,16 @@ const app  = express();
 const PORT = process.env.PORT || 5000;
 const execFileAsync = promisify(execFile);
 
+// GPU provider abstraction.  GPU_PROVIDER controls which backend resolves:
+//   "zerogpu" (default) → Hugging Face ZeroGPU Space (Gradio API)
+//   "modal"             → existing Modal endpoints (forwarded unchanged)
+const {
+  resolveBackend,
+  ZeroGPUBackend,
+  GpuError,
+} = require('./gpu_backends');
+const gpuBackend = resolveBackend(process.env);
+
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname)));
@@ -76,27 +86,36 @@ async function callModal(url, body) {
 }
 
 // ── GET /api/gpu-status ────────────────────────────────────────────────────────
-// Lightweight reachability check for the Modal GPU endpoint (does not execute
-// any code — just confirms the server can be reached).
+// Lightweight reachability check for the active GPU backend.  When the backend
+// is ZeroGPU this probes the Space's /gradio_api/config without queueing a GPU
+// call.  When Modal is selected this hits MODAL_RUN_URL with a GET.
 app.get('/api/gpu-status', async (req, res) => {
-  const { MODAL_RUN_URL } = process.env;
-  const gpuType = process.env.GPU_TYPE || 'A10G';
-
-  if (!MODAL_RUN_URL) {
-    return res.json({ state: 'not-configured', gpuType });
-  }
-
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 6000);
-    const modalRes = await fetch(MODAL_RUN_URL, { method: 'GET', signal: controller.signal });
-    clearTimeout(timer);
-    // Any HTTP response (even 4xx/405 for a GET on a POST-only endpoint)
-    // proves the Modal server is up and reachable.
-    return res.json({ state: 'connected', gpuType, httpStatus: modalRes.status });
+    const info = await gpuBackend.status();
+    return res.json(info);
   } catch (err) {
-    return res.json({ state: 'disconnected', gpuType, error: err.message });
+    return res.status(502).json({
+      state: 'disconnected',
+      provider: gpuBackend.kind,
+      error: err && err.message ? err.message : String(err),
+    });
   }
+});
+
+// ── GET /api/gpu-config ──────────────────────────────────────────────────────
+// Returns which backend is active + Space info so the dashboard can route
+// inference/model-cell runs to the right endpoint (structured ZeroGPU vs.
+// Python-cell Modal) without guessing.
+app.get('/api/gpu-config', (req, res) => {
+  res.json({
+    provider: gpuBackend.kind,
+    zerogpu: {
+      space: gpuBackend.kind === 'zerogpu' ? gpuBackend.spaceId : (process.env.ZEROGPU_SPACE || 'Gochan562/claro_ai_gpu'),
+    },
+    modal: {
+      configured: !!(process.env.MODAL_RUN_URL),
+    },
+  });
 });
 
 // ── GET /api/stream-logs ─────────────────────────────────────────────────────
@@ -171,28 +190,112 @@ app.get('/api/stream-logs', async (req, res) => {
   }
 });
 
-// ── POST /api/run-cell ────────────────────────────────────────────────────────
-// Executes a notebook cell's Python code on the Modal A10G GPU and returns
-// stdout + stderr so the notebook can display real output.
-app.post('/api/run-cell', async (req, res) => {
-  const { MODAL_RUN_URL } = process.env;
-
-  if (!MODAL_RUN_URL) {
-    return res.status(500).json({
-      error: 'MODAL_RUN_URL is not configured. Deploy trainer.py to Modal then set the env var.'
+// ── POST /api/zerogpu-run ─────────────────────────────────────────────────────
+// Structured request to the ZeroGPU Space.  Accepts:
+//   { model_id: str, task: str, inputs: { prompt, max_new_tokens, ... } }
+// and returns { output, stderr }.  Never forwards arbitrary Python; the model
+// loads and runs inside the Space.
+app.post('/api/zerogpu-run', async (req, res) => {
+  if (gpuBackend.kind !== 'zerogpu') {
+    return res.status(400).json({
+      error: `Not on ZeroGPU backend (current provider: ${gpuBackend.kind}). Set GPU_PROVIDER=zerogpu to use this endpoint.`,
     });
   }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Number(process.env.ZEROGPU_TIMEOUT_MS || 120000));
+  try {
+    const result = await gpuBackend.run(req.body || {}, controller.signal);
+    return res.json(result);
+  } catch (err) {
+    const code = err && err.code ? err.code : 'zerogpu_runtime';
+    const status = err && err.status ? err.status : 502;
+    if (err instanceof GpuError) {
+      return res.status(status).json({ error: err.message, code });
+    }
+    return res.status(502).json({ error: `ZeroGPU call failed: ${err.message || err}`, code });
+  } finally {
+    clearTimeout(timer);
+  }
+});
 
-  const { code } = req.body;
-  if (!code || !code.trim()) {
+// ── GET /api/zerogpu-stream ──────────────────────────────────────────────────
+// Server-Sent Events: opens a ZeroGPU Space call and streams the resulting
+// lines into the dashboard GPU terminal as they arrive.  Accepts the same
+// structured payload as /api/zerogpu-run but as URL-safe JSON in ?req=
+app.get('/api/zerogpu-stream', async (req, res) => {
+  res.set({
+    'Content-Type':      'text/event-stream',
+    'Cache-Control':     'no-cache',
+    Connection:           'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.flushHeaders();
+
+  const sendLine = (line) => res.write(`data: ${JSON.stringify({ line })}\n\n`);
+  const sendDone = (ok, message) => {
+    res.write(`event: done\ndata: ${JSON.stringify({ ok, message: message || '' })}\n\n`);
+    res.end();
+  };
+
+  if (gpuBackend.kind !== 'zerogpu') {
+    sendLine(`❌ Not on ZeroGPU backend (current provider: ${gpuBackend.kind}).`);
+    return sendDone(false);
+  }
+  let body;
+  try {
+    const raw = req.query.req || '{}';
+    body = JSON.parse(decodeURIComponent(raw));
+  } catch (err) {
+    sendLine(`❌ Malformed ?req= JSON: ${err.message}`);
+    return sendDone(false);
+  }
+
+  const controller = new AbortController();
+  req.on('close', () => controller.abort());
+
+  try {
+    await gpuBackend.run(body, controller.signal, sendLine);
+    sendDone(true);
+  } catch (err) {
+    const code = err && err.code ? err.code : 'zerogpu_runtime';
+    sendLine(`❌ ${err.message || err}  (code: ${code})`);
+    sendDone(false);
+  }
+});
+
+// ── POST /api/run-cell ────────────────────────────────────────────────────────
+// Executes a notebook cell.  Behaviour depends on the active backend:
+//   • ZeroGPU (default) → rejects Python-cell requests for the inference/model
+//     cells; the dashboard must send structured requests to /api/zerogpu-run.
+//     Other code/parameter/markdown cells never reach here from a ZeroGPU
+//     model cell, but we keep the endpoint available for plain Python cells
+//     by forwarding to Modal *only if* Modal is configured.
+//   • Modal → runs arbitrary Python on the remote A10G (unchanged behaviour).
+app.post('/api/run-cell', async (req, res) => {
+  const { code } = req.body || {};
+  if (!code || !String(code).trim()) {
     return res.status(400).json({ error: 'No code provided.' });
   }
 
+  if (gpuBackend.kind === 'zerogpu') {
+    // The local Claro.AI should only communicate with the Space; it does not
+    // run arbitrary Python anywhere when ZeroGPU is the active backend.
+    return res.status(400).json({
+      error:
+        'ZeroGPU backend only accepts structured { model_id, task, inputs } ' +
+        'requests via POST /api/zerogpu-run (or GET /api/zerogpu-stream). ' +
+        'Plain notebook-cell Python is not executed on ZeroGPU.',
+      code: 'zerogpu_no_python_cells',
+    });
+  }
+
+  // Modal path (unchanged from the original implementation).
   try {
-    const { status, data } = await callModal(MODAL_RUN_URL, { code });
+    const { status, data } = await gpuBackend.run({ code });
     return res.status(status).json(data);
   } catch (err) {
-    return res.status(502).json({ error: `Could not reach Modal: ${err.message}` });
+    const status = err && err.status ? err.status : 502;
+    return res.status(status).json({ error: err.message || String(err) });
   }
 });
 

@@ -1186,6 +1186,13 @@
       currentModelCellId: null
     };
 
+    // GPU provider config populated from /api/gpu-config.  When provider is
+    // "zerogpu" the dashboard sends structured { model_id, task, inputs } to
+    // POST /api/zerogpu-run (the Space loads+runs the model); for "modal" it
+    // keeps the existing behaviour of forwarding the generated notebook cell
+    // Python to POST /api/run-cell.
+    let gpuProvider = { provider: 'zerogpu', zerogpu: { space: 'Gochan562/claro_ai_gpu' }, modal: { configured: false } };
+
     let hfModels = [];
     let filteredModels = [];
     let gpuStatus   = { state: 'idle', gpuType: 'A10G' };
@@ -1913,24 +1920,37 @@
           updateNotebook();
           return;
         } else if (cell.type === 'code' || cell.type === 'model') {
-          // Show live "running" feedback inside the cell while streaming from Modal
-          const interimDiv = document.createElement('div');
-          interimDiv.className = 'cell-output';
-          interimDiv.innerHTML = '<pre>⏳ Streaming from Modal GPU…  (cold start may take ~20 s) — watch the GPU Console below</pre>';
-          const existing = cellElement.querySelector('.cell-output');
-          if (existing) existing.remove();
-          cellElement.appendChild(interimDiv);
+          // ZeroGPU provider: the Space loads and runs the model itself, so
+          // we send a structured { model_id, task, inputs:{prompt,max_new_tokens} }
+          // request to /api/zerogpu-run instead of forwarding arbitrary Python.
+          if (gpuProvider.provider === 'zerogpu' &&
+              (cell.type === 'model' || cell.modelInfo?.role === 'inference') &&
+              (gpuProvider.zerogpu?.enabled ?? true)) {
+            output = await runCellViaZeroGPU(notebook, cell);
+            hasError = output === null;
+            cell.outputFormat = hasError ? 'error' : 'text';
+          } else {
+            // Modal provider (unchanged): stream the generated notebook-cell
+            // Python through /api/stream-logs (SSE) or fall back to /api/run-cell
+            // for very long cells.
+            const interimDiv = document.createElement('div');
+            interimDiv.className = 'cell-output';
+            interimDiv.innerHTML = '<pre>⏳ Streaming from Modal GPU…  (cold start may take ~20 s) — watch the GPU Console below</pre>';
+            const existing = cellElement.querySelector('.cell-output');
+            if (existing) existing.remove();
+            cellElement.appendChild(interimDiv);
 
-          try {
-            const result = await streamCellToTerminal(executionCode);
-            output   = result.text || (result.ok ? '✅ Executed successfully (no output)' : 'No output captured.');
-            hasError = !result.ok;
-            cell.outputFormat = result.ok ? 'text' : 'error';
-          } catch (err) {
-            setGpuState('disconnected');
-            output   = `Network error: ${err.message}`;
-            hasError = true;
-            cell.outputFormat = 'error';
+            try {
+              const result = await streamCellToTerminal(executionCode);
+              output   = result.text || (result.ok ? '✅ Executed successfully (no output)' : 'No output captured.');
+              hasError = !result.ok;
+              cell.outputFormat = result.ok ? 'text' : 'error';
+            } catch (err) {
+              setGpuState('disconnected');
+              output   = `Network error: ${err.message}`;
+              hasError = true;
+              cell.outputFormat = 'error';
+            }
           }
         }
       } catch (err) {
@@ -3140,11 +3160,106 @@ print(f"Loaded {loaded_class} on {DEVICE}")
 
     document.addEventListener('DOMContentLoaded', () => {
       initGpuTerminal();
+      // Fetch the active GPU provider so the notebook can route cell runs to
+      // the right backend.  ZeroGPU → structured /api/zerogpu-run; Modal →
+      // existing /api/run-cell.
+      fetch('/api/gpu-config').then(r => r.ok ? r.json() : null).then(cfg => {
+        if (cfg) gpuProvider = cfg;
+      }).catch(() => { /* server will fall back to its default */ });
       setTimeout(() => {
         loadAllNotebooks();
         renderUI();
       }, 1000);
     });
+
+    // ── ZeroGPU structured execution path ────────────────────────────────────────
+    // When the active GPU provider is ZeroGPU the dashboard never sends
+    // arbitrary notebook-cell Python.  It posts a structured
+    // { model_id, task, inputs:{ prompt, max_new_tokens } } to /api/zerogpu-run,
+    // and the Space loads and runs the model itself.  The prompt is parsed from
+    // the inference cell's generated Python (the `prompt = "..."` line) so the
+    // generator stays the sole source of the displayed example prompt; this
+    // function only adapts the transport, not the model cell template.
+    function parsePromptAndMaxTokens(inferenceContent, defaultPrompt) {
+      const text = String(inferenceContent || '');
+      // Look for: prompt = "..."   (handles single/double quotes, f-strings, triples)
+      let prompt = defaultPrompt || 'Hello, world!';
+      const m = text.match(/prompt\s*=\s*(?:(?:[rbfu]*"""|'''|")(.*?)(?:"""|''')"|")|([`"])([\s\S]*?)\3\b)/i);
+      // Simpler/forgiving: first "prompt = <string>" with either kind of quotes.
+      const m2 = text.match(/^\s*prompt\s*=\s*f?(?:"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'|```([\s\S]*?)```)\s*$/m);
+      if (m2) prompt = m2[1] !== undefined ? m2[1] : (m2[2] !== undefined ? m2[2] : (m2[3] || defaultPrompt));
+
+      let maxNewTokens = 128;
+      const mTok = text.match(/max_new_tokens\s*=\s*(\d+)/);
+      if (mTok) {
+        const n = parseInt(mTok[1], 10);
+        if (Number.isFinite(n) && n >= 1) maxNewTokens = Math.min(n, 500);
+      }
+      return { prompt, max_new_tokens: maxNewTokens };
+    }
+
+    async function runCellViaZeroGPU(notebook, cell) {
+      initGpuTerminal();
+      setGpuState('checking');
+      writeGpuLine(`\n$ ZeroGPU call… (${new Date().toLocaleTimeString()})`, 'gray');
+
+      // Resolve the model cell + task.  Inference cells point at their loader
+      // cell via modelInfo.loaderCellId; model cells themselves carry modelInfo.id.
+      let modelId = null;
+      let task = 'text-generation';
+      let inferenceContent = '';
+      if (cell.modelInfo?.role === 'inference') {
+        const loader = notebook.cells.find(c => c.id === cell.modelInfo.loaderCellId && c.type === 'model');
+        modelId = loader?.modelInfo?.id || cell.modelInfo.modelId || null;
+        task = String(cell.modelInfo.task || loader?.modelInfo?.task || task).toLowerCase();
+        inferenceContent = cell.content || '';
+      } else {
+        modelId = cell.modelInfo?.id || null;
+        task = String(cell.modelInfo?.task || task).toLowerCase();
+        const infs = notebook.cells.find(c =>
+          c.modelInfo?.role === 'inference' && c.modelInfo?.loaderCellId === cell.id
+        );
+        inferenceContent = infs?.content || '';
+      }
+
+      if (!modelId) {
+        writeGpuLine('❌ No model id resolved for this cell — pick a model in the picker first.', 'red');
+        setGpuState('disconnected');
+        return null;
+      }
+
+      const { prompt, max_new_tokens } = parsePromptAndMaxTokens(inferenceContent, 'Once upon a time');
+
+      writeGpuLine(`↗ POST /api/zerogpu-run  model=${modelId}  task=${task}  max_new_tokens=${max_new_tokens}`, 'gray');
+      writeGpuLine(`  prompt: ${prompt.length > 60 ? prompt.slice(0, 60) + '…' : prompt}`);
+
+      const body = { model_id: modelId, task, inputs: { prompt, max_new_tokens } };
+      try {
+        const res  = await fetch('/api/zerogpu-run', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify(body)
+        });
+        const data = await res.json().catch(() => ({ error: 'Non-JSON response from server' }));
+        setGpuState(res.ok ? 'connected' : 'disconnected');
+
+        if (!res.ok || data.error) {
+          const code = data.code ? ` (${data.code})` : '';
+          writeGpuLine(`❌ ZeroGPU${code}: ${data.error || JSON.stringify(data)}`, 'red');
+          return null;
+        }
+        const text = (data.output || '').trim();
+        if (text) {
+          for (const line of text.split('\n')) writeGpuLine(line);
+        }
+        writeGpuLine('✔ Done.', 'green');
+        return text || '✅ Executed successfully (no output)';
+      } catch (err) {
+        setGpuState('disconnected');
+        writeGpuLine(`❌ Network error: ${err.message}`, 'red');
+        return null;
+      }
+    }
 
     // Streams a cell's code execution over SSE into the shared GPU terminal.
     // Falls back to the (still-available) /api/run-cell JSON endpoint for

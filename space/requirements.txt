@@ -1,0 +1,8 @@
+transformers
+torch
+accelerate
+spaces
+diffusers>=0.30.0
+huggingface_hub
+sentencepiece
+protobuf

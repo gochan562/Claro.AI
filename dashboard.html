@@ -3239,7 +3239,23 @@ function parsePromptAndMaxTokens(inferenceContent, defaultPrompt) {
           headers: { 'Content-Type': 'application/json' },
           body:    JSON.stringify(body)
         });
-        const data = await res.json().catch(() => ({ error: 'Non-JSON response from server' }));
+
+        const status = res.status;
+        const contentType = res.headers.get('content-type') || 'N/A';
+        const contentLength = res.headers.get('content-length') || 'N/A';
+        const rawText = await res.text();
+
+        writeGpuLine(`🔍 DIAG: POST /api/zerogpu-run → status=${status} content-type=${contentType} content-length=${contentLength}`, 'gray');
+        writeGpuLine(`🔍 DIAG: first 3000 chars: ${rawText.slice(0, 3000)}`, 'gray');
+
+        let data;
+        try {
+          data = JSON.parse(rawText);
+        } catch (e) {
+          writeGpuLine(`🔍 DIAG: JSON parse failed: ${e.message}`, 'red');
+          data = { error: 'Non-JSON response from server', raw: rawText.slice(0, 500) };
+        }
+
         setGpuState(res.ok ? 'connected' : 'disconnected');
 
         if (!res.ok || data.error) {

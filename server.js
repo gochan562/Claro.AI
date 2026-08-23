@@ -203,8 +203,9 @@ app.post('/api/zerogpu-run', async (req, res) => {
   }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Number(process.env.ZEROGPU_TIMEOUT_MS || 120000));
+  const authToken = req.headers.authorization?.replace(/^Bearer\s+/i, '') || '';
   try {
-    const result = await gpuBackend.run(req.body || {}, controller.signal);
+    const result = await gpuBackend.run(req.body || {}, controller.signal, null, authToken);
     return res.json(result);
   } catch (err) {
     const code = err && err.code ? err.code : 'zerogpu_runtime';

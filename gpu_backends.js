@@ -233,9 +233,12 @@ class ZeroGPUBackend {
         res.status
       );
     }
+    const ctype = res.headers.get('content-type') || 'unknown';
+    const raw = await res.text();
+    console.error('[ZeroGPU POST] status:', res.status, 'content-type:', ctype, 'body:', raw.slice(0, 1000));
     let payload;
     try {
-      payload = await res.json();
+      payload = JSON.parse(raw);
     } catch (err) {
       throw new GpuError(`ZeroGPU returned non-JSON response: ${err.message}`, 'malformed_response', 502);
     }

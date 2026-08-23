@@ -533,8 +533,22 @@ def load_model(model_id: str, gguf_file: Optional[str] = None) -> LoaderResult:
 
     device, dtype = _device_dtype()
     gguf_files = _list_gguf_files(model_id)
-    if gguf_files:
+    
+    # If user explicitly requests a specific GGUF file, honor it.
+    # Otherwise, if the repo has a config.json (standard Transformers model),
+    # prefer the Transformers loader over community-uploaded GGUF files.
+    # Only fall back to GGUF for pure GGUF models (no config.json).
+    if gguf_file:
         result = _load_gguf(model_id, gguf_files, device, dtype)
+    elif gguf_files:
+        try:
+            from huggingface_hub import hf_hub_download
+            hf_hub_download(model_id, "config.json")
+            # Has config.json → standard Transformers model, use that.
+            result = _load_transformers(model_id, device, dtype)
+        except Exception:
+            # No config.json → pure GGUF model.
+            result = _load_gguf(model_id, gguf_files, device, dtype)
     elif _has_diffusers_model_index(model_id):
         result = _load_diffusers(model_id, device, dtype)
     else:

@@ -195,14 +195,16 @@ class ZeroGPUBackend {
   // supported repo (Transformers / Diffusers / GGUF) instead of hard-coding
   // a single model.  We forward the validated model_id/task alongside the
   // prompt so the Space actually does the requested work.
-  async _postGenerate(prompt, maxNewTokens, signal, modelId, task) {
+  async _postGenerate(prompt, maxNewTokens, signal, modelId, task, authToken) {
     const url = `${this.base}/gradio_api/call/v2/generate`;
     const body = { prompt, max_new_tokens: maxNewTokens };
     if (modelId) body.model_id = modelId;
     if (task) body.task = task;
+    const headers = { 'Content-Type': 'application/json' };
+    if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
     const res = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify(body),
       signal,
     });
@@ -233,7 +235,7 @@ class ZeroGPUBackend {
         res.status
       );
     }
-    const ctype = res.headers.get('content-type') || 'unknown';
+    const ctype = res.headers?.get('content-type') || 'unknown';
     const raw = await res.text();
     console.error('[ZeroGPU POST] status:', res.status, 'content-type:', ctype, 'body:', raw.slice(0, 1000));
     let payload;
@@ -251,9 +253,11 @@ class ZeroGPUBackend {
 
   // GET the SSE stream for an event_id and return the final `complete` payload.
   // `onLine` is optional and receives every raw SSE line (for live terminal).
-  async _streamResult(eventId, signal, onLine) {
+  async _streamResult(eventId, signal, onLine, authToken) {
     const url = `${this.base}/gradio_api/call/generate/${encodeURIComponent(eventId)}`;
-    const res = await fetch(url, { signal });
+    const headers = {};
+    if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+    const res = await fetch(url, { signal, headers });
     if (res.status === 404) {
       throw new GpuError('ZeroGPU event was not found (event expired or Space restarted).', 'space_unavailable', 502);
     }
@@ -261,6 +265,8 @@ class ZeroGPUBackend {
       const detail = await res.text().catch(() => '');
       throw new GpuError(`ZeroGPU stream open failed (HTTP ${res.status}): ${detail.slice(0, 200)}`, 'space_unavailable', res.status || 502);
     }
+    const streamCtype = res.headers?.get('content-type') || 'unknown';
+    console.error('[ZeroGPU STREAM] status:', res.status, 'content-type:', streamCtype);
 
     const nodeStream = Readable.fromWeb(res.body);
     let buffer = '';
@@ -286,6 +292,7 @@ class ZeroGPUBackend {
           if (eventType) {
             if (eventType === 'complete') {
               resolved = true;
+              console.error('[ZeroGPU STREAM] complete frame:', dataBuf.slice(0, 3000));
               try {
                 const parsed = JSON.parse(dataBuf);
                 // Gradio returns an array: ["<generated text>"]
@@ -319,6 +326,7 @@ class ZeroGPUBackend {
             if (eventType === 'error') {
               hadError = true;
               errMsg = dataBuf;
+              console.error('[ZeroGPU STREAM] error frame:', dataBuf.slice(0, 3000));
             }
           }
           eventType = '';
@@ -366,6 +374,7 @@ class ZeroGPUBackend {
       if (eventType === 'error') {
         hadError = true;
         errMsg = dataBuf;
+        console.error('[ZeroGPU STREAM] error frame (flush):', dataBuf.slice(0, 3000));
       }
     }
 
@@ -380,13 +389,19 @@ class ZeroGPUBackend {
         const parsed = JSON.parse(errMsg);
         if (parsed && typeof parsed === 'object' && parsed.error) message = parsed.error;
         if (parsed && parsed.title === 'ZeroGPU worker error') code = 'zerogpu_quota';
+        if (parsed && parsed.title === 'ZeroGPU queue timeout') code = 'zerogpu_timeout';
       } catch {
         // already a string
       }
       if (/No GPU available|quota|GHA seconds|GPU is not available/i.test(message)) code = 'zerogpu_quota';
+      if (/No GPU was available after \d+s/i.test(message)) code = 'zerogpu_timeout';
       if (/Not Found/i.test(message)) code = 'space_unavailable';
       if (/Unrecognized|does not have|model_type|from_pretrained/i.test(message)) code = 'invalid_model_id';
-      throw new GpuError(`ZeroGPU error: ${message}`, code, status);
+      let displayMessage = message;
+      if (code === 'zerogpu_timeout') {
+        displayMessage = 'ZeroGPU timeout: this model took too long to initialize or execute within ZeroGPU\'s execution limit. Try a smaller/quantized model or switch GPU provider.';
+      }
+      throw new GpuError(`ZeroGPU error: ${displayMessage}`, code, status);
     }
     if (!resolved) {
       throw new GpuError('ZeroGPU stream closed without a complete frame.', 'malformed_response', 502);
@@ -394,13 +409,13 @@ class ZeroGPUBackend {
     return '';
   }
 
-  // run(body, signal): { output, stderr }
-  async run(body, signal, onLine) {
+  // run(body, signal, onLine, authToken): { output, stderr }
+  async run(body, signal, onLine, authToken) {
     const { modelId, task, prompt, max_new_tokens } = normalizeStructuredRequest(body);
     if (onLine) onLine(`↗ ZeroGPU → ${this.spaceId}  model=${modelId} task=${task} max_new_tokens=${max_new_tokens}`);
     let eventId;
     try {
-      eventId = await this._postGenerate(prompt, max_new_tokens, signal, modelId, task);
+      eventId = await this._postGenerate(prompt, max_new_tokens, signal, modelId, task, authToken);
     } catch (err) {
       if (err.name === 'AbortError') throw new GpuError('ZeroGPU call was cancelled.', 'cancelled', 499);
       if (err.name === 'TypeError') {
@@ -411,7 +426,7 @@ class ZeroGPUBackend {
     }
     let text = '';
     try {
-      text = await this._streamResult(eventId, signal, onLine);
+      text = await this._streamResult(eventId, signal, onLine, authToken);
     } catch (err) {
       if (err.name === 'AbortError') throw new GpuError('ZeroGPU stream was cancelled.', 'cancelled', 499);
       if (err.name === 'TypeError') {

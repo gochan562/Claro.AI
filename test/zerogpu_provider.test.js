@@ -26,16 +26,19 @@ function setBackendResponses(scenario) {
     calls.push({ url: u, method: init.method || 'GET', body: init.body });
     const r = scenario(u, init);
     if (r instanceof Error) throw r;
+    const responseText = r.text ?? (r.json !== undefined ? JSON.stringify(r.json) : '');
+    const responseHeaders = r.headers || { 'content-type': r.json !== undefined ? 'application/json' : 'text/event-stream' };
     return {
       ok: r.ok ?? true,
       status: r.status ?? 200,
+      headers: {
+        get: (name) => responseHeaders[name.toLowerCase()],
+      },
       async json() { return r.json; },
-      async text() { return r.text || ''; },
+      async text() { return responseText; },
       get body() {
         if (r.body === null || r.body === undefined) return null;
         const { Readable } = require('stream');
-        // Provide a proper WHATWG ReadableStream over the string body so that
-        // gpu_backends.js's `Readable.fromWeb(res.body)` is happy.
         const chunks = r.body.split(/(?<=\n)/).map((s) => new TextEncoder().encode(s));
         const rs = new ReadableStream({
           start(controller) { chunks.forEach((c) => controller.enqueue(c)); controller.close(); },

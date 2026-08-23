@@ -2891,8 +2891,6 @@ print(f"Loaded {loaded_class} on {DEVICE}")
     }
 
     // ── Tab navigation ──────────────────────────────────────────
-
-    // ── Tab navigation ──────────────────────────────────────────
     const TAB_MAP = {
       'notebooks':     'notebook-workspace',
       'hf-updates':    'hf-updates-workspace',
@@ -2901,8 +2899,10 @@ print(f"Loaded {loaded_class} on {DEVICE}")
       'settings':      'settings-workspace'
     };
 
-    document.addEventListener('DOMContentLoaded', function() {
-      document.getElementById('main-nav').addEventListener('click', function(e) {
+    (function() {
+      const nav = document.getElementById('main-nav');
+      if (nav) {
+        nav.addEventListener('click', function(e) {
         const li = e.target.closest('li[data-tab]');
         if (!li) return;
         const tab = li.dataset.tab;
@@ -2927,7 +2927,8 @@ print(f"Loaded {loaded_class} on {DEVICE}")
         if (tab === 'hf-updates') loadHFUpdates();
         if (tab === 'datasets') loadDatasets(true);
       });
-    });
+      }
+    })();
 
     // ── Datasets search ─────────────────────────────────────────
     let dsModels = [];

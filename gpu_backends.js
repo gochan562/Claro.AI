@@ -332,6 +332,40 @@ class ZeroGPUBackend {
       }
     }
 
+    // Flush any pending frame if the stream ended without a trailing blank line
+    if (eventType && dataBuf !== '') {
+      if (eventType === 'complete') {
+        resolved = true;
+        try {
+          const parsed = JSON.parse(dataBuf);
+          const text = Array.isArray(parsed) ? parsed[0] : parsed;
+          const out = typeof text === 'string' ? text : JSON.stringify(text);
+          const m = typeof out === 'string' ? out.match(/^\[CLARO:([a-z_]+)\]\s*(.*)$/s) : null;
+          if (m) {
+            const code = m[1];
+            const message = m[2];
+            const status =
+              code === 'invalid_model_id'   ? 400 :
+              code === 'bad_request'         ? 400 :
+              code === 'task_model_mismatch'  ? 422 :
+              code === 'task_not_exposed'     ? 422 :
+              code === 'model_load_error'     ? 502 :
+              code === 'gguf_multiple_files'  ? 422 :
+              502;
+            throw new GpuError(`ZeroGPU model error: ${message}`, code, status);
+          }
+          return out;
+        } catch (err) {
+          if (err && err instanceof GpuError) throw err;
+          throw new GpuError(`ZeroGPU returned malformed complete frame: ${dataBuf.slice(0, 200)}`, 'malformed_response', 502);
+        }
+      }
+      if (eventType === 'error') {
+        hadError = true;
+        errMsg = dataBuf;
+      }
+    }
+
     if (hadError) {
       // Gradio error frames come in two shapes:
       //   {"error": "...", "title": "ZeroGPU worker error"}

@@ -93,6 +93,35 @@ async function run() {
   );
   console.log('✓ test 1b: structured request maps to {prompt, max_new_tokens, model_id, task}');
 
+  // ─── 1c. Regression: max_new_tokens + temperature + top_p reach the Space unchanged ─
+  // Pins the exact URL and body so a future "soft-rejected with 404 during restart"
+  // regression cannot silently alter the wire format.
+  let capturedPost = null;
+  setBackendResponses((u, init) => {
+    if (u.endsWith('/gradio_api/call/v2/generate') && init.method === 'POST') {
+      capturedPost = { url: u, body: init.body };
+      return { status: 200, json: { event_id: 'evt-reg' } };
+    }
+    if (u.endsWith('/gradio_api/call/generate/evt-reg')) {
+      return { ok: true, status: 200, body: 'event: complete\ndata: ["ok"]\n\n' };
+    }
+    return { status: 404, text: 'unexpected' };
+  });
+  await new ZeroGPUBackend(infra).run(
+    { model_id: 'SakanaAI/EvoLLM-JP-v1-7B', task: 'text-generation',
+      inputs: { prompt: 'once upon a time,', max_new_tokens: 300, temperature: 0.5, top_p: 0.85 } },
+    new AbortController().signal
+  );
+  assert(capturedPost && capturedPost.url.endsWith('/gradio_api/call/v2/generate'),
+    'POST must hit /gradio_api/call/v2/generate');
+  assert.deepStrictEqual(
+    JSON.parse(capturedPost.body),
+    { prompt: 'once upon a time,', max_new_tokens: 300, model_id: 'SakanaAI/EvoLLM-JP-v1-7B',
+      task: 'text-generation', temperature: 0.5, top_p: 0.85 },
+    'non-default temperature/top_p must be forwarded verbatim to the Space'
+  );
+  console.log('✓ test 1c: max_new_tokens=300 + temperature + top_p reach Space verbatim');
+
   // ─── 2. Quota exhausted ├──
   setBackendResponses((u, init) => {
     if (u.endsWith('/gradio_api/call/v2/generate')) return { status: 200, json: { event_id: 'evt-q' } };

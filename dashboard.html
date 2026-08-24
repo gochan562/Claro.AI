@@ -959,7 +959,7 @@
         <div class="add-cell-dropdown" id="add-cell-dropdown-static">
           <button class="toolbar-btn" onclick="toggleAddCellMenu('static')">+ Add Cell ▾</button>
           <div class="add-cell-menu" id="add-cell-menu-static">
-            <div class="add-cell-menu-item" onclick="addCell('code');closeAddCellMenu()"><span class="menu-icon">💻</span><div><div>Code Cell</div><div class="menu-desc">Python executed on GPU</div></div></div>
+            <div class="add-cell-menu-item" onclick="addCell('code');closeAddCellMenu()"><span class="menu-icon">💻</span><div><div>Code Cell</div><div class="menu-desc">Python executed locally (browser)</div></div></div>
             <div class="add-cell-menu-item" onclick="addCell('markdown');closeAddCellMenu()"><span class="menu-icon">📝</span><div><div>Markdown Cell</div><div class="menu-desc">Formatted text &amp; notes</div></div></div>
             <div class="add-cell-menu-sep"></div>
             <div class="add-cell-menu-item" onclick="addCell('model');closeAddCellMenu()"><span class="menu-icon">🤖</span><div><div>Model Cell</div><div class="menu-desc">Load a Hugging Face model</div></div></div>
@@ -1173,6 +1173,7 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/python/python.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/markdown/markdown.min.js"></script>
+  <script src="/pyodide_local.js"></script>
   <script>
     let notebookRegistry = {
       notebooks: {},
@@ -1470,7 +1471,7 @@
         <div class="add-cell-dropdown" id="add-cell-dropdown-edit">
           <button class="toolbar-btn" onclick="toggleAddCellMenu('edit')">+ Add Cell ▾</button>
           <div class="add-cell-menu" id="add-cell-menu-edit">
-            <div class="add-cell-menu-item" onclick="addCell('code');closeAddCellMenu()"><span class="menu-icon">💻</span><div><div>Code Cell</div><div class="menu-desc">Python executed on GPU</div></div></div>
+            <div class="add-cell-menu-item" onclick="addCell('code');closeAddCellMenu()"><span class="menu-icon">💻</span><div><div>Code Cell</div><div class="menu-desc">Python executed locally (browser)</div></div></div>
             <div class="add-cell-menu-item" onclick="addCell('markdown');closeAddCellMenu()"><span class="menu-icon">📝</span><div><div>Markdown Cell</div><div class="menu-desc">Formatted text &amp; notes</div></div></div>
             <div class="add-cell-menu-sep"></div>
             <div class="add-cell-menu-item" onclick="addCell('model');closeAddCellMenu()"><span class="menu-icon">🤖</span><div><div>Model Cell</div><div class="menu-desc">Load a Hugging Face model</div></div></div>
@@ -1919,6 +1920,28 @@
           setMarkdownRendered(cellId, html);
           updateNotebook();
           return;
+        } else if (cell.type === 'code' && !cell.modelInfo) {
+          // Ordinary Python cell: run locally in the browser via Pyodide.
+          // These cells must NEVER be sent to Modal, ZeroGPU, or any other
+          // remote GPU provider — only AI/model cells use a remote backend.
+          const interimDiv = document.createElement('div');
+          interimDiv.className = 'cell-output';
+          interimDiv.innerHTML = '<pre>🐍 Running Python locally…</pre>';
+          const existingLocal = cellElement.querySelector('.cell-output');
+          if (existingLocal) existingLocal.remove();
+          cellElement.appendChild(interimDiv);
+          try {
+            const result = await window.PyodideLocal.run(cell.content || '');
+            output = result.ok
+              ? ((result.stdout || '') + (result.stderr ? '\n' + result.stderr : '')).trimEnd() || '✅ Executed successfully (no output)'
+              : (result.stdout || '') + (result.stderr ? '\n' + result.stderr : '') + result.error;
+            hasError = !result.ok;
+            cell.outputFormat = hasError ? 'error' : 'text';
+          } catch (err) {
+            output = `Local Python error: ${err.message}`;
+            hasError = true;
+            cell.outputFormat = 'error';
+          }
         } else if (cell.type === 'code' || cell.type === 'model') {
           // ZeroGPU provider: the Space loads and runs the model itself, so
           // we send a structured { model_id, task, inputs:{prompt,max_new_tokens} }

@@ -24,7 +24,7 @@ function setBackendResponses(scenario) {
   global.fetch = async (url, init = {}) => {
     const u = String(url);
     calls.push({ url: u, method: init.method || 'GET', body: init.body });
-    const r = scenario(u, init);
+    const r = await scenario(u, init);
     if (r instanceof Error) throw r;
     const responseText = r.text ?? (r.json !== undefined ? JSON.stringify(r.json) : '');
     const responseHeaders = r.headers || { 'content-type': r.json !== undefined ? 'application/json' : 'text/event-stream' };
@@ -145,13 +145,28 @@ async function run() {
   assert(err && err.code === 'bad_request');
   console.log('✓ test 5: missing prompt → bad_request');
 
-  // ─── 6. max_new_tokens clamp + out-of-range error from Space ├──
+  // ─── 6. max_new_tokens over the hard limit → clear validation error ──
+  // (never silently reduced)
+  err = null;
+  try {
+    normalizeStructuredRequest({
+      model_id: 'm/m', task: 'text-generation',
+      inputs: { prompt: 'x', max_new_tokens: 99999 },
+    });
+  } catch (e) { err = e; }
+  assert(err && err instanceof GpuError, 'expected GpuError');
+  assert.strictEqual(err.code, 'bad_request', 'over-limit value must be rejected, not clamped');
+  assert(err.message.includes('2048'), 'error should state the hard limit');
+  assert.strictEqual(err.status, 400);
+  console.log('✓ test 6: max_new_tokens=99999 rejected with 400/bad_request (no silent clamp)');
+
+  // An in-limit value passes through verbatim.
   const norm = normalizeStructuredRequest({
     model_id: 'm/m', task: 'text-generation',
-    inputs: { prompt: 'x', max_new_tokens: 99999 },
+    inputs: { prompt: 'x', max_new_tokens: 1500 },
   });
-  assert.strictEqual(norm.max_new_tokens, 500, 'over-limit value should be soft-capped to 500');
-  console.log('✓ test 6: max_new_tokens=99999 is clamped to 500 (not silently rejected)');
+  assert.strictEqual(norm.max_new_tokens, 1500, 'in-limit value passes through untouched');
+  console.log('✓ test 6b: max_new_tokens=1500 (≤2048) passes through unchanged');
 
   // Gradio can also reject with the slider-max error; surface it.
   setBackendResponses((u, init) => {
@@ -160,7 +175,7 @@ async function run() {
       return {
         ok: true,
         status: 200,
-        body: 'event: error\ndata: {"error": "Value 999 is greater than maximum value 500.", "title": "Error"}\n\n',
+        body: 'event: error\ndata: {"error": "Value 999 is greater than maximum value 2048.", "title": "Error"}\n\n',
       };
     }
     return { status: 404, text: '?' };
@@ -173,7 +188,7 @@ async function run() {
     );
   } catch (e) { err = e; }
   assert(err && err instanceof GpuError);
-  assert(err.message.includes('greater than maximum value 500'));
+  assert(err.message.includes('greater than maximum value 2048'));
   console.log('✓ test 7: Gradio validation error surfaced');
 
   // ─── 8. Malformed response (stream ends without complete frame) ├──
@@ -229,6 +244,32 @@ async function run() {
   assert.strictEqual(err.code, 'model_load_error', 'code parsed from [CLARO:...] prefix');
   assert(err.message.includes('Could not read AutoConfig for some/bad-repo'));
   console.log('✓ test 10: structured [CLARO:<code>] error from complete frame mapped to typed code');
+
+  // ─── 11. Duplicate in-flight request deduplication ────────────────────────
+  // Two identical concurrent run() calls (double-click / re-render) must
+  // produce exactly ONE POST to the Space — a duplicate must never consume
+  // GPU quota twice.
+  setBackendResponses(async (u, init) => {
+    if (u.endsWith('/gradio_api/call/v2/generate') && init.method === 'POST') {
+      // Slow POST so the second request arrives while the first is in-flight.
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return { status: 200, json: { event_id: 'evt-dup' } };
+    }
+    if (u.endsWith('/gradio_api/call/generate/evt-dup')) {
+      return { ok: true, status: 200, body: 'event: complete\ndata: ["dup-ok"]\n\n' };
+    }
+    return { status: 404, text: '?' };
+  });
+  const dupBackend = new ZeroGPUBackend(infra);
+  const dupBody = { model_id: 'm/m', task: 'text-generation', inputs: { prompt: 'same prompt', max_new_tokens: 10 } };
+  const [rA, rB] = await Promise.all([
+    dupBackend.run(dupBody, new AbortController().signal),
+    dupBackend.run(dupBody, new AbortController().signal),
+  ]);
+  assert(rA.output.includes('dup-ok') && rB.output.includes('dup-ok'), 'both callers get the result');
+  const postCount = calls.filter((c) => c.method === 'POST').length;
+  assert.strictEqual(postCount, 1, `duplicate request must reuse the in-flight call (got ${postCount} POSTs)`);
+  console.log('✓ test 11: duplicate concurrent request deduplicated (1 POST for 2 runs)');
 
   delete global.fetch;
   console.log('\nAll ZeroGPU integration tests passed.');

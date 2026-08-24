@@ -33,13 +33,25 @@ import importlib
 import io
 import os
 import threading
+import time
+import hashlib
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Optional
 
 MAX_CACHED = max(1, int(os.environ.get("CLARO_SPACE_MAX_CACHED", "3")))
-_CACHE: "OrderedDict[tuple, LoaderResult]" = OrderedDict()
+_CACHE: "OrderedDict[str, LoaderResult]" = OrderedDict()
 _CACHE_LOCK = threading.Lock()
+# Loads are serialized so two concurrent misses for different models cannot
+# double-allocate RAM; ZeroGPU inference is effectively serialized per worker
+# anyway, and the model is off the GPU outside the GPU call.
+_LOAD_LOCK = threading.Lock()
+_MOVE_LOCK = threading.Lock()
+
+# Duration constants for @spaces.GPU (seconds)
+DEFAULT_DURATION = 60
+MIN_DURATION = 15
+MAX_DURATION = 300
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -73,16 +85,21 @@ class LoaderResult:
     modality: str  # "text" | "image" | "audio" | "diffusion" | "gguf"
     device: Any
     dtype: Any
+    config_hash: str = ""  # hash of config for cache invalidation
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Device/dtype
 # ──────────────────────────────────────────────────────────────────────────────
 def _device_dtype():
+    """Loading is ALWAYS done on CPU (fp16 weights) so model loading never
+    consumes ZeroGPU GPU-seconds.  The @spaces.GPU inference path moves the
+    cached model onto CUDA only for the duration of the request, then offloads
+    it again, so VRAM stays free between calls and the CPU-side LRU cache can
+    safely hold several models.
+    """
     import torch
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.float16 if dev.type == "cuda" else torch.float32
-    return dev, dtype
+    return torch.device("cpu"), torch.float16
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -111,6 +128,78 @@ def _has_diffusers_model_index(model_id: str):
         return True
     except Exception:
         return False
+
+
+def _get_config_hash(model_id: str) -> str:
+    """Get a hash of the model's config.json for cache invalidation on revision changes."""
+    try:
+        from huggingface_hub import hf_hub_download
+        import json
+        path = hf_hub_download(model_id, "config.json")
+        with open(path, "r") as f:
+            config = json.load(f)
+        # Hash relevant config fields that affect model loading
+        relevant = {
+            "architectures": config.get("architectures"),
+            "model_type": config.get("model_type"),
+            "auto_map": config.get("auto_map"),
+            "is_encoder_decoder": config.get("is_encoder_decoder"),
+        }
+        return hashlib.sha256(json.dumps(relevant, sort_keys=True).encode()).hexdigest()[:16]
+    except Exception:
+        return ""
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Duration estimation for @spaces.GPU
+# ──────────────────────────────────────────────────────────────────────────────
+def estimate_gpu_duration(task: str, max_new_tokens: int, modality: str, model_size_hint: str = "") -> int:
+    """Estimate the GPU time needed for a request.
+
+    Returns duration in seconds for @spaces.GPU decorator.
+    """
+    base = DEFAULT_DURATION
+
+    # Task-based adjustments
+    if task in ("text-generation", "text2text-generation", "summarization",
+                "translation", "conversational", "chat"):
+        # Text generation allowance.  Model loading happens on the CPU worker
+        # OUTSIDE the GPU window, so this only needs to cover: move-onto-CUDA,
+        # generation, and a rare cache-evicted reload of small models.
+        # Measured warm path for 3B-class models is ~4-5s wall; these figures
+        # keep a ~4x safety margin over that.
+        gen_time = max_new_tokens / 60.0  # observed A10G-class throughput
+        load_time = 12  # base move/reload allowance (≤3B)
+        if "7b" in model_size_hint.lower() or "7B" in model_size_hint:
+            load_time = 20
+        elif "13b" in model_size_hint.lower() or "13B" in model_size_hint:
+            load_time = 35
+        elif "30b" in model_size_hint.lower() or "30B" in model_size_hint:
+            load_time = 50
+        elif "70b" in model_size_hint.lower() or "70B" in model_size_hint:
+            load_time = 70
+        base = int(load_time + gen_time + 10)  # 10s buffer
+
+    elif task in ("text-to-image", "image-generation"):
+        # Diffusion: ~5-15s per inference depending on steps
+        base = 60
+
+    elif task == "text-classification":
+        # Fast forward pass
+        base = 15
+
+    else:
+        base = 30
+
+    # Modality adjustments
+    if modality == "diffusion":
+        base = max(base, 45)
+    elif modality == "gguf":
+        # llama-cpp-python runs on CPU, faster load but slower generation
+        base = max(base, 20)
+
+    # Clamp to reasonable bounds
+    return max(MIN_DURATION, min(MAX_DURATION, base))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -255,7 +344,7 @@ def _load_diffusers(model_id, device, dtype) -> LoaderResult:
             "Diffusers backend is not installed in this Space.",
             code="model_load_error",
         )
-    pipe_kwargs = {"dtype": dtype} if device.type == "cuda" else {}
+    pipe_kwargs = {"dtype": dtype}
     try:
         pipe = DiffusionPipeline.from_pretrained(model_id, **pipe_kwargs)
         pipe = pipe.to(device)
@@ -275,17 +364,10 @@ def _load_diffusers(model_id, device, dtype) -> LoaderResult:
         device=device,
         dtype=dtype,
     )
-    # Note: the pipeline object lives on `pipe`, exposed via run_inference's
-    # rebuild step (see load_model); the LoaderResult.model stays None to keep
-    # the canonical interface intact, and Diffusers calls go through a side
-    # handle.
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Transformers loader (AutoConfig architecture resolver — identical logic to
-# hf_loader/notebook_builder.py, but executed here as real Python functions
-# instead of generated cell source).  Architecture/format detection remains
-# the source of truth; `task` does NOT influence the loading class.
+# Transformers loader (AutoConfig architecture resolver)
 # ──────────────────────────────────────────────────────────────────────────────
 def _is_multimodal(config, architectures):
     metadata = " ".join(
@@ -434,21 +516,20 @@ def _load_transformers(model_id, device, dtype) -> LoaderResult:
             code="model_load_error",
         )
 
-    model_kwargs = {"trust_remote_code": trust_remote_code}
-    if device.type == "cuda":
-        model_kwargs.update(dtype=dtype, device_map="auto")
+    model_kwargs = {"trust_remote_code": trust_remote_code, "dtype": dtype}
     try:
         model = ModelClass.from_pretrained(model_id, **model_kwargs)
     except Exception as e:
+        # Check for CUDA OOM specifically
+        if "CUDA out of memory" in str(e) or "out of memory" in str(e).lower():
+            raise ClaroBackendError(
+                f"GPU out of memory loading {model_id}. Try a smaller model or quantized variant.",
+                code="gpu_oom",
+            )
         raise ClaroBackendError(
             f"Could not load Transformers model {model_id} via {loaded_class}: {e}",
             code="model_load_error",
         )
-    if "device_map" not in model_kwargs:
-        try:
-            model = model.to(device)
-        except Exception:
-            pass
     model.eval()
 
     tokenizer = None
@@ -517,62 +598,141 @@ def _load_transformers(model_id, device, dtype) -> LoaderResult:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Top-level model loader with safe caching
+# Top-level model loader with safe caching (CPU-side, no GPU decorator)
 # ──────────────────────────────────────────────────────────────────────────────
-def load_model(model_id: str, gguf_file: Optional[str] = None) -> LoaderResult:
+def load_model(model_id: str, gguf_file: Optional[str] = None, revision: Optional[str] = None) -> LoaderResult:
+    """Load model on CPU (no GPU quota consumed). Returns cached result if available."""
     if not isinstance(model_id, str) or "/" not in model_id or model_id.strip() != model_id:
         raise ClaroBackendError(
             f"Invalid model_id: {model_id!r}",
             code="invalid_model_id",
         )
-    key = (model_id, gguf_file)
+
+    # Include revision and config hash in cache key for proper invalidation
+    config_hash = _get_config_hash(model_id)
+    key_parts = [model_id]
+    if gguf_file:
+        key_parts.append(f"gguf:{gguf_file}")
+    if revision:
+        key_parts.append(f"rev:{revision}")
+    if config_hash:
+        key_parts.append(f"cfg:{config_hash}")
+    key = "|".join(key_parts)
+
     with _CACHE_LOCK:
         if key in _CACHE:
             _CACHE.move_to_end(key)
-            return _CACHE[key]
+            result = _CACHE[key]
+            print(f"[CLARO] CACHE HIT model={model_id} key={key[:80]}")
+            return result
 
-    device, dtype = _device_dtype()
-    gguf_files = _list_gguf_files(model_id)
-    
-    # If user explicitly requests a specific GGUF file, honor it.
-    # Otherwise, if the repo has a config.json (standard Transformers model),
-    # prefer the Transformers loader over community-uploaded GGUF files.
-    # Only fall back to GGUF for pure GGUF models (no config.json).
-    if gguf_file:
-        result = _load_gguf(model_id, gguf_files, device, dtype)
-    elif gguf_files:
-        try:
-            from huggingface_hub import hf_hub_download
-            hf_hub_download(model_id, "config.json")
-            # Has config.json → standard Transformers model, use that.
-            result = _load_transformers(model_id, device, dtype)
-        except Exception:
-            # No config.json → pure GGUF model.
+    print(f"[CLARO] CACHE MISS model={model_id} key={key[:80]}")
+    load_start = time.time()
+
+    # Serialize loads: two concurrent misses must not both allocate full RAM.
+    with _LOAD_LOCK:
+        with _CACHE_LOCK:  # another thread may have loaded while we waited
+            if key in _CACHE:
+                _CACHE.move_to_end(key)
+                return _CACHE[key]
+
+        device, dtype = _device_dtype()
+        gguf_files = _list_gguf_files(model_id)
+
+        # If user explicitly requests a specific GGUF file, honor it.
+        # Otherwise, if the repo has a config.json (standard Transformers model),
+        # prefer the Transformers loader over community-uploaded GGUF files.
+        # Only fall back to GGUF for pure GGUF models (no config.json).
+        if gguf_file:
             result = _load_gguf(model_id, gguf_files, device, dtype)
-    elif _has_diffusers_model_index(model_id):
-        result = _load_diffusers(model_id, device, dtype)
-    else:
-        result = _load_transformers(model_id, device, dtype)
+        elif gguf_files:
+            try:
+                from huggingface_hub import hf_hub_download
+                hf_hub_download(model_id, "config.json")
+                # Has config.json → standard Transformers model, use that.
+                result = _load_transformers(model_id, device, dtype)
+            except Exception:
+                # No config.json → pure GGUF model.
+                result = _load_gguf(model_id, gguf_files, device, dtype)
+        elif _has_diffusers_model_index(model_id):
+            result = _load_diffusers(model_id, device, dtype)
+        else:
+            result = _load_transformers(model_id, device, dtype)
 
-    with _CACHE_LOCK:
-        _CACHE[key] = result
-        _CACHE.move_to_end(key)
-        while len(_CACHE) > MAX_CACHED:
-            _CACHE.popitem(last=False)
+        # Update config hash in result
+        result.config_hash = config_hash
+
+        with _CACHE_LOCK:
+            _CACHE[key] = result
+            _CACHE.move_to_end(key)
+            while len(_CACHE) > MAX_CACHED:
+                evicted_key = _CACHE.popitem(last=False)[0]
+                print(f"[CLARO] CACHE EVICT {evicted_key[:80]}")
+        print(f"[CLARO] LOAD DONE model={model_id} load_time={time.time() - load_start:.2f}s loaded_class={result.loaded_class}")
     return result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GPU move/offload helpers (ZeroGPU: model lives on CPU between calls)
+# ──────────────────────────────────────────────────────────────────────────────
+def _to_gpu(result: LoaderResult) -> float:
+    """Move the cached model onto CUDA inside a @spaces.GPU context.
+    Returns the move time in seconds.  GGUF stays on CPU by design.
+    """
+    if result.model is None or result.modality in ("gguf", "diffusion"):
+        return 0.0
+    import torch
+    if not torch.cuda.is_available():
+        return 0.0
+    start = time.time()
+    try:
+        result.model.to("cuda")
+    except Exception as e:
+        if "out of memory" in str(e).lower():
+            raise ClaroBackendError(
+                "GPU out of memory moving model to CUDA. Try a smaller model "
+                "or quantized variant.",
+                code="gpu_oom",
+            )
+        raise ClaroBackendError(f"Could not move model to GPU: {e}", code="model_runtime")
+    return time.time() - start
+
+
+def _offload_gpu(result: LoaderResult) -> None:
+    """Move the model back to CPU and release VRAM so the worker's cache can
+    hold multiple models without GPU OOM, and idle VRAM is not held hostage.
+    """
+    if result.model is None or result.modality in ("gguf", "diffusion"):
+        return
+    import torch
+    if not torch.cuda.is_available():
+        return
+    try:
+        result.model.to("cpu")
+    except Exception:
+        pass
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 def cache_stats():
     with _CACHE_LOCK:
-        return {"size": len(_CACHE), "keys": list(_CACHE.keys()), "max": MAX_CACHED}
+        # Return keys as tuples (model_id, ...) for backward compatibility with tests
+        # The full key is a composite string; extract model_id as first element
+        keys = []
+        for k in _CACHE.keys():
+            # Key format: "model_id|gguf:...|rev:...|cfg:..."
+            model_id = k.split("|")[0] if "|" in k else k
+            keys.append((model_id,))
+        return {"size": len(_CACHE), "keys": keys, "max": MAX_CACHED}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Inference dispatch.  `task` chooses the inference behaviour only; the model
-# class is already resolved by load_model above.  No arbitrary Python code is
-# executed — only literal handlers per supported task.
+# Inference dispatch (GPU-side, wrapped with @spaces.GPU)
 # ──────────────────────────────────────────────────────────────────────────────
-def _generate_text(result: LoaderResult, prompt: str, max_new_tokens: int) -> str:
+def _generate_text(result: LoaderResult, prompt: str, max_new_tokens: int, temperature: float = 0.7, top_p: float = 0.9) -> "tuple[str, Optional[int]]":
     import torch
     if result.preprocessor is None:
         raise ClaroBackendError(
@@ -586,15 +746,20 @@ def _generate_text(result: LoaderResult, prompt: str, max_new_tokens: int) -> st
             **inputs,
             max_new_tokens=int(max_new_tokens),
             do_sample=True,
-            temperature=0.7,
-            top_p=0.9,
+            temperature=temperature,
+            top_p=top_p,
             pad_token_id=getattr(result.preprocessor, "eos_token_id", None),
         )
     if is_enc_dec:
         new_ids = out[0]
     else:
         new_ids = out[0][inputs["input_ids"].shape[-1]:]
-    return result.preprocessor.decode(new_ids, skip_special_tokens=True)
+    # Token count for observability (no prompt contents are ever logged).
+    try:
+        n_new = int(new_ids.shape[-1])
+    except Exception:
+        n_new = None
+    return result.preprocessor.decode(new_ids, skip_special_tokens=True), n_new
 
 
 def _generate_text_to_image(result: LoaderResult, prompt: str, max_new_tokens: int) -> str:
@@ -615,51 +780,84 @@ def run_inference(
     prompt: str,
     max_new_tokens: int = 100,
     gguf_file: Optional[str] = None,
+    revision: Optional[str] = None,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
 ) -> str:
+    """Run inference on GPU. Model is loaded via load_model() which uses CPU cache.
+    
+    This function is decorated with @spaces.GPU in app.py with dynamic duration.
+    """
     task = (task or "text-generation").strip().lower()
-    result = load_model(model_id, gguf_file=gguf_file)
+    # Normally a CACHE HIT: app.py loads the model on the CPU worker before
+    # entering the @spaces.GPU function, so no download/reload happens here.
+    cache_size_before = len(_CACHE)
+    result = load_model(model_id, gguf_file=gguf_file, revision=revision)
+    cache_hit = len(_CACHE) <= cache_size_before
 
-    if task in ("text-generation", "text2text-generation", "summarization",
-                "translation", "question-answering", "conversational", "chat"):
-        if result.modality == "diffusion":
-            raise ClaroBackendError(
-                f"Task '{task}' is not compatible with a Diffusion pipeline.",
-                code="task_model_mismatch",
-            )
-        return _generate_text(result, prompt, max_new_tokens)
+    # Estimate duration for logging
+    model_size_hint = model_id.split("/")[-1] if "/" in model_id else model_id
+    estimated_duration = estimate_gpu_duration(task, max_new_tokens, result.modality, model_size_hint)
 
-    if task in ("text-to-image", "image-generation"):
-        if result.modality != "diffusion":
-            raise ClaroBackendError(
-                f"Task '{task}' requires a Diffusion pipeline, but {model_id} "
-                f"loaded as {result.loaded_class}.",
-                code="task_model_mismatch",
-            )
-        return _generate_text_to_image(result, prompt, max_new_tokens)
+    # GPU-scoped section: move cached CPU model → CUDA, run, offload back.
+    # Serialized so two GPU calls never fight over the same cached object.
+    n_tokens: Optional[int] = None
+    with _MOVE_LOCK:
+        move_in = _to_gpu(result)
+        start_time = time.time()
+        try:
+            if task in ("text-generation", "text2text-generation", "summarization",
+                        "translation", "question-answering", "conversational", "chat"):
+                if result.modality == "diffusion":
+                    raise ClaroBackendError(
+                        f"Task '{task}' is not compatible with a Diffusion pipeline.",
+                        code="task_model_mismatch",
+                    )
+                text, n_tokens = _generate_text(result, prompt, max_new_tokens, temperature, top_p)
 
-    if task == "text-classification":
-        if result.preprocessor is None or result.model is None:
-            raise ClaroBackendError(
-                "text-classification requires a model with a tokenizer.",
-                code="task_model_mismatch",
-            )
-        import torch
-        inputs = result.preprocessor(prompt, return_tensors="pt").to(result.model.device)
-        with torch.no_grad():
-            logits = result.model(**inputs).logits
-        idx = int(logits.argmax(-1).item())
-        label = result.model.config.id2label.get(idx, str(idx)) if hasattr(result.model.config, "id2label") else str(idx)
-        return f"{label}"
+            elif task in ("text-to-image", "image-generation"):
+                if result.modality != "diffusion":
+                    raise ClaroBackendError(
+                        f"Task '{task}' requires a Diffusion pipeline, but {model_id} "
+                        f"loaded as {result.loaded_class}.",
+                        code="task_model_mismatch",
+                    )
+                text = _generate_text_to_image(result, prompt, max_new_tokens)
 
-    # Generic fallback: surface forward-pass output as a short string.
-    if result.preprocessor is None or result.model is None:
-        raise ClaroBackendError(
-            f"Task '{task}' is not supported for model loaded as "
-            f"{result.loaded_class} (modality={result.modality}).",
-            code="task_model_mismatch",
-        )
-    import torch
-    inputs = result.preprocessor(prompt, return_tensors="pt").to(result.model.device)
-    with torch.no_grad():
-        outputs = result.model(**inputs)
-    return str(outputs)[:4000]
+            elif task == "text-classification":
+                if result.preprocessor is None or result.model is None:
+                    raise ClaroBackendError(
+                        "text-classification requires a model with a tokenizer.",
+                        code="task_model_mismatch",
+                    )
+                import torch
+                inputs = result.preprocessor(prompt, return_tensors="pt").to(result.model.device)
+                with torch.no_grad():
+                    logits = result.model(**inputs).logits
+                idx = int(logits.argmax(-1).item())
+                label = result.model.config.id2label.get(idx, str(idx)) if hasattr(result.model.config, "id2label") else str(idx)
+                text = f"{label}"
+
+            else:
+                # Generic fallback: surface forward-pass output as a short string.
+                if result.preprocessor is None or result.model is None:
+                    raise ClaroBackendError(
+                        f"Task '{task}' is not supported for model loaded as "
+                        f"{result.loaded_class} (modality={result.modality}).",
+                        code="task_model_mismatch",
+                    )
+                import torch
+                inputs = result.preprocessor(prompt, return_tensors="pt").to(result.model.device)
+                with torch.no_grad():
+                    outputs = result.model(**inputs)
+                text = str(outputs)[:4000]
+        finally:
+            _offload_gpu(result)
+
+    elapsed = time.time() - start_time
+    print(f"[CLARO] INFER model={model_id} task={task} max_new_tokens={max_new_tokens} "
+          f"modality={result.modality} loaded_class={result.loaded_class} "
+          f"gpu_size=default cache={'hit' if cache_hit else 'miss'} "
+          f"move_in={move_in:.2f}s exec={elapsed:.2f}s estimated={estimated_duration}s "
+          f"tokens={n_tokens} cache_size={len(_CACHE)}")
+    return text

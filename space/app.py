@@ -25,13 +25,18 @@ import spaces
 from backend import (
     ClaroBackendError,
     cache_stats,
+    load_model,
     run_inference,
+    estimate_gpu_duration,
 )
 
 # Defaults used when the local Claro.AI provider does not pass model_id/task
 # (e.g. someone clicking Submit in the Space UI directly).
 DEFAULT_MODEL_ID = "HuggingFaceTB/SmolLM3-3B"
 DEFAULT_TASK = "text-generation"
+
+# Hard limit for max_new_tokens
+MAX_NEW_TOKENS_LIMIT = 2048
 
 
 def _parse_structured(prompt_or_json: str):
@@ -58,8 +63,43 @@ def _parse_structured(prompt_or_json: str):
     return prompt_or_json, None, None, None
 
 
-@spaces.GPU
-def generate(prompt, max_new_tokens=100, model_id=None, task=None):
+def _gpu_duration(max_new_tokens, task, model_id, *_args, **_kwargs):
+    """Callable duration for @spaces.GPU.
+
+    ZeroGPU bills actual compute time, but `duration` is the kill-switch window.
+    We size it to the workload (task + max_new_tokens + model size hint) instead
+    of the one-size-fits-all default, so a 15-token request never reserves the
+    same window as a 2048-token one.  Over-long workloads are already rejected
+    (bad_request) before this runs, so the estimate never under-allocates.
+    """
+    try:
+        tokens = int(max_new_tokens or 100)
+    except Exception:
+        tokens = 100
+    t = str(task or DEFAULT_TASK).lower()
+    hint = (str(model_id or "")).split("/")[-1]
+    return estimate_gpu_duration(t, tokens, "", hint)
+
+
+@spaces.GPU(duration=_gpu_duration)
+def _gpu_infer(prompt, max_new_tokens, task, model_id, gguf_file, revision, temperature, top_p):
+    """GPU-scoped inference: moves the CPU-cached model onto CUDA, runs the
+    requested task, and offloads it again.  Model *loading* deliberately happens
+    on the CPU worker (see generate()) so cold loads do not consume GPU seconds.
+    """
+    return run_inference(
+        model_id=model_id,
+        task=task,
+        prompt=prompt,
+        max_new_tokens=max_new_tokens,
+        gguf_file=gguf_file,
+        revision=revision,
+        temperature=temperature,
+        top_p=top_p,
+    )
+
+
+def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=None, revision=None, temperature=0.7, top_p=0.9):
     """Structured endpoint.
 
     Args:
@@ -67,10 +107,14 @@ def generate(prompt, max_new_tokens=100, model_id=None, task=None):
                           structured request {"model_id","task","prompt",
                           "max_new_tokens"} so the Replit provider can send a
                           single payload and reuse the same endpoint.
-        max_new_tokens:   integer 1..500
+        max_new_tokens:   integer 1..2048 (hard limit)
         model_id:         Hugging Face repo id.  When None, falls back to
                           DEFAULT_MODEL_ID (SmolLM3-3B on the bare Space UI).
         task:             inference behaviour, e.g. "text-generation".
+        gguf_file:        Optional specific GGUF file to load.
+        revision:         Optional model revision for cache invalidation.
+        temperature:      Sampling temperature (default 0.7).
+        top_p:            Nucleus sampling top-p (default 0.9).
 
     Returns:
         str: generated text, or a structured error string of the form
@@ -92,25 +136,55 @@ def generate(prompt, max_new_tokens=100, model_id=None, task=None):
     if not prompt or not isinstance(prompt, str):
         return f"[CLARO:bad_request] prompt is required"
 
-    # Clamp the slider-equivalent knob to the Space's documented range.
+    # Hard limit for max_new_tokens - reject instead of silent clamp
     try:
         max_new_tokens = int(max_new_tokens)
     except Exception:
         max_new_tokens = 100
-    if max_new_tokens < 1: max_new_tokens = 1
-    if max_new_tokens > 500: max_new_tokens = 500
+    if max_new_tokens < 1:
+        return f"[CLARO:bad_request] max_new_tokens must be >= 1"
+    if max_new_tokens > MAX_NEW_TOKENS_LIMIT:
+        return f"[CLARO:bad_request] max_new_tokens exceeds hard limit of {MAX_NEW_TOKENS_LIMIT}"
+
+    # Validate temperature/top_p
+    try:
+        temperature = float(temperature)
+        if not (0.0 <= temperature <= 2.0):
+            temperature = 0.7
+    except Exception:
+        temperature = 0.7
+    try:
+        top_p = float(top_p)
+        if not (0.0 <= top_p <= 1.0):
+            top_p = 0.9
+    except Exception:
+        top_p = 0.9
+
+    # Estimate duration for logging (actual quota based on real compute time)
+    model_size_hint = model_id.split("/")[-1] if "/" in model_id else model_id
+    estimated_duration = estimate_gpu_duration(task, max_new_tokens, "", model_size_hint)
 
     try:
-        text = run_inference(
-            model_id=model_id,
-            task=task,
-            prompt=prompt,
-            max_new_tokens=max_new_tokens,
+        # 1) Model load happens HERE, on the CPU worker (no @spaces.GPU), so
+        #    downloads/from_pretrained never consume GPU-seconds.  Repeated
+        #    requests for the same model hit the LRU cache and cost ~0 time.
+        load_model(model_id, gguf_file=gguf_file, revision=revision)
+        # 2) GPU quota is consumed ONLY by the explicit inference call below,
+        #    with a workload-sized duration window.
+        text = _gpu_infer(
+            prompt,
+            max_new_tokens,
+            task,
+            model_id,
+            gguf_file,
+            revision,
+            temperature,
+            top_p,
         )
         # Return the generated text verbatim on success — the local Claro.AI
         # provider returns it directly to the dashboard.  Debug info (model
         # loaded, cache stats) goes to stdout/logs instead.
-        print(f"[CLARO] model={model_id} task={task} cache={cache_stats()}")
+        print(f"[CLARO] model={model_id} task={task} cache={cache_stats()} estimated_duration={estimated_duration}s")
         return text
     except ClaroBackendError as e:
         # Surface as a structured error string (NOT a Gradio exception) so the
@@ -119,6 +193,10 @@ def generate(prompt, max_new_tokens=100, model_id=None, task=None):
         return str(e)
     except Exception as e:
         tb = traceback.format_exc(limit=3)
+        # Check for CUDA OOM in unexpected errors
+        err_msg = str(e)
+        if "CUDA out of memory" in err_msg or "out of memory" in err_msg.lower():
+            return f"[CLARO:gpu_oom] GPU out of memory: {err_msg}"
         return f"[CLARO:model_runtime] unexpected error: {e}\n{tb}"
 
 
@@ -132,9 +210,13 @@ demo = gr.Interface(
     fn=generate,
     inputs=[
         gr.Textbox(label="Prompt (or JSON: {model_id,task,prompt,max_new_tokens})"),
-        gr.Slider(minimum=1, maximum=500, value=100, step=1, label="Max new tokens"),
+        gr.Slider(minimum=1, maximum=MAX_NEW_TOKENS_LIMIT, value=100, step=1, label="Max new tokens"),
         gr.Textbox(label="Model id", value=DEFAULT_MODEL_ID),
         gr.Textbox(label="Task", value=DEFAULT_TASK),
+        gr.Textbox(label="GGUF file (optional)", value=""),
+        gr.Textbox(label="Revision (optional)", value=""),
+        gr.Slider(minimum=0.0, maximum=2.0, value=0.7, step=0.1, label="Temperature"),
+        gr.Slider(minimum=0.0, maximum=1.0, value=0.9, step=0.05, label="Top-p"),
     ],
     outputs=gr.Textbox(label="Output"),
     title="Claro.AI GPU — generic backend",

@@ -73,6 +73,12 @@ function safeReadSpaceResolvedUrl(env) {
   return { spaceId: space, base };
 }
 
+// Hard limit for max_new_tokens (matches Space side)
+const MAX_NEW_TOKENS_LIMIT = 2048;
+
+// Request deduplication cache (in-flight requests)
+const _inflightRequests = new Map();
+
 // Validate the structured request.  Returns a normalized object or throws.
 function normalizeStructuredRequest(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
@@ -129,15 +135,33 @@ function normalizeStructuredRequest(body) {
     }
     maxNewTokens = n;
   }
-  // The Space's slider is 1..500.  Clamp before sending so we don't trigger a
-  // Gradio validation error, but still flag wildly out-of-range values.
-  if (maxNewTokens < 1) maxNewTokens = 1;
-  if (maxNewTokens > 500) {
-    // Soft cap rather than hard reject — long generations still work.
-    maxNewTokens = 500;
+  // Hard limit - reject instead of silent clamp
+  if (maxNewTokens < 1) {
+    throw new GpuError('inputs.max_new_tokens must be >= 1', 'bad_request', 400);
+  }
+  if (maxNewTokens > MAX_NEW_TOKENS_LIMIT) {
+    throw new GpuError(
+      `inputs.max_new_tokens exceeds hard limit of ${MAX_NEW_TOKENS_LIMIT}`,
+      'bad_request',
+      400
+    );
   }
 
-  return { modelId, task, prompt, max_new_tokens: maxNewTokens };
+  // Optional parameters
+  const temperature = inputs.temperature !== undefined ? Number(inputs.temperature) : 0.7;
+  const top_p = inputs.top_p !== undefined ? Number(inputs.top_p) : 0.9;
+  const gguf_file = inputs.gguf_file || null;
+  const revision = inputs.revision || null;
+
+  return { modelId, task, prompt, max_new_tokens: maxNewTokens, temperature, top_p, gguf_file, revision };
+}
+
+// Generate a deduplication key for a request
+function _dedupKey(modelId, task, prompt, maxNewTokens, temperature, top_p) {
+  const crypto = require('crypto');
+  const hash = crypto.createHash('sha256');
+  hash.update(`${modelId}|${task}|${prompt}|${maxNewTokens}|${temperature}|${top_p}`);
+  return hash.digest('hex').slice(0, 16);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -195,11 +219,16 @@ class ZeroGPUBackend {
   // supported repo (Transformers / Diffusers / GGUF) instead of hard-coding
   // a single model.  We forward the validated model_id/task alongside the
   // prompt so the Space actually does the requested work.
-  async _postGenerate(prompt, maxNewTokens, signal, modelId, task, authToken) {
+  async _postGenerate(prompt, maxNewTokens, signal, modelId, task, authToken, temperature, top_p, gguf_file, revision) {
     const url = `${this.base}/gradio_api/call/v2/generate`;
     const body = { prompt, max_new_tokens: maxNewTokens };
     if (modelId) body.model_id = modelId;
     if (task) body.task = task;
+    // Only send temperature/top_p if they differ from defaults (backward compat)
+    if (temperature !== undefined && temperature !== 0.7) body.temperature = temperature;
+    if (top_p !== undefined && top_p !== 0.9) body.top_p = top_p;
+    if (gguf_file) body.gguf_file = gguf_file;
+    if (revision) body.revision = revision;
     const headers = { 'Content-Type': 'application/json' };
     if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
     const res = await fetch(url, {
@@ -314,6 +343,7 @@ class ZeroGPUBackend {
                     code === 'task_not_exposed'     ? 422 :
                     code === 'model_load_error'     ? 502 :
                     code === 'gguf_multiple_files'  ? 422 :
+                    code === 'gpu_oom'              ? 502 :
                     502;
                   throw new GpuError(`ZeroGPU model error: ${message}`, code, status);
                 }
@@ -362,6 +392,7 @@ class ZeroGPUBackend {
               code === 'task_not_exposed'     ? 422 :
               code === 'model_load_error'     ? 502 :
               code === 'gguf_multiple_files'  ? 422 :
+              code === 'gpu_oom'              ? 502 :
               502;
             throw new GpuError(`ZeroGPU model error: ${message}`, code, status);
           }
@@ -397,9 +428,13 @@ class ZeroGPUBackend {
       if (/No GPU was available after \d+s/i.test(message)) code = 'zerogpu_timeout';
       if (/Not Found/i.test(message)) code = 'space_unavailable';
       if (/Unrecognized|does not have|model_type|from_pretrained/i.test(message)) code = 'invalid_model_id';
+      if (/out of memory/i.test(message)) code = 'gpu_oom';
       let displayMessage = message;
       if (code === 'zerogpu_timeout') {
         displayMessage = 'ZeroGPU timeout: this model took too long to initialize or execute within ZeroGPU\'s execution limit. Try a smaller/quantized model or switch GPU provider.';
+      }
+      if (code === 'gpu_oom') {
+        displayMessage = 'GPU out of memory: this model does not fit on the available ZeroGPU. Try a smaller/quantized model or switch GPU provider.';
       }
       throw new GpuError(`ZeroGPU error: ${displayMessage}`, code, status);
     }
@@ -411,11 +446,49 @@ class ZeroGPUBackend {
 
   // run(body, signal, onLine, authToken): { output, stderr }
   async run(body, signal, onLine, authToken) {
-    const { modelId, task, prompt, max_new_tokens } = normalizeStructuredRequest(body);
-    if (onLine) onLine(`↗ ZeroGPU → ${this.spaceId}  model=${modelId} task=${task} max_new_tokens=${max_new_tokens}`);
+    const { modelId, task, prompt, max_new_tokens, temperature, top_p, gguf_file, revision } = normalizeStructuredRequest(body);
+
+    // Request deduplication: check if identical request is already in-flight
+    const dedupKey = _dedupKey(modelId, task, prompt, max_new_tokens, temperature, top_p);
+    if (_inflightRequests.has(dedupKey)) {
+      console.log('[ZeroGPU] Deduplicating request:', dedupKey);
+      if (onLine) onLine(`↗ ZeroGPU (dedup) → ${this.spaceId}  model=${modelId} task=${task} max_new_tokens=${max_new_tokens}`);
+      // Wait for the existing request to complete
+      try {
+        const result = await _inflightRequests.get(dedupKey);
+        // Clean up after a short delay to allow rapid re-requests
+        setTimeout(() => _inflightRequests.delete(dedupKey), 1000);
+        return result;
+      } catch (err) {
+        _inflightRequests.delete(dedupKey);
+        throw err;
+      }
+    }
+
+    if (onLine) onLine(`↗ ZeroGPU → ${this.spaceId}  model=${modelId} task=${task} max_new_tokens=${max_new_tokens} temp=${temperature} top_p=${top_p}`);
+
+    // Create the promise and store it for deduplication
+    const runPromise = this._runInternal(prompt, max_new_tokens, signal, modelId, task, authToken, temperature, top_p, gguf_file, revision, onLine);
+    _inflightRequests.set(dedupKey, runPromise);
+
+    try {
+      const result = await runPromise;
+      // Keep a *successful* result briefly so rapid-fire re-requests (double
+      // clicks, component re-renders) reuse it instead of consuming quota.
+      setTimeout(() => _inflightRequests.delete(dedupKey), 1000);
+      return result;
+    } catch (err) {
+      // Failures are dropped immediately — never replay an error to a later
+      // caller, and let a genuine retry make a real call.
+      _inflightRequests.delete(dedupKey);
+      throw err;
+    }
+  }
+
+  async _runInternal(prompt, max_new_tokens, signal, modelId, task, authToken, temperature, top_p, gguf_file, revision, onLine) {
     let eventId;
     try {
-      eventId = await this._postGenerate(prompt, max_new_tokens, signal, modelId, task, authToken);
+      eventId = await this._postGenerate(prompt, max_new_tokens, signal, modelId, task, authToken, temperature, top_p, gguf_file, revision);
     } catch (err) {
       if (err.name === 'AbortError') throw new GpuError('ZeroGPU call was cancelled.', 'cancelled', 499);
       if (err.name === 'TypeError') {
@@ -564,4 +637,5 @@ module.exports = {
   resolveBackend,
   normalizeStructuredRequest,
   defaultSpaceUrl,
+  MAX_NEW_TOKENS_LIMIT,
 };

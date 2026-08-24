@@ -3181,6 +3181,10 @@ print(f"Loaded {loaded_class} on {DEVICE}")
     // the inference cell's generated Python (the `prompt = "..."` line) so the
     // generator stays the sole source of the displayed example prompt; this
     // function only adapts the transport, not the model cell template.
+    // Server-side hard limit for ZeroGPU max_new_tokens (mirrors gpu_backends.js
+    // and the Space).  Used only to warn early — values are never silently clamped.
+    const ZEROGPU_MAX_NEW_TOKENS = 2048;
+
 function parsePromptAndMaxTokens(inferenceContent, defaultPrompt) {
       const text = String(inferenceContent || '');
       // Simpler/forgiving: first "prompt = <string>" with either kind of quotes.
@@ -3192,7 +3196,11 @@ function parsePromptAndMaxTokens(inferenceContent, defaultPrompt) {
       const mTok = text.match(/max_new_tokens\s*=\s*(\d+)/);
       if (mTok) {
         const n = parseInt(mTok[1], 10);
-        if (Number.isFinite(n) && n >= 1) maxNewTokens = Math.min(n, 500);
+        // No silent clamping: the requested value is passed through verbatim.
+        // Values above the server-side hard limit (ZEROGPU_MAX_NEW_TOKENS)
+        // produce a visible validation error from /api/zerogpu-run instead of
+        // being silently reduced.
+        if (Number.isFinite(n) && n >= 1) maxNewTokens = n;
       }
       return { prompt, max_new_tokens: maxNewTokens };
     }
@@ -3230,6 +3238,9 @@ function parsePromptAndMaxTokens(inferenceContent, defaultPrompt) {
       const { prompt, max_new_tokens } = parsePromptAndMaxTokens(inferenceContent, 'Once upon a time');
 
       writeGpuLine(`↗ POST /api/zerogpu-run  model=${modelId}  task=${task}  max_new_tokens=${max_new_tokens}`, 'gray');
+      if (max_new_tokens > ZEROGPU_MAX_NEW_TOKENS) {
+        writeGpuLine(`⚠️ max_new_tokens=${max_new_tokens} exceeds the hard limit of ${ZEROGPU_MAX_NEW_TOKENS} — the server will reject this with a validation error. Lower it in the inference cell.`, 'yellow');
+      }
       writeGpuLine(`  prompt: ${prompt.length > 60 ? prompt.slice(0, 60) + '…' : prompt}`);
 
       const body = { model_id: modelId, task, inputs: { prompt, max_new_tokens } };

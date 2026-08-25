@@ -31,13 +31,17 @@ from __future__ import annotations
 
 import importlib
 import io
+import logging
 import os
 import threading
 import time
+import traceback
 import hashlib
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Optional
+
+logger = logging.getLogger("claro.backend")
 
 MAX_CACHED = max(1, int(os.environ.get("CLARO_SPACE_MAX_CACHED", "3")))
 _CACHE: "OrderedDict[str, LoaderResult]" = OrderedDict()
@@ -316,8 +320,12 @@ def _load_gguf(model_id, files, device, dtype) -> LoaderResult:
             path = hf_hub_download(model_id, gguf_file)
             llm = Llama(path, **llm_kwargs)
     except Exception as e:
+        logger.error(
+            "Failed to load GGUF model %s/%s:\n%s",
+            model_id, gguf_file, traceback.format_exc(),
+        )
         raise ClaroBackendError(
-            f"Could not load GGUF model {model_id}/{gguf_file}: {e}",
+            f"Could not load GGUF model {model_id}/{gguf_file} ({type(e).__name__}: {e})",
             code="model_load_error",
         )
     return LoaderResult(
@@ -349,8 +357,12 @@ def _load_diffusers(model_id, device, dtype) -> LoaderResult:
         pipe = DiffusionPipeline.from_pretrained(model_id, **pipe_kwargs)
         pipe = pipe.to(device)
     except Exception as e:
+        logger.error(
+            "Failed to load Diffusers pipeline for %s:\n%s",
+            model_id, traceback.format_exc(),
+        )
         raise ClaroBackendError(
-            f"Could not load Diffusers pipeline for {model_id}: {e}",
+            f"Could not load Diffusers pipeline for {model_id} ({type(e).__name__}: {e})",
             code="model_load_error",
         )
     return LoaderResult(
@@ -414,6 +426,71 @@ def _arch_suffix_to_autoclass(architecture):
 _REMOTE_MODEL_TYPES = set()  # trust_remote_code is decided by auto_map only
 
 
+def _normalize_legacy_rope_scaling(config):
+    """Reconcile transformers>=5 rope_scaling normalization with remote code
+    written against the transformers 4.x config convention.
+
+    transformers>=5 always materializes ``config.rope_scaling`` as a dict and
+    renamed the legacy ``"type"`` key to ``"rope_type"``; a repo that declares
+    ``rope_scaling: null`` now surfaces as ``{"rope_type": "default", ...}``.
+    Custom (trust_remote_code) model implementations written for 4.x expect
+    ``rope_scaling`` to be ``None`` when no scaling is configured, or a dict
+    containing the legacy ``"type"`` key otherwise — e.g. their rope init does
+    ``config.rope_scaling["type"]`` and dies with ``KeyError: 'type'``.
+
+    For remote-code configs only, restore the legacy shape generically:
+      * effective type "default"/None → ``rope_scaling = None`` (no scaling
+        was ever configured by the repo; the dict was synthesized)
+      * otherwise → alias ``type`` ↔ ``rope_type`` in both directions
+    Built-in configs are never touched by the caller.
+    """
+    rope = getattr(config, "rope_scaling", None)
+    if not isinstance(rope, dict):
+        return
+    rope_type = rope.get("rope_type", rope.get("type"))
+    if rope_type in (None, "default"):
+        config.rope_scaling = None
+    else:
+        rope.setdefault("type", rope_type)
+        rope.setdefault("rope_type", rope_type)
+
+
+def _patch_cache_api_for_remote_code():
+    """Restore transformers 4.x empty-cache semantics for remote-code models.
+
+    transformers>=5 restructured caches into per-layer objects; the base
+    ``Cache.get_max_length()`` computes ``max(...)`` over ``self.layers`` and
+    (a) raises ``ValueError`` on a still-empty (prefill) cache, (b) reports an
+    unbounded dynamic cache as ``-1``.  transformers 4.x reported both as
+    ``None`` ("no maximum"), which is exactly what custom remote code written
+    for 4.x tests via ``if cache.get_max_length() is not None`` and feeds into
+    numeric ops (``-1`` crashes ``torch.min``/slicing; v5's own docstring
+    defines ``-1`` as "no maximum", i.e. the same meaning spelled differently).
+
+    Caches with a real configured maximum (static/sliding-window layers)
+    return their value unchanged, so bounded-cache behavior is preserved.
+    """
+    try:
+        from transformers.cache_utils import Cache
+    except Exception:
+        return
+    if getattr(Cache, "_claro_max_length_compat", False):
+        return
+    if not hasattr(Cache, "get_max_length"):
+        return  # v4.x: no compat needed; v5.x adds this method
+    orig = Cache.get_max_length
+
+    def _compat_get_max_length(self, layer_idx=None):
+        if layer_idx is None and len(getattr(self, "layers", None) or []) == 0:
+            return None  # v4 semantics: an empty cache has no max length yet
+        result = orig(self, layer_idx)
+        return None if result == -1 else result  # v5 "-1" == v4 None
+
+    Cache._claro_orig_get_max_length = orig
+    Cache.get_max_length = _compat_get_max_length
+    Cache._claro_max_length_compat = True
+
+
 def _load_transformers(model_id, device, dtype) -> LoaderResult:
     import torch
     try:
@@ -429,8 +506,11 @@ def _load_transformers(model_id, device, dtype) -> LoaderResult:
             config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
             config_requires_remote_code = True
         except Exception as e:
+            logger.error(
+                "AutoConfig failed for %s:\n%s", model_id, traceback.format_exc()
+            )
             raise ClaroBackendError(
-                f"Could not read AutoConfig for {model_id}: {e}",
+                f"Could not read AutoConfig for {model_id} ({type(e).__name__}: {e})",
                 code="model_load_error",
             )
 
@@ -453,6 +533,11 @@ def _load_transformers(model_id, device, dtype) -> LoaderResult:
         return any(not hasattr(transformers, str(t).rsplit(".", 1)[-1]) for t in targets)
 
     trust_remote_code = _architecture_requires_remote_code()
+    if trust_remote_code:
+        # Custom code may be written against older transformers conventions;
+        # make the config object and runtime cache API legacy-compatible.
+        _normalize_legacy_rope_scaling(config)
+        _patch_cache_api_for_remote_code()
 
     def _auto_class_from_map():
         for k in auto_map:
@@ -516,10 +601,22 @@ def _load_transformers(model_id, device, dtype) -> LoaderResult:
             code="model_load_error",
         )
 
-    model_kwargs = {"trust_remote_code": trust_remote_code, "dtype": dtype}
+    # Pass the already-resolved config through so (a) the normalization above
+    # actually reaches custom model code and (b) the config is not fetched twice.
+    model_kwargs = {
+        "config": config,
+        "trust_remote_code": trust_remote_code,
+        "dtype": dtype,
+    }
     try:
         model = ModelClass.from_pretrained(model_id, **model_kwargs)
     except Exception as e:
+        # Log the COMPLETE underlying traceback server-side so a bare
+        # "KeyError: 'type'"-style string never hides the real failure.
+        logger.error(
+            "Failed to load Transformers model %s via %s:\n%s",
+            model_id, loaded_class, traceback.format_exc(),
+        )
         # Check for CUDA OOM specifically
         if "CUDA out of memory" in str(e) or "out of memory" in str(e).lower():
             raise ClaroBackendError(
@@ -527,7 +624,8 @@ def _load_transformers(model_id, device, dtype) -> LoaderResult:
                 code="gpu_oom",
             )
         raise ClaroBackendError(
-            f"Could not load Transformers model {model_id} via {loaded_class}: {e}",
+            f"Could not load Transformers model {model_id} via {loaded_class} "
+            f"({type(e).__name__}: {e})",
             code="model_load_error",
         )
     model.eval()
@@ -732,7 +830,28 @@ def cache_stats():
 # ──────────────────────────────────────────────────────────────────────────────
 # Inference dispatch (GPU-side, wrapped with @spaces.GPU)
 # ──────────────────────────────────────────────────────────────────────────────
-def _generate_text(result: LoaderResult, prompt: str, max_new_tokens: int, temperature: float = 0.7, top_p: float = 0.9) -> "tuple[str, Optional[int]]":
+def _logits_diag(tag: str, scores) -> None:
+    """Log numerical diagnostics for a logits tensor. Purely diagnostic."""
+    import torch
+    try:
+        finite_vals = scores[scores.isfinite()]
+        nan_count = int(torch.isnan(scores).sum().item())
+        inf_count = int(torch.isinf(scores).sum().item())
+        total = scores.numel()
+        mn = float(finite_vals.min().item()) if finite_vals.numel() > 0 else float("nan")
+        mx = float(finite_vals.max().item()) if finite_vals.numel() > 0 else float("nan")
+        logger.warning(
+            "[CLARO-DIAG] %s dtype=%s device=%s shape=%s nan=%d/%d inf=%d/%d min=%.6g max=%.6g",
+            tag, scores.dtype, scores.device, list(scores.shape),
+            nan_count, total, inf_count, total, mn, mx,
+        )
+    except Exception as exc:
+        logger.warning("[CLARO-DIAG] %s logits_diag failed: %s", tag, exc)
+
+
+def _generate_text(result: LoaderResult, prompt: str, max_new_tokens: int,
+                    temperature: float = 0.7, top_p: float = 0.9,
+                    do_sample: bool = True) -> "tuple[str, Optional[int]]":
     import torch
     if result.preprocessor is None:
         raise ClaroBackendError(
@@ -741,15 +860,87 @@ def _generate_text(result: LoaderResult, prompt: str, max_new_tokens: int, tempe
         )
     inputs = result.preprocessor(prompt, return_tensors="pt").to(result.model.device)
     is_enc_dec = bool(getattr(result.model.config, "is_encoder_decoder", False))
+    on_cuda = torch.cuda.is_available() and next(result.model.parameters()).is_cuda
+
+    # ── DIAGNOSTIC: pre-generate forward pass to check raw logits ──
+    # Runs one forward step to determine whether NaN/Inf originates in the
+    # model forward itself, before generate() enters its sampling loop.
+    if on_cuda:
+        try:
+            torch.cuda.synchronize()
+            with torch.no_grad():
+                fwd_out = result.model(**inputs)
+            torch.cuda.synchronize()
+            raw_logits = getattr(fwd_out, "logits", None)
+            if raw_logits is None and hasattr(fwd_out, "last_hidden_state"):
+                raw_logits = fwd_out.last_hidden_state
+            if raw_logits is not None:
+                _logits_diag("PRE-GEN-FWD raw logits", raw_logits)
+                # Check softmax of raw logits (what multinomial would see)
+                try:
+                    probs = torch.softmax(raw_logits.float(), dim=-1)
+                    _logits_diag("PRE-GEN-FWD softmax probs", probs)
+                    del probs
+                except Exception as exc:
+                    logger.warning("[CLARO-DIAG] PRE-GEN-FWD softmax failed: %s", exc)
+                del fwd_out, raw_logits
+            torch.cuda.empty_cache()
+        except Exception as exc:
+            logger.warning("[CLARO-DIAG] PRE-GEN-FWD model forward failed: %s", exc)
+
+    # ── DIAGNOSTIC LOGITS PROCESSOR ──
+    # Hooks into generate()'s logits pipeline. Logs scores at each call,
+    # giving visibility into: (a) what generate() sees after the model
+    # forward, (b) what each processor produces, (c) NaN/Inf state.
+    from transformers import LogitsProcessorList, LogitsProcessor
+
+    class _DiagnosticLogitsProcessor(LogitsProcessor):
+        def __init__(self):
+            self._call_count = 0
+
+        def __call__(self, input_ids, scores):
+            self._call_count += 1
+            _logits_diag(f"PROC-CALL-{self._call_count} pre-cast", scores)
+            # Cast to float32 (existing fix — kept for now)
+            if scores.dtype != torch.float32:
+                scores = scores.float()
+                _logits_diag(f"PROC-CALL-{self._call_count} post-cast", scores)
+            return scores
+
+    proc = _DiagnosticLogitsProcessor()
+
+    # ── GENERATE ──
+    gen_kwargs = dict(
+        **inputs,
+        max_new_tokens=int(max_new_tokens),
+        do_sample=bool(do_sample),
+        logits_processor=LogitsProcessorList([proc]),
+        pad_token_id=getattr(result.preprocessor, "eos_token_id", None),
+    )
+    if do_sample:
+        gen_kwargs["temperature"] = temperature
+        gen_kwargs["top_p"] = top_p
+
     with torch.no_grad():
-        out = result.model.generate(
-            **inputs,
-            max_new_tokens=int(max_new_tokens),
-            do_sample=True,
-            temperature=temperature,
-            top_p=top_p,
-            pad_token_id=getattr(result.preprocessor, "eos_token_id", None),
-        )
+        try:
+            out = result.model.generate(**gen_kwargs)
+        except Exception as exc:
+            # CUDA device-side assert — log diagnostics and re-raise
+            logger.warning("[CLARO-DIAG] generate() failed: %s", exc)
+            raise
+
+    # ── DIAGNOSTIC: post-generate output check ──
+    if on_cuda:
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+    try:
+        new_ids = out[0] if is_enc_dec else out[0][inputs["input_ids"].shape[-1]:]
+        _logits_diag("POST-GEN output token ids (float)", new_ids.float())
+    except Exception:
+        pass
+
     if is_enc_dec:
         new_ids = out[0]
     else:
@@ -783,6 +974,7 @@ def run_inference(
     revision: Optional[str] = None,
     temperature: float = 0.7,
     top_p: float = 0.9,
+    do_sample: bool = True,
 ) -> str:
     """Run inference on GPU. Model is loaded via load_model() which uses CPU cache.
     
@@ -813,7 +1005,7 @@ def run_inference(
                         f"Task '{task}' is not compatible with a Diffusion pipeline.",
                         code="task_model_mismatch",
                     )
-                text, n_tokens = _generate_text(result, prompt, max_new_tokens, temperature, top_p)
+                text, n_tokens = _generate_text(result, prompt, max_new_tokens, temperature, top_p, do_sample=do_sample)
 
             elif task in ("text-to-image", "image-generation"):
                 if result.modality != "diffusion":

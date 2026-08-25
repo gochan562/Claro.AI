@@ -46,7 +46,7 @@ def _parse_structured(prompt_or_json: str):
     the local provider send a single structured blob.
     """
     if not isinstance(prompt_or_json, str):
-        return prompt_or_json, None, None, None
+        return prompt_or_json, None, None, None, None
     s = prompt_or_json.strip()
     if s.startswith("{") and s.endswith("}"):
         try:
@@ -57,10 +57,11 @@ def _parse_structured(prompt_or_json: str):
                     obj.get("model_id"),
                     obj.get("task"),
                     obj.get("max_new_tokens"),
+                    obj.get("do_sample"),
                 )
         except Exception:
             pass
-    return prompt_or_json, None, None, None
+    return prompt_or_json, None, None, None, None
 
 
 def _gpu_duration(max_new_tokens, task, model_id, *_args, **_kwargs):
@@ -82,7 +83,7 @@ def _gpu_duration(max_new_tokens, task, model_id, *_args, **_kwargs):
 
 
 @spaces.GPU(duration=_gpu_duration)
-def _gpu_infer(prompt, max_new_tokens, task, model_id, gguf_file, revision, temperature, top_p):
+def _gpu_infer(prompt, max_new_tokens, task, model_id, gguf_file, revision, temperature, top_p, do_sample):
     """GPU-scoped inference: moves the CPU-cached model onto CUDA, runs the
     requested task, and offloads it again.  Model *loading* deliberately happens
     on the CPU worker (see generate()) so cold loads do not consume GPU seconds.
@@ -96,10 +97,11 @@ def _gpu_infer(prompt, max_new_tokens, task, model_id, gguf_file, revision, temp
         revision=revision,
         temperature=temperature,
         top_p=top_p,
+        do_sample=do_sample,
     )
 
 
-def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=None, revision=None, temperature=0.7, top_p=0.9):
+def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=None, revision=None, temperature=0.7, top_p=0.9, do_sample=True):
     """Structured endpoint.
 
     Args:
@@ -123,12 +125,14 @@ def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=Non
     """
     # Unwrap an optional structured JSON payload passed through `prompt`.
     if model_id is None and task is None:
-        p, mid, t, mnt = _parse_structured(prompt)
+        p, mid, t, mnt, ds = _parse_structured(prompt)
         if mid is not None:
             model_id = mid
             task = t
             if mnt is not None:
                 max_new_tokens = mnt
+            if ds is not None:
+                do_sample = bool(ds)
             prompt = p
 
     model_id = (model_id or DEFAULT_MODEL_ID).strip()
@@ -159,6 +163,11 @@ def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=Non
             top_p = 0.9
     except Exception:
         top_p = 0.9
+    # Validate do_sample
+    if isinstance(do_sample, str):
+        do_sample = do_sample.strip().lower() not in ("false", "0", "no", "")
+    else:
+        do_sample = bool(do_sample)
 
     # Estimate duration for logging (actual quota based on real compute time)
     model_size_hint = model_id.split("/")[-1] if "/" in model_id else model_id
@@ -180,6 +189,7 @@ def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=Non
             revision,
             temperature,
             top_p,
+            do_sample,
         )
         # Return the generated text verbatim on success — the local Claro.AI
         # provider returns it directly to the dashboard.  Debug info (model
@@ -209,7 +219,7 @@ def show_cache():
 demo = gr.Interface(
     fn=generate,
     inputs=[
-        gr.Textbox(label="Prompt (or JSON: {model_id,task,prompt,max_new_tokens})"),
+        gr.Textbox(label="Prompt (or JSON: {model_id,task,prompt,max_new_tokens,do_sample})"),
         gr.Slider(minimum=1, maximum=MAX_NEW_TOKENS_LIMIT, value=100, step=1, label="Max new tokens"),
         gr.Textbox(label="Model id", value=DEFAULT_MODEL_ID),
         gr.Textbox(label="Task", value=DEFAULT_TASK),
@@ -217,6 +227,7 @@ demo = gr.Interface(
         gr.Textbox(label="Revision (optional)", value=""),
         gr.Slider(minimum=0.0, maximum=2.0, value=0.7, step=0.1, label="Temperature"),
         gr.Slider(minimum=0.0, maximum=1.0, value=0.9, step=0.05, label="Top-p"),
+        gr.Checkbox(label="do_sample (greedy if unchecked)", value=True),
     ],
     outputs=gr.Textbox(label="Output"),
     title="Claro.AI GPU — generic backend",

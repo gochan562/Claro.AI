@@ -183,7 +183,7 @@ def run_training(args):
         )
         import importlib
     except ImportError as e:
-        _fail(f"missing dependency: {e}. Install torch, transformers, datasets, accelerate. Trace: {traceback.format_exc()}")
+        _fail(f"missing dependency: {e}. On Replit, run: pip install -r requirements.txt (torch, transformers, datasets, accelerate, peft) or set PYTHON_BIN to a venv with torch. Trace: {traceback.format_exc()}")
     except Exception as e:
         _fail(f"import failed: {e}\n{traceback.format_exc()}")
 

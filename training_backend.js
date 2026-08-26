@@ -418,9 +418,54 @@ function resolveTrainingProvider(env) {
 }
 
 // ── Real Trainer via Python ──
+function _findPythonWithDeps() {
+  const candidates = [
+    process.env.PYTHON_BIN,
+    'python3',
+    'python',
+    '/usr/bin/python3',
+    '/opt/python/bin/python',
+    path.join(__dirname, '.venv', 'bin', 'python'),
+    path.join(__dirname, 'venv', 'bin', 'python'),
+  ].filter(Boolean);
+  // Also check common Replit/venv locations
+  const extra = [
+    '/home/runner/workspace/.pythonlibs/bin/python',
+    '/opt/homebrew/bin/python3',
+  ];
+  candidates.push(...extra);
+  const { spawnSync } = require('child_process');
+  for (const bin of candidates) {
+    try {
+      const r = spawnSync(bin, ['-c', 'import torch, transformers, datasets, accelerate; print("ok")'], { timeout: 5000, encoding: 'utf8' });
+      if (r.status === 0 && r.stdout && r.stdout.includes('ok')) {
+        return bin;
+      }
+    } catch (_) {}
+  }
+  // Fallback to env or python3 even if check fails (let training_runner report the real error)
+  return process.env.PYTHON_BIN || 'python3';
+}
+
 function _startPythonTraining(job) {
   const cfg = job.config;
-  const pythonBin = process.env.PYTHON_BIN || 'python3';
+  // Prefer env, but verify it has deps; otherwise try to find one that does
+  let pythonBin = process.env.PYTHON_BIN || 'python3';
+  // Quick check: if the requested bin doesn't have torch, try to find one that does
+  try {
+    const { spawnSync } = require('child_process');
+    const chk = spawnSync(pythonBin, ['-c', 'import torch'], { timeout: 3000 });
+    if (chk.status !== 0) {
+      const alt = _findPythonWithDeps();
+      if (alt && alt !== pythonBin) {
+        // Verify alt actually has torch before switching
+        const chk2 = spawnSync(alt, ['-c', 'import torch'], { timeout: 3000 });
+        if (chk2.status === 0) {
+          pythonBin = alt;
+        }
+      }
+    }
+  } catch (_) {}
   const runnerPath = path.join(__dirname, 'training_runner.py');
 
   if (!fs.existsSync(runnerPath)) {

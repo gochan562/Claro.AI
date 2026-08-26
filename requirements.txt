@@ -1,0 +1,10 @@
+torch
+transformers>=4.30
+datasets
+accelerate
+peft
+safetensors
+huggingface_hub
+pillow
+numpy
+scikit-learn

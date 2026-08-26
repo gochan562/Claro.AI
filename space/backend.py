@@ -695,10 +695,52 @@ def _load_transformers(model_id, device, dtype) -> LoaderResult:
     )
 
 
+# ── LoRA helper — auto-detect target modules (reused from training_runner) ──
+def _infer_lora_targets(model) -> list[str]:
+    try:
+        model_type = getattr(getattr(model, "config", None), "model_type", "") or ""
+        model_type = model_type.lower()
+        type_map = {
+            "bert": ["query", "value"],
+            "roberta": ["query", "value"],
+            "distilbert": ["q_lin", "v_lin"],
+            "albert": ["query", "value"],
+            "gpt2": ["c_attn"],
+            "llama": ["q_proj", "v_proj"],
+            "mistral": ["q_proj", "v_proj"],
+            "mixtral": ["q_proj", "v_proj"],
+            "gemma": ["q_proj", "v_proj"],
+            "qwen": ["q_proj", "v_proj"],
+            "phi": ["q_proj", "v_proj"],
+            "falcon": ["query_key_value"],
+            "bloom": ["query_key_value"],
+            "t5": ["q", "v"],
+            "bart": ["q_proj", "v_proj"],
+            "vit": ["query", "value"],
+        }
+        if model_type in type_map:
+            return type_map[model_type]
+        import torch.nn as nn
+        cands = set()
+        for n, m in model.named_modules():
+            if isinstance(m, nn.Linear):
+                low = n.lower()
+                for pat in ["q_proj", "v_proj", "query", "value", "q_lin", "c_attn", "qkv"]:
+                    if pat in low:
+                        cands.add(n.split(".")[-1])
+                        break
+        if cands:
+            pref = [c for c in cands if c in ("query", "q_proj", "c_attn", "q_lin")]
+            return sorted(pref)[:2] if pref else sorted(cands)[:2]
+        return ["query", "value"]
+    except Exception:
+        return ["query", "value"]
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Top-level model loader with safe caching (CPU-side, no GPU decorator)
 # ──────────────────────────────────────────────────────────────────────────────
-def load_model(model_id: str, gguf_file: Optional[str] = None, revision: Optional[str] = None) -> LoaderResult:
+def load_model(model_id: str, gguf_file: Optional[str] = None, revision: Optional[str] = None, adapter_path: Optional[str] = None) -> LoaderResult:
     """Load model on CPU (no GPU quota consumed). Returns cached result if available."""
     if not isinstance(model_id, str) or "/" not in model_id or model_id.strip() != model_id:
         raise ClaroBackendError(
@@ -706,13 +748,21 @@ def load_model(model_id: str, gguf_file: Optional[str] = None, revision: Optiona
             code="invalid_model_id",
         )
 
-    # Include revision and config hash in cache key for proper invalidation
+    # Include revision, config hash and adapter in cache key
     config_hash = _get_config_hash(model_id)
     key_parts = [model_id]
     if gguf_file:
         key_parts.append(f"gguf:{gguf_file}")
     if revision:
         key_parts.append(f"rev:{revision}")
+    if adapter_path:
+        # adapter_path may be a HF id or local dir; include its hash for cache invalidation
+        try:
+            import hashlib as _hl
+            adapter_hash = _hl.sha256(str(adapter_path).encode()).hexdigest()[:8]
+        except Exception:
+            adapter_hash = str(adapter_path)[:16]
+        key_parts.append(f"adapter:{adapter_path}:{adapter_hash}")
     if config_hash:
         key_parts.append(f"cfg:{config_hash}")
     key = "|".join(key_parts)
@@ -756,6 +806,53 @@ def load_model(model_id: str, gguf_file: Optional[str] = None, revision: Optiona
             result = _load_diffusers(model_id, device, dtype)
         else:
             result = _load_transformers(model_id, device, dtype)
+
+        # ── LoRA adapter: load base model via existing loader, then wrap with PEFT ──
+        # This reuses the existing base loader, cache, and device/dtype handling.
+        # Adapter path is validated server-side from job_id, never from arbitrary client path.
+        if adapter_path:
+            # Validate adapter path is not traversal and exists or is HF id
+            # For local training outputs, adapter_path is a directory under training_outputs (on local server)
+            # For Space, it may be a HF Hub id; we handle both.
+            import os as _os
+            is_local = _os.path.exists(adapter_path) or adapter_path.startswith("training_outputs/") or adapter_path.startswith("/tmp") or adapter_path.startswith("./training_outputs")
+            # For HF Hub adapter ids, they look like "owner/name" and will be handled by PeftModel
+            try:
+                from peft import PeftModel
+                # The base model is already loaded in result.model
+                if result.model is None:
+                    raise ClaroBackendError("Base model not loaded for LoRA", code="model_load_error")
+                # Check adapter files exist if local path
+                if is_local:
+                    if not _os.path.exists(adapter_path):
+                        # Try resolved training_outputs path
+                        alt = _os.path.join(_os.path.dirname(__file__), "..", adapter_path) if not _os.path.isabs(adapter_path) else adapter_path
+                        if _os.path.exists(alt):
+                            adapter_path = alt
+                        else:
+                            raise ClaroBackendError(f"LoRA adapter not found at {adapter_path}", code="model_load_error")
+                    # Verify adapter_config.json exists
+                    if not _os.path.exists(_os.path.join(adapter_path, "adapter_config.json")):
+                        raise ClaroBackendError(f"adapter_config.json missing in {adapter_path}", code="model_load_error")
+
+                # Wrap base with adapter — this reuses the existing model instance
+                result.model = PeftModel.from_pretrained(result.model, adapter_path)
+                result.model.eval()
+                # Update loaded_class to reflect LoRA
+                result.loaded_class = result.loaded_class + " + LoRA"
+                # Log trainable for observability
+                try:
+                    trainable, total = result.model.get_nb_trainable_parameters()
+                    print(f"[CLARO] LoRA adapter loaded from {adapter_path} trainable={trainable} total={total} ({trainable/total*100:.2f}%)")
+                except Exception:
+                    print(f"[CLARO] LoRA adapter loaded from {adapter_path}")
+            except ImportError:
+                raise ClaroBackendError("PEFT not installed for LoRA inference", code="model_load_error")
+            except ClaroBackendError:
+                raise
+            except Exception as e:
+                logger.error("Failed to load LoRA adapter %s for %s:\n%s", adapter_path, model_id, traceback.format_exc())
+                raise ClaroBackendError(f"Could not load LoRA adapter {adapter_path} for {model_id} ({type(e).__name__}: {e})", code="model_load_error")
 
         # Update config hash in result
         result.config_hash = config_hash
@@ -975,6 +1072,7 @@ def run_inference(
     temperature: float = 0.7,
     top_p: float = 0.9,
     do_sample: bool = True,
+    adapter_path: Optional[str] = None,
 ) -> str:
     """Run inference on GPU. Model is loaded via load_model() which uses CPU cache.
     
@@ -984,7 +1082,7 @@ def run_inference(
     # Normally a CACHE HIT: app.py loads the model on the CPU worker before
     # entering the @spaces.GPU function, so no download/reload happens here.
     cache_size_before = len(_CACHE)
-    result = load_model(model_id, gguf_file=gguf_file, revision=revision)
+    result = load_model(model_id, gguf_file=gguf_file, revision=revision, adapter_path=adapter_path)
     cache_hit = len(_CACHE) <= cache_size_before
 
     # Estimate duration for logging

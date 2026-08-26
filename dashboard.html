@@ -934,6 +934,224 @@
       grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
       gap: 12px;
     }
+
+    /* ── Training Cell ── */
+    .training-cell-body {
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .training-form-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    @media (max-width: 700px) { .training-form-grid { grid-template-columns: 1fr; } }
+    .training-field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .training-field label {
+      font-size: 12px;
+      color: #94a3b8;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .training-field input, .training-field select {
+      padding: 9px 10px;
+      background: #0a101f;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      color: #e2e8f0;
+      font-size: 13px;
+      outline: none;
+    }
+    .training-field input:focus, .training-field select:focus {
+      border-color: #60a5fa;
+    }
+    .training-field input::placeholder { color: #475569; }
+    .training-actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .training-btn {
+      padding: 9px 18px;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+      transition: 0.15s;
+    }
+    .training-btn.primary {
+      background: #16a34a;
+      color: white;
+    }
+    .training-btn.primary:hover { background: #22c55e; }
+    .training-btn.primary:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
+    .training-btn.stop {
+      background: #dc2626;
+      color: white;
+    }
+    .training-btn.stop:hover { background: #ef4444; }
+    .training-btn.secondary {
+      background: #334155;
+      color: #e2e8f0;
+    }
+    .training-btn.secondary:hover { background: #475569; }
+    .training-status-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+    .training-status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 600;
+      border: 1px solid #334155;
+      background: #0f172a;
+    }
+    .training-status-badge.queued { color: #94a3b8; border-color: #475569; }
+    .training-status-badge.loading { color: #f59e0b; border-color: #f59e0b; }
+    .training-status-badge.training { color: #22c55e; border-color: #22c55e; animation: train-pulse 1.2s infinite; }
+    .training-status-badge.evaluating { color: #60a5fa; border-color: #60a5fa; }
+    .training-status-badge.finished { color: #22c55e; border-color: #22c55e; background: rgba(34,197,94,0.1); }
+    .training-status-badge.failed { color: #ef4444; border-color: #ef4444; background: rgba(239,68,68,0.1); }
+    @keyframes train-pulse { 0%,100%{opacity:1} 50%{opacity:0.6} }
+    .training-metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 10px;
+    }
+    .training-metric-card {
+      background: #0f172a;
+      border: 1px solid #1e293b;
+      border-radius: 10px;
+      padding: 10px 12px;
+      text-align: center;
+    }
+    .training-metric-label {
+      font-size: 10px;
+      color: #64748b;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 4px;
+    }
+    .training-metric-value {
+      font-size: 18px;
+      font-weight: 700;
+      color: #e2e8f0;
+      font-family: 'Consolas', monospace;
+    }
+    .training-metric-value.small { font-size: 13px; }
+    .training-chart-wrap {
+      background: #0f172a;
+      border: 1px solid #1e293b;
+      border-radius: 10px;
+      padding: 12px;
+    }
+    .training-chart-wrap h4 {
+      font-size: 12px;
+      color: #94a3b8;
+      margin-bottom: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .training-logs {
+      background: #0b0f1a;
+      border: 1px solid #1e293b;
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-family: 'Consolas', monospace;
+      font-size: 11px;
+      color: #94a3b8;
+      max-height: 140px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .training-gpu-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 8px;
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      font-size: 11px;
+      color: #94a3b8;
+    }
+    .training-gpu-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #64748b;
+    }
+    .training-gpu-dot.training { background: #22c55e; box-shadow: 0 0 6px rgba(34,197,94,0.6); }
+    .training-gpu-dot.failed { background: #ef4444; }
+    .lora-section {
+      background: #0f172a;
+      border: 1px solid #1e293b;
+      border-radius: 10px;
+      padding: 12px;
+    }
+    .lora-section h4 {
+      font-size: 12px;
+      color: #94a3b8;
+      margin-bottom: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .lora-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 10px;
+    }
+    .lora-hint {
+      font-size: 11px;
+      color: #64748b;
+      margin-top: 6px;
+      font-style: italic;
+    }
+    .training-complete {
+      background: #0f172a;
+      border: 1px solid #10b981;
+      border-radius: 10px;
+      padding: 14px;
+    }
+    .training-complete h4 {
+      font-size: 13px;
+      color: #6ee7b7;
+      margin-bottom: 8px;
+    }
+    .training-complete-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      color: #94a3b8;
+      margin: 4px 0;
+    }
+    .training-complete-row strong { color: #e2e8f0; font-family: Consolas, monospace; }
+    .training-complete-btn {
+      margin-top: 10px;
+      padding: 8px 14px;
+      background: #10b981;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 13px;
+    }
+    .training-complete-btn:hover { background: #059669; }
   </style>
 </head>
 <body>
@@ -964,6 +1182,8 @@
             <div class="add-cell-menu-sep"></div>
             <div class="add-cell-menu-item" onclick="addCell('model');closeAddCellMenu()"><span class="menu-icon">🤖</span><div><div>Model Cell</div><div class="menu-desc">Load a Hugging Face model</div></div></div>
             <div class="add-cell-menu-item" onclick="addCell('parameter');closeAddCellMenu()"><span class="menu-icon">🎛️</span><div><div>Parameter Cell</div><div class="menu-desc">Sliders for model config</div></div></div>
+            <div class="add-cell-menu-sep"></div>
+            <div class="add-cell-menu-item" onclick="addCell('training');closeAddCellMenu()"><span class="menu-icon">🏋️</span><div><div>Training Cell</div><div class="menu-desc">Fine-tune a model on a dataset</div></div></div>
           </div>
         </div>
         <button class="toolbar-btn run-btn" onclick="runAllCells()">▶ Run All</button>
@@ -1173,6 +1393,7 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/python/python.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/markdown/markdown.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script src="/pyodide_local.js"></script>
   <script>
     let notebookRegistry = {
@@ -1284,6 +1505,38 @@
       const saved = localStorage.getItem('claro-notebooks-registry');
       if (saved) {
         notebookRegistry = JSON.parse(saved);
+        // migrate training cells: ensure defaults
+        for (const id of Object.keys(notebookRegistry.notebooks || {})) {
+          const nb = notebookRegistry.notebooks[id];
+          for (const cell of (nb.cells || [])) {
+            if (cell.type === 'training' && !cell.training) {
+              try { cell.training = JSON.parse(cell.content || '{}'); } catch(_) { cell.training = {}; }
+              cell.training.model_id = cell.training.model_id || 'distilbert-base-uncased';
+              cell.training.dataset_id = cell.training.dataset_id || 'stanfordnlp/imdb';
+              cell.training.task_type = cell.training.task_type || 'text-classification';
+              cell.training.epochs = cell.training.epochs || 2;
+              cell.training.batch_size = cell.training.batch_size || 8;
+              cell.training.learning_rate = cell.training.learning_rate || 0.00002;
+              cell.training.validation_split = cell.training.validation_split ?? 10;
+              cell.training.status = cell.training.status || 'idle';
+              cell.training.progress = cell.training.progress || { current_epoch:0, current_step:0, train_loss:null, eval_loss:null, eta:null, gpu_status:'idle', training_method:'auto', trainable_params:null, total_params:null };
+              cell.training.metrics = cell.training.metrics || [];
+              cell.training.logs = cell.training.logs || [];
+            }
+            // ensure LoRA fields for existing training cells (created before LoRA)
+            if (cell.type === 'training' && cell.training) {
+              if (!('training_method' in cell.training)) cell.training.training_method = 'auto';
+              if (!('lora_r' in cell.training)) cell.training.lora_r = 8;
+              if (!('lora_alpha' in cell.training)) cell.training.lora_alpha = 16;
+              if (!('lora_dropout' in cell.training)) cell.training.lora_dropout = 0.05;
+              if (!('target_modules' in cell.training)) cell.training.target_modules = 'auto';
+              if (!cell.training.progress) cell.training.progress = {};
+              if (!('training_method' in cell.training.progress)) cell.training.progress.training_method = cell.training.training_method;
+              if (!('trainable_params' in cell.training.progress)) cell.training.progress.trainable_params = null;
+              if (!('total_params' in cell.training.progress)) cell.training.progress.total_params = null;
+            }
+          }
+        }
       } else {
         const legacyNotebook = localStorage.getItem('claro-notebook');
         if (legacyNotebook) {
@@ -1385,6 +1638,30 @@
         cell.paramView = 'gui';
         cell.content = paramsToCode(cell);
       }
+      if (type === 'training') {
+        cell.training = {
+          model_id: 'distilbert-base-uncased',
+          dataset_id: 'stanfordnlp/imdb',
+          task_type: 'text-classification',
+          epochs: 2,
+          batch_size: 8,
+          learning_rate: 0.00002,
+          max_steps: '',
+          validation_split: 10,
+          training_method: 'auto',
+          lora_r: 8,
+          lora_alpha: 16,
+          lora_dropout: 0.05,
+          target_modules: 'auto',
+          job_id: null,
+          status: 'idle',
+          progress: { current_epoch: 0, current_step: 0, train_loss: null, eval_loss: null, eta: null, gpu_status: 'idle', training_method: 'auto', trainable_params: null, total_params: null },
+          metrics: [],
+          logs: [],
+        };
+        // training cells store config in cell.training, not cell.content
+        cell.content = JSON.stringify(cell.training, null, 2);
+      }
 
       notebook.cells.push(cell);
       updateNotebook();
@@ -1394,6 +1671,22 @@
     function deleteCell(cellId) {
       const notebook = getActiveNotebook();
       if (!notebook) return;
+      const cell = notebook.cells.find(c => c.id === cellId);
+      if (cell && cell.type === 'training' && cell.training && cell.training.job_id) {
+        // stop running job when cell deleted
+        const t = cell.training;
+        if (['queued','loading','training','evaluating'].includes(t.status)) {
+          stopTrainingCell(cellId);
+        }
+        if (trainingCharts[cellId]) {
+          try { trainingCharts[cellId].destroy(); } catch(_) {}
+          delete trainingCharts[cellId];
+        }
+        if (trainingStreams[cellId]) {
+          try { trainingStreams[cellId].close(); } catch(_) {}
+          delete trainingStreams[cellId];
+        }
+      }
       
       notebook.cells = notebook.cells.filter(c => c.id !== cellId);
       updateNotebook();
@@ -1476,6 +1769,8 @@
             <div class="add-cell-menu-sep"></div>
             <div class="add-cell-menu-item" onclick="addCell('model');closeAddCellMenu()"><span class="menu-icon">🤖</span><div><div>Model Cell</div><div class="menu-desc">Load a Hugging Face model</div></div></div>
             <div class="add-cell-menu-item" onclick="addCell('parameter');closeAddCellMenu()"><span class="menu-icon">🎛️</span><div><div>Parameter Cell</div><div class="menu-desc">Sliders for model config</div></div></div>
+            <div class="add-cell-menu-sep"></div>
+            <div class="add-cell-menu-item" onclick="addCell('training');closeAddCellMenu()"><span class="menu-icon">🏋️</span><div><div>Training Cell</div><div class="menu-desc">Fine-tune a model on a dataset</div></div></div>
           </div>
         </div>
         <button class="toolbar-btn run-btn" onclick="runAllCells()">▶ Run All</button>
@@ -1718,8 +2013,950 @@
       if (guiPane) guiPane.innerHTML = buildParamGuiHTML(cell);
     }
 
+    // ── Training Cell helpers ─────────────────────────────────────────────────
+    const trainingCharts = {};
+    const trainingStreams = {};
+    const trainingPollTimers = {};
+
+    function formatETA(sec) {
+      if (sec === null || sec === undefined || isNaN(sec)) return '—';
+      if (sec < 60) return sec + 's';
+      const m = Math.floor(sec/60);
+      const s = sec % 60;
+      return m + 'm ' + s + 's';
+    }
+
+    function isLargeModelFrontend(modelId) {
+      const m = String(modelId||'').toLowerCase();
+      const mm = m.match(/(\d+(?:\.\d+)?)\s*b\b/);
+      if (mm) {
+        const num = parseFloat(mm[1]);
+        if (!isNaN(num) && num >= 1) return true;
+      }
+      if (/(?:^|[-_\/\s])(?:1b|1\.5b|3b|7b|8b|13b|30b|70b)(?:$|[-_\/\s])/i.test(m)) return true;
+      return false;
+    }
+
+    function buildTrainingCellBody(cell) {
+      if (!cell.training) {
+        cell.training = {
+          model_id: 'distilbert-base-uncased',
+          dataset_id: 'stanfordnlp/imdb',
+          task_type: 'text-classification',
+          epochs: 2,
+          batch_size: 8,
+          learning_rate: 0.00002,
+          max_steps: '',
+          validation_split: 10,
+          training_method: 'auto',
+          lora_r: 8,
+          lora_alpha: 16,
+          lora_dropout: 0.05,
+          target_modules: 'auto',
+          job_id: null,
+          status: 'idle',
+          progress: { current_epoch: 0, current_step: 0, train_loss: null, eval_loss: null, eta: null, gpu_status: 'idle', training_method: 'auto', trainable_params: null, total_params: null },
+          metrics: [],
+          logs: [],
+        };
+      }
+      const t = cell.training;
+      const wrap = document.createElement('div');
+      wrap.className = 'training-cell-body';
+      wrap.id = `training-body-${cell.id}`;
+
+      const isRunning = ['queued','loading','training','evaluating'].includes(t.status);
+      const locked = isRunning ? 'disabled' : '';
+
+      const _effMethod = t.training_method === 'auto' ? (isLargeModelFrontend(t.model_id) ? 'lora' : 'full') : t.training_method;
+      const _loraVisible = _effMethod === 'lora' ? '' : 'display:none;';
+      wrap.innerHTML = `
+        <div class="training-form-grid">
+          <div class="training-field">
+            <label>Model ID</label>
+            <input type="text" id="tr-${cell.id}-model" value="${t.model_id}" placeholder="owner/model-name" ${locked} oninput="updateTrainingField(${cell.id},'model_id',this.value)" />
+          </div>
+          <div class="training-field">
+            <label>Dataset ID</label>
+            <input type="text" id="tr-${cell.id}-dataset" value="${t.dataset_id}" placeholder="owner/dataset-name" ${locked} oninput="updateTrainingField(${cell.id},'dataset_id',this.value)" />
+          </div>
+          <div class="training-field">
+            <label>Task Type</label>
+            <select id="tr-${cell.id}-task" ${locked} onchange="updateTrainingField(${cell.id},'task_type',this.value)">
+              <option value="text-generation" ${t.task_type==='text-generation'?'selected':''}>Text Generation</option>
+              <option value="text-classification" ${t.task_type==='text-classification'?'selected':''}>Text Classification</option>
+              <option value="image-classification" ${t.task_type==='image-classification'?'selected':''}>Image Classification</option>
+              <option value="token-classification" ${t.task_type==='token-classification'?'selected':''}>Token Classification</option>
+            </select>
+          </div>
+          <div class="training-field">
+            <label>Training Method</label>
+            <select id="tr-${cell.id}-method" ${locked} onchange="updateTrainingMethod(${cell.id},this.value)">
+              <option value="auto" ${t.training_method==='auto'?'selected':''}>Auto (${isLargeModelFrontend(t.model_id) ? 'LoRA for ≥1B' : 'Full for <1B'})</option>
+              <option value="full" ${t.training_method==='full'?'selected':''}>Full Fine-tuning</option>
+              <option value="lora" ${t.training_method==='lora'?'selected':''}>LoRA (PEFT)</option>
+            </select>
+            <div class="lora-hint" id="tr-${cell.id}-method-hint">${_effMethod==='lora' ? 'Will train only LoRA adapters (efficient for ≥1B)' : 'Will fine-tune all weights'}</div>
+          </div>
+          <div class="training-field">
+            <label>Validation Split (%)</label>
+            <input type="number" min="0" max="50" step="1" value="${t.validation_split}" ${locked} oninput="updateTrainingField(${cell.id},'validation_split',this.value)" />
+          </div>
+          <div class="training-field">
+            <label>Epochs (max ${MAX_TRAIN_EPOCHS||5})</label>
+            <input type="number" min="1" max="${MAX_TRAIN_EPOCHS||5}" step="1" value="${t.epochs}" ${locked} oninput="updateTrainingField(${cell.id},'epochs',this.value)" />
+          </div>
+          <div class="training-field">
+            <label>Batch Size</label>
+            <input type="number" min="1" max="32" step="1" value="${t.batch_size}" ${locked} oninput="updateTrainingField(${cell.id},'batch_size',this.value)" />
+          </div>
+          <div class="training-field">
+            <label>Learning Rate</label>
+            <input type="number" step="0.000001" value="${t.learning_rate}" ${locked} oninput="updateTrainingField(${cell.id},'learning_rate',this.value)" />
+          </div>
+          <div class="training-field">
+            <label>Max Steps (optional)</label>
+            <input type="number" min="1" placeholder="auto" value="${t.max_steps}" ${locked} oninput="updateTrainingField(${cell.id},'max_steps',this.value)" />
+          </div>
+        </div>
+
+        <div class="lora-section" id="tr-${cell.id}-lora-section" style="${_loraVisible}">
+          <h4>🔧 LoRA Config <span style="font-weight:normal;text-transform:none;color:#64748b;">(auto target_modules)</span></h4>
+          <div class="lora-grid">
+            <div class="training-field">
+              <label>r (rank)</label>
+              <input type="number" min="1" max="64" step="1" value="${t.lora_r}" ${locked} oninput="updateTrainingField(${cell.id},'lora_r',this.value)" />
+            </div>
+            <div class="training-field">
+              <label>lora_alpha</label>
+              <input type="number" min="1" max="128" step="1" value="${t.lora_alpha}" ${locked} oninput="updateTrainingField(${cell.id},'lora_alpha',this.value)" />
+            </div>
+            <div class="training-field">
+              <label>lora_dropout</label>
+              <input type="number" min="0" max="0.5" step="0.01" value="${t.lora_dropout}" ${locked} oninput="updateTrainingField(${cell.id},'lora_dropout',this.value)" />
+            </div>
+            <div class="training-field">
+              <label>target_modules</label>
+              <input type="text" placeholder="auto" value="${t.target_modules}" ${locked} oninput="updateTrainingField(${cell.id},'target_modules',this.value)" />
+            </div>
+          </div>
+          <div class="lora-hint">auto = infer from architecture (e.g. q_proj/v_proj for Llama, query/value for BERT). Use comma-separated to override.</div>
+        </div>
+
+        <div class="training-actions">
+          <button class="training-btn primary" id="tr-${cell.id}-start" onclick="startTrainingCell(${cell.id})" ${isRunning ? 'disabled' : ''}>▶ Start Training</button>
+          <button class="training-btn stop" id="tr-${cell.id}-stop" onclick="stopTrainingCell(${cell.id})" ${!isRunning ? 'disabled style="opacity:0.5;cursor:not-allowed;"' : ''}>⏹ Stop</button>
+          <div class="training-status-row" id="tr-${cell.id}-statusrow">
+            <span class="training-status-badge ${t.status}" id="tr-${cell.id}-badge">${t.status}</span>
+            <span class="training-gpu-badge"><span class="training-gpu-dot ${t.status}" id="tr-${cell.id}-gpudot"></span><span id="tr-${cell.id}-gputext">${t.progress?.gpu_status || 'idle'}</span></span>
+            ${t.job_id ? `<span style="font-size:11px;color:#64748b;font-family:monospace;">${t.job_id}</span>` : ''}
+          </div>
+        </div>
+        ${t.status==='failed' && t.error ? `<div id="tr-${cell.id}-errorbox" style="background:rgba(239,68,68,0.12);border:1px solid #dc2626;border-radius:8px;padding:10px 12px;color:#fecaca;font-size:12px;font-family:Consolas,monospace;white-space:pre-wrap;word-break:break-word;">❌ training_error: ${String(t.error).slice(0,500)}<br><span style="color:#fca5a5;font-size:11px;">${(t.logs||[]).slice(-2).join('<br>').slice(0,600)}</span></div>` : `<div id="tr-${cell.id}-errorbox" style="display:none;"></div>`}
+
+        <div class="training-metrics-grid" id="tr-${cell.id}-metrics">
+          <div class="training-metric-card"><div class="training-metric-label">Epoch</div><div class="training-metric-value" id="tr-${cell.id}-epoch">${t.progress?.current_epoch ?? 0}</div></div>
+          <div class="training-metric-card"><div class="training-metric-label">Step</div><div class="training-metric-value" id="tr-${cell.id}-step">${t.progress?.current_step ?? 0}</div></div>
+          <div class="training-metric-card"><div class="training-metric-label">Train Loss</div><div class="training-metric-value" id="tr-${cell.id}-train">${t.progress?.train_loss != null ? Number(t.progress.train_loss).toFixed(4) : '—'}</div></div>
+          <div class="training-metric-card"><div class="training-metric-label">Val Loss</div><div class="training-metric-value" id="tr-${cell.id}-eval">${t.progress?.eval_loss != null ? Number(t.progress.eval_loss).toFixed(4) : '—'}</div></div>
+          <div class="training-metric-card"><div class="training-metric-label">ETA</div><div class="training-metric-value small" id="tr-${cell.id}-eta">${formatETA(t.progress?.eta)}</div></div>
+          <div class="training-metric-card"><div class="training-metric-label">GPU</div><div class="training-metric-value small" id="tr-${cell.id}-gpu">${t.progress?.gpu_status || 'idle'}</div></div>
+          <div class="training-metric-card"><div class="training-metric-label">Trainable</div><div class="training-metric-value small" id="tr-${cell.id}-trainable">${t.progress?.trainable_params ? `${(t.progress.trainable_params/1000).toFixed(1)}k / ${(t.progress.total_params/1000000).toFixed(2)}M (${(t.progress.trainable_params/t.progress.total_params*100).toFixed(2)}%)` : (t.progress?.training_method==='lora' || _effMethod==='lora' ? 'LoRA' : 'Full')}</div></div>
+        </div>
+
+        <div id="tr-${cell.id}-complete" style="${t.status==='finished' ? '' : 'display:none;'}">
+          ${t.status==='finished' ? `<div class="training-complete" id="tr-${cell.id}-complete-inner"><h4>✅ Training complete</h4><div style="font-size:12px;color:#94a3b8;">Loading artifacts...</div></div>` : ''}
+        </div>
+
+        <div class="training-chart-wrap">
+          <h4>📈 Loss — training vs validation</h4>
+          <canvas id="tr-${cell.id}-chart" height="180"></canvas>
+        </div>
+
+        <div class="training-logs" id="tr-${cell.id}-logs" style="${t.logs && t.logs.length ? '' : 'display:none;'}">${(t.logs || []).slice(-40).join('\n')}</div>
+      `;
+
+      // init chart after DOM attach
+      setTimeout(() => initTrainingChart(cell.id), 50);
+      // if job is running, re-attach SSE
+      if (t.job_id && isRunning) {
+        setTimeout(() => attachTrainingSSE(cell.id, t.job_id), 300);
+      }
+      return wrap;
+    }
+
+    const MAX_TRAIN_EPOCHS = 5;
+
+    function updateTrainingField(cellId, key, value) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training) return;
+      if (['epochs','batch_size','validation_split','max_steps','lora_r','lora_alpha'].includes(key)) {
+        if (value === '' && key === 'max_steps') cell.training[key] = '';
+        else cell.training[key] = value === '' ? '' : Number(value);
+      } else if (['learning_rate','lora_dropout'].includes(key)) {
+        cell.training[key] = Number(value);
+      } else if (key === 'target_modules') {
+        cell.training[key] = String(value).trim() || 'auto';
+      } else {
+        cell.training[key] = value;
+      }
+      // if model_id changed and method is auto, update hint / lora visibility
+      if (key === 'model_id') {
+        const eff = cell.training.training_method === 'auto' ? (isLargeModelFrontend(value) ? 'lora' : 'full') : cell.training.training_method;
+        const sec = document.getElementById(`tr-${cellId}-lora-section`);
+        const hint = document.getElementById(`tr-${cellId}-method-hint`);
+        if (sec) sec.style.display = eff === 'lora' ? '' : 'none';
+        if (hint) hint.textContent = eff === 'lora' ? 'Will train only LoRA adapters (efficient for ≥1B)' : 'Will fine-tune all weights';
+        // also update the Auto option text
+        const sel = document.getElementById(`tr-${cellId}-method`);
+        if (sel && cell.training.training_method === 'auto' && sel.options[0]) {
+          sel.options[0].text = `Auto (${eff==='lora' ? 'LoRA for ≥1B' : 'Full for <1B'})`;
+        }
+      }
+      updateNotebook();
+    }
+
+    function updateTrainingMethod(cellId, value) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training) return;
+      cell.training.training_method = value;
+      // update visibility of LoRA section
+      const eff = value === 'auto' ? (isLargeModelFrontend(cell.training.model_id) ? 'lora' : 'full') : value;
+      const sec = document.getElementById(`tr-${cellId}-lora-section`);
+      const hint = document.getElementById(`tr-${cellId}-method-hint`);
+      if (sec) sec.style.display = eff === 'lora' ? '' : 'none';
+      if (hint) hint.textContent = eff === 'lora' ? 'Will train only LoRA adapters (efficient for ≥1B)' : 'Will fine-tune all weights';
+      // update Auto text
+      const sel = document.getElementById(`tr-${cellId}-method`);
+      if (sel && value === 'auto' && sel.options[0]) {
+        sel.options[0].text = `Auto (${eff==='lora' ? 'LoRA for ≥1B' : 'Full for <1B'})`;
+      }
+      updateNotebook();
+    }
+
+    function initTrainingChart(cellId) {
+      const canvas = document.getElementById(`tr-${cellId}-chart`);
+      if (!canvas || typeof Chart === 'undefined') return;
+      if (trainingCharts[cellId]) {
+        try { trainingCharts[cellId].destroy(); } catch(_) {}
+      }
+      const ctx = canvas.getContext('2d');
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      const metrics = cell?.training?.metrics || [];
+      const labels = metrics.map(m => m.step);
+      const trainData = metrics.map(m => m.train_loss);
+      const evalData = metrics.map(m => m.eval_loss ?? null);
+
+      trainingCharts[cellId] = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: labels,
+          datasets: [
+            {
+              label: 'Training Loss',
+              data: trainData,
+              borderColor: '#22c55e',
+              backgroundColor: 'rgba(34,197,94,0.08)',
+              tension: 0.3,
+              pointRadius: 0,
+              borderWidth: 2,
+              spanGaps: true,
+            },
+            {
+              label: 'Validation Loss',
+              data: evalData,
+              borderColor: '#60a5fa',
+              backgroundColor: 'rgba(96,165,250,0.08)',
+              tension: 0.3,
+              pointRadius: 2,
+              pointBackgroundColor: '#60a5fa',
+              borderWidth: 2,
+              spanGaps: true,
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: false,
+          interaction: { intersect: false, mode: 'index' },
+          plugins: {
+            legend: { labels: { color: '#94a3b8', font: { size: 11 }, boxWidth: 14 } },
+          },
+          scales: {
+            x: {
+              title: { display: true, text: 'Steps', color: '#64748b', font: { size: 11 } },
+              ticks: { color: '#64748b', maxTicksLimit: 8 },
+              grid: { color: 'rgba(51,65,85,0.4)' },
+            },
+            y: {
+              title: { display: true, text: 'Loss', color: '#64748b', font: { size: 11 } },
+              ticks: { color: '#64748b' },
+              grid: { color: 'rgba(51,65,85,0.4)' },
+            }
+          }
+        }
+      });
+      // fix container height
+      canvas.parentElement.style.height = '220px';
+    }
+
+    function updateTrainingChart(cellId, metric) {
+      const chart = trainingCharts[cellId];
+      if (!chart) return;
+      chart.data.labels.push(metric.step);
+      chart.data.datasets[0].data.push(metric.train_loss);
+      chart.data.datasets[1].data.push(metric.eval_loss ?? null);
+      // keep last 80 points visible, but store all
+      if (chart.data.labels.length > 80) {
+        // shift window — but keep full data for later? just shift
+        // we keep all; chart will handle scroll via maxTicksLimit
+      }
+      chart.update('none');
+    }
+
+    function renderTrainingStatus(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training) return;
+      const t = cell.training;
+      const badge = document.getElementById(`tr-${cellId}-badge`);
+      const gdot = document.getElementById(`tr-${cellId}-gpudot`);
+      const gtxt = document.getElementById(`tr-${cellId}-gputext`);
+      const epochEl = document.getElementById(`tr-${cellId}-epoch`);
+      const stepEl = document.getElementById(`tr-${cellId}-step`);
+      const trainEl = document.getElementById(`tr-${cellId}-train`);
+      const evalEl = document.getElementById(`tr-${cellId}-eval`);
+      const etaEl = document.getElementById(`tr-${cellId}-eta`);
+      const gpuEl = document.getElementById(`tr-${cellId}-gpu`);
+      if (badge) { badge.textContent = t.status; badge.className = 'training-status-badge ' + t.status; }
+      if (gdot) gdot.className = 'training-gpu-dot ' + t.status;
+      if (gtxt) gtxt.textContent = t.progress?.gpu_status || t.status;
+      if (epochEl) epochEl.textContent = t.progress?.current_epoch ?? 0;
+      if (stepEl) stepEl.textContent = t.progress?.current_step ?? 0;
+      if (trainEl) trainEl.textContent = t.progress?.train_loss != null ? Number(t.progress.train_loss).toFixed(4) : '—';
+      if (evalEl) evalEl.textContent = t.progress?.eval_loss != null ? Number(t.progress.eval_loss).toFixed(4) : '—';
+      if (etaEl) etaEl.textContent = formatETA(t.progress?.eta);
+      if (gpuEl) gpuEl.textContent = t.progress?.gpu_status || 'idle';
+      const trEl = document.getElementById(`tr-${cellId}-trainable`);
+      if (trEl) {
+        if (t.progress?.trainable_params && t.progress?.total_params) {
+          const pct = (t.progress.trainable_params / t.progress.total_params * 100).toFixed(2);
+          trEl.textContent = `${(t.progress.trainable_params/1000).toFixed(1)}k / ${(t.progress.total_params/1000000).toFixed(2)}M (${pct}%)`;
+        } else if (t.progress?.training_method === 'lora' || t.training_method === 'lora' || (t.training_method === 'auto' && isLargeModelFrontend(t.model_id))) {
+          trEl.textContent = 'LoRA';
+        } else {
+          trEl.textContent = 'Full';
+        }
+      }
+      // keep lora section visibility in sync with effective method
+      const loraSec = document.getElementById(`tr-${cellId}-lora-section`);
+      if (loraSec) {
+        const eff = t.training_method === 'auto' ? (isLargeModelFrontend(t.model_id) ? 'lora' : 'full') : t.training_method;
+        loraSec.style.display = eff === 'lora' ? '' : 'none';
+      }
+
+      // locks
+      const formInputs = document.querySelectorAll(`#training-body-${cellId} input, #training-body-${cellId} select`);
+      const isRunning = ['queued','loading','training','evaluating'].includes(t.status);
+      formInputs.forEach(el => el.disabled = isRunning);
+      const startBtn = document.getElementById(`tr-${cellId}-start`);
+      const stopBtn = document.getElementById(`tr-${cellId}-stop`);
+      if (startBtn) startBtn.disabled = isRunning;
+      if (stopBtn) stopBtn.disabled = !isRunning;
+
+      // header buttons too
+      const cellEl = document.getElementById(`cell-${cellId}`);
+      if (cellEl) {
+        const hStart = cellEl.querySelector('.cell-controls .run');
+        const hStop = cellEl.querySelectorAll('.cell-controls button')[1];
+        if (hStart) hStart.disabled = isRunning;
+        if (hStop) hStop.disabled = !isRunning;
+      }
+
+      // error box — show training_error clearly
+      const errBox = document.getElementById(`tr-${cellId}-errorbox`);
+      if (errBox) {
+        if (t.status === 'failed' && t.error) {
+          errBox.style.display = '';
+          const tail = (t.logs || []).slice(-2).join('<br>').slice(0,600);
+          errBox.innerHTML = `❌ training_error: ${String(t.error).slice(0,600)}${t.error === 'training_error' && tail ? '<br><span style="color:#fca5a5;font-size:11px;">' + tail + '</span>' : ''}`;
+        } else {
+          errBox.style.display = 'none';
+          errBox.innerHTML = '';
+        }
+      }
+
+      // training complete section — fetch artifacts if finished
+      if (t.status === 'finished' && t.job_id) {
+        const comp = document.getElementById(`tr-${cellId}-complete`);
+        if (comp && !comp.dataset.loaded) {
+          comp.dataset.loaded = '1';
+          setTimeout(() => renderTrainingComplete(cellId), 100);
+        }
+      }
+    }
+
+    function formatFileSize(bytes) {
+      if (bytes == null || isNaN(bytes)) return '—';
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
+      return (bytes/1024/1024).toFixed(2) + ' MB';
+    }
+
+    async function renderTrainingComplete(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training || !cell.training.job_id) return;
+      const jobId = cell.training.job_id;
+      const container = document.getElementById(`tr-${cellId}-complete`);
+      if (!container) return;
+      container.style.display = '';
+      const inner = document.getElementById(`tr-${cellId}-complete-inner`);
+      if (inner) inner.innerHTML = `<h4>✅ Training complete</h4><div style="font-size:12px;color:#94a3b8;">Loading artifacts for ${jobId}...</div>`;
+      else container.innerHTML = `<div class="training-complete"><h4>✅ Training complete</h4><div style="font-size:12px;color:#94a3b8;">Loading artifacts...</div></div>`;
+
+      try {
+        const res = await fetch(`/api/train/artifacts/${encodeURIComponent(jobId)}`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        // data: {ready, training_method, base_model_id, task_type, artifact_dir, adapter_dir, model_dir, files, ...}
+        const isLora = data.training_method === 'lora';
+        const trainable = cell.training.progress?.trainable_params;
+        const total = cell.training.progress?.total_params;
+        const pct = trainable && total ? (trainable/total*100).toFixed(2) : null;
+        const finalTrain = cell.training.progress?.train_loss != null ? Number(cell.training.progress.train_loss).toFixed(4) : '—';
+        const finalEval = cell.training.progress?.eval_loss != null ? Number(cell.training.progress.eval_loss).toFixed(4) : '—';
+        let filesHtml = '';
+        try {
+          const sizes = [];
+          for (const f of (data.files||[]).slice(0,6)) {
+            sizes.push(f);
+          }
+          filesHtml = sizes.join(', ');
+        } catch(_) {}
+
+        let html = `<div class="training-complete" id="tr-${cellId}-complete-inner">`;
+        html += `<h4>✅ Training complete — ${isLora ? 'LoRA' : 'Full'} </h4>`;
+        html += `<div class="training-complete-row"><span>Model</span><strong>${data.base_model_id || cell.training.model_id}</strong></div>`;
+        html += `<div class="training-complete-row"><span>Method</span><strong>${isLora ? 'LoRA' : 'Full Fine-tuning'}</strong></div>`;
+        if (isLora && trainable) {
+          html += `<div class="training-complete-row"><span>Trainable</span><strong>${(trainable/1000).toFixed(1)}k / ${(total/1000000).toFixed(2)}M (${pct}%)</strong></div>`;
+          html += `<div class="training-complete-row"><span>Base model</span><strong>${data.base_model_id}</strong></div>`;
+          html += `<div class="training-complete-row"><span>Adapter</span><strong style="font-size:11px;word-break:break-all;">${data.adapter_dir}</strong></div>`;
+          // try to get adapter size
+          try {
+            const adapterSize = data.files.includes('adapter_model.safetensors') ? 'adapter present' : '';
+            html += `<div class="training-complete-row"><span>Adapter files</span><strong>${filesHtml}</strong></div>`;
+          } catch(_) {}
+        } else if (!isLora) {
+          html += `<div class="training-complete-row"><span>Trained model</span><strong style="font-size:11px;word-break:break-all;">${data.model_dir}</strong></div>`;
+          html += `<div class="training-complete-row"><span>Model files</span><strong>${filesHtml}</strong></div>`;
+        }
+        html += `<div class="training-complete-row"><span>Final train loss</span><strong>${finalTrain}</strong></div>`;
+        html += `<div class="training-complete-row"><span>Final eval loss</span><strong>${finalEval}</strong></div>`;
+        html += `<button class="training-complete-btn" onclick="useTrainedInInference(${cellId}, '${jobId}')">Use in Inference Cell →</button>`;
+        html += `</div>`;
+        container.innerHTML = html;
+        container.style.display = '';
+      } catch (err) {
+        container.innerHTML = `<div class="training-complete" style="border-color:#dc2626;background:rgba(239,68,68,0.08);"><h4 style="color:#fecaca;">⚠️ Not inference-ready</h4><div style="font-size:12px;color:#fca5a5;white-space:pre-wrap;">${String(err.message).slice(0,600)}</div></div>`;
+        container.style.display = '';
+      }
+    }
+
+    async function useTrainedInInference(cellId, jobId) {
+      // Fetch artifact metadata server-side (never trust client path)
+      let data;
+      try {
+        const res = await fetch(`/api/train/artifacts/${encodeURIComponent(jobId)}`);
+        data = await res.json();
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      } catch (err) {
+        alert(`Cannot use training: ${err.message}`);
+        return;
+      }
+
+      const nb = getActiveNotebook();
+      if (!nb) return;
+
+      // Do not silently overwrite — always create a new inference cell pair
+      const isLora = data.training_method === 'lora';
+      const baseModelId = data.base_model_id;
+      const task = data.task_type || 'text-classification';
+      const adapterPath = data.adapter_dir; // for LoRA
+      const modelPath = data.model_dir; // for full
+
+      // Build a new model cell + inference cell for the trained artifact
+      const modelCellId = nb.nextCellId++;
+      const inferenceCellId = nb.nextCellId++;
+
+      const modelCell = {
+        id: modelCellId,
+        type: 'model',
+        content: '', // will be filled with trained loader code
+        output: '',
+        status: 'idle',
+        outputFormat: 'text',
+        modelInfo: {
+          id: isLora ? baseModelId : modelPath,
+          task: task,
+          isTrained: true,
+          job_id: jobId,
+          training_method: data.training_method,
+          base_model_id: baseModelId,
+          adapter_path: isLora ? adapterPath : null,
+          model_dir: modelPath,
+          artifact_dir: data.artifact_dir,
+        }
+      };
+
+      // Build trained loader code that uses existing loader architecture + PEFT for LoRA
+      let loaderCode = '';
+      if (isLora) {
+        loaderCode = `# --- Trained LoRA Loader (from ${jobId}) ---
+# Base: ${baseModelId}
+# Adapter: ${adapterPath}
+from transformers import AutoTokenizer, AutoConfig
+from peft import PeftModel
+import torch
+
+BASE_MODEL_ID = ${JSON.stringify(baseModelId)}
+ADAPTER_DIR = ${JSON.stringify(adapterPath)}
+
+# Reuse existing loader logic for base model
+from transformers import AutoModelForSequenceClassification, AutoModelForCausalLM, AutoModelForTokenClassification, AutoModelForImageClassification
+from hf_loader.model_inspector import inspect
+from hf_loader.loader_strategies import resolve_loader
+import importlib
+
+ctx = inspect(BASE_MODEL_ID)
+plan = resolve_loader(ctx)
+print(f"Base loader: {plan.auto_model_class} trust_remote_code={plan.trust_remote_code}")
+
+# Load base model + tokenizer via existing HF logic (auto-detect)
+# For LoRA inference, we load the base as the same task head used in training
+_task = ${JSON.stringify(task)}
+if _task == "text-classification":
+    from transformers import AutoModelForSequenceClassification
+    base_model = AutoModelForSequenceClassification.from_pretrained(BASE_MODEL_ID, trust_remote_code=plan.trust_remote_code)
+elif _task == "token-classification":
+    from transformers import AutoModelForTokenClassification
+    base_model = AutoModelForTokenClassification.from_pretrained(BASE_MODEL_ID, trust_remote_code=plan.trust_remote_code)
+elif _task == "image-classification":
+    from transformers import AutoModelForImageClassification
+    base_model = AutoModelForImageClassification.from_pretrained(BASE_MODEL_ID, trust_remote_code=plan.trust_remote_code)
+else:
+    from transformers import AutoModelForCausalLM
+    base_model = AutoModelForCausalLM.from_pretrained(BASE_MODEL_ID, trust_remote_code=plan.trust_remote_code)
+
+# Load tokenizer from adapter (saved) or base
+try:
+    tokenizer = AutoTokenizer.from_pretrained(ADAPTER_DIR, trust_remote_code=plan.trust_remote_code)
+except Exception:
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID, trust_remote_code=plan.trust_remote_code)
+if tokenizer.pad_token is None and tokenizer.eos_token:
+    tokenizer.pad_token = tokenizer.eos_token
+
+# Load adapter
+model = PeftModel.from_pretrained(base_model, ADAPTER_DIR)
+model.eval()
+preprocessor = tokenizer
+processor = None
+feature_extractor = None
+loaded_class = plan.auto_model_class + " + LoRA"
+print(f"Loaded LoRA adapter from {ADAPTER_DIR}")
+print(f"Trainable: {model.get_nb_trainable_parameters() if hasattr(model, 'get_nb_trainable_parameters') else 'unknown'}")
+`;
+      } else {
+        loaderCode = `# --- Trained Full Model Loader (from ${jobId}) ---
+# Model: ${modelPath}
+from transformers import AutoTokenizer, AutoConfig
+import torch
+
+MODEL_DIR = ${JSON.stringify(modelPath)}
+# Use existing loader to inspect, but load from local path
+from hf_loader.model_inspector import inspect
+from hf_loader.loader_strategies import resolve_loader
+
+ctx = inspect(MODEL_DIR)
+plan = resolve_loader(ctx)
+print(f"Loader: {plan.auto_model_class} from {MODEL_DIR}")
+
+# Load model + tokenizer from trained output (local)
+from transformers import AutoModel
+# Try task-specific class first
+_task = ${JSON.stringify(task)}
+model = None
+tokenizer = None
+try:
+    if _task == "text-classification":
+        from transformers import AutoModelForSequenceClassification
+        model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR)
+    elif _task == "token-classification":
+        from transformers import AutoModelForTokenClassification
+        model = AutoModelForTokenClassification.from_pretrained(MODEL_DIR)
+    elif _task == "image-classification":
+        from transformers import AutoModelForImageClassification
+        model = AutoModelForImageClassification.from_pretrained(MODEL_DIR)
+    else:
+        from transformers import AutoModelForCausalLM
+        model = AutoModelForCausalLM.from_pretrained(MODEL_DIR)
+except Exception as e:
+    print(f"task-specific load failed: {e}, trying AutoModel")
+    from transformers import AutoModel
+    model = AutoModel.from_pretrained(MODEL_DIR)
+
+from transformers import AutoTokenizer
+try:
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+except Exception:
+    tokenizer = AutoTokenizer.from_pretrained(${JSON.stringify(baseModelId)})
+
+if tokenizer.pad_token is None and tokenizer.eos_token:
+    tokenizer.pad_token = tokenizer.eos_token
+
+preprocessor = tokenizer
+processor = None
+feature_extractor = None
+loaded_class = plan.auto_model_class + " (trained)"
+model.eval()
+print(f"Loaded trained model from {MODEL_DIR}")
+`;
+      }
+
+      modelCell.content = loaderCode;
+      modelCell.modelInfo.inferenceCellId = inferenceCellId;
+
+      // Use existing task template for inference, but ensure it uses preprocessor/model from loader
+      const inferenceCode = generateTaskTemplate(task);
+      const inferenceCell = {
+        id: inferenceCellId,
+        type: 'code',
+        content: inferenceCode,
+        output: '',
+        status: 'idle',
+        outputFormat: 'text',
+        modelInfo: {
+          role: 'inference',
+          loaderCellId: modelCellId,
+          modelId: isLora ? baseModelId : modelPath,
+          adapter_path: isLora ? adapterPath : null,
+          task: task,
+          job_id: jobId,
+          isTrained: true,
+          training_method: data.training_method,
+        }
+      };
+
+      // Insert after the training cell (safer than overwriting)
+      const idx = nb.cells.findIndex(c => c.id === cellId);
+      const insertAt = idx >= 0 ? idx + 1 : nb.cells.length;
+      nb.cells.splice(insertAt, 0, modelCell, inferenceCell);
+
+      // Persist job_id reference for reload
+      updateNotebook();
+      renderNotebookEditor();
+
+      // Scroll to new cells
+      setTimeout(() => {
+        const el = document.getElementById(`cell-${modelCellId}`);
+        if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }, 100);
+    }
+
+    async function startTrainingCell(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training) return;
+      const t = cell.training;
+
+      // validate
+      if (!t.model_id || !t.dataset_id) {
+        alert('Model ID and Dataset ID are required');
+        return;
+      }
+
+      // reset previous state if finished/failed
+      if (['finished','failed','idle'].includes(t.status)) {
+        t.metrics = [];
+        t.logs = [];
+        t.progress = { current_epoch: 0, current_step: 0, train_loss: null, eval_loss: null, eta: null, gpu_status: 'idle', training_method: t.training_method, trainable_params: null, total_params: null };
+        if (trainingCharts[cellId]) {
+          try { trainingCharts[cellId].destroy(); } catch(_) {}
+          delete trainingCharts[cellId];
+          setTimeout(() => initTrainingChart(cellId), 100);
+        }
+      }
+
+      t.status = 'queued';
+      renderTrainingStatus(cellId);
+      updateNotebook();
+
+      // close old stream
+      if (trainingStreams[cellId]) {
+        try { trainingStreams[cellId].close(); } catch(_) {}
+        delete trainingStreams[cellId];
+      }
+      if (trainingPollTimers[cellId]) {
+        clearInterval(trainingPollTimers[cellId]);
+        delete trainingPollTimers[cellId];
+      }
+
+      try {
+        const res = await fetch('/api/train/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model_id: t.model_id,
+            dataset_id: t.dataset_id,
+            task_type: t.task_type,
+            epochs: Number(t.epochs),
+            batch_size: Number(t.batch_size),
+            learning_rate: Number(t.learning_rate),
+            max_steps: t.max_steps === '' || t.max_steps == null ? null : Number(t.max_steps),
+            validation_split: Number(t.validation_split),
+            training_method: t.training_method,
+            lora_r: Number(t.lora_r),
+            lora_alpha: Number(t.lora_alpha),
+            lora_dropout: Number(t.lora_dropout),
+            target_modules: t.target_modules,
+          })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to start training');
+
+        t.job_id = data.job_id;
+        t.status = data.status || 'queued';
+        updateNotebook();
+        renderTrainingStatus(cellId);
+        // persist job_id in header
+        const statusRow = document.getElementById(`tr-${cellId}-statusrow`);
+        if (statusRow && data.job_id) {
+          const existing = statusRow.querySelector('span:last-child');
+          if (existing && existing.textContent.includes('train_')) existing.textContent = data.job_id;
+          else {
+            const span = document.createElement('span');
+            span.style.cssText = 'font-size:11px;color:#64748b;font-family:monospace;';
+            span.textContent = data.job_id;
+            statusRow.appendChild(span);
+          }
+        }
+        attachTrainingSSE(cellId, data.job_id);
+      } catch (err) {
+        t.status = 'failed';
+        t.logs.push('❌ ' + err.message);
+        renderTrainingStatus(cellId);
+        const logsEl = document.getElementById(`tr-${cellId}-logs`);
+        if (logsEl) { logsEl.style.display = ''; logsEl.textContent = t.logs.slice(-40).join('\n'); logsEl.scrollTop = logsEl.scrollHeight; }
+        updateNotebook();
+      }
+    }
+
+    async function stopTrainingCell(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training || !cell.training.job_id) return;
+      try {
+        const res = await fetch('/api/train/stop', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ job_id: cell.training.job_id })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Stop failed');
+        cell.training.status = 'failed';
+        cell.training.logs.push('⏹ Stopped by user');
+        renderTrainingStatus(cellId);
+        updateNotebook();
+        if (trainingStreams[cellId]) {
+          try { trainingStreams[cellId].close(); } catch(_) {}
+          delete trainingStreams[cellId];
+        }
+        if (trainingPollTimers[cellId]) {
+          clearInterval(trainingPollTimers[cellId]);
+          delete trainingPollTimers[cellId];
+        }
+      } catch (err) {
+        alert('Stop failed: ' + err.message);
+      }
+    }
+
+    function attachTrainingSSE(cellId, jobId) {
+      // close old
+      if (trainingStreams[cellId]) {
+        try { trainingStreams[cellId].close(); } catch(_) {}
+      }
+      if (trainingPollTimers[cellId]) {
+        clearInterval(trainingPollTimers[cellId]);
+      }
+
+      let es;
+      try {
+        es = new EventSource(`/api/train/metrics/${jobId}?stream=1`);
+      } catch (e) {
+        // fallback to polling
+        startTrainingPolling(cellId, jobId);
+        return;
+      }
+      trainingStreams[cellId] = es;
+
+      es.addEventListener('metrics', (e) => {
+        try {
+          const m = JSON.parse(e.data);
+          handleTrainingMetric(cellId, m);
+        } catch(_) {}
+      });
+      es.addEventListener('progress', (e) => {
+        try {
+          const p = JSON.parse(e.data);
+          const nb = getActiveNotebook();
+          const cell = nb?.cells.find(c => c.id === cellId);
+          if (cell && cell.training) {
+            cell.training.progress = p;
+            cell.training.status = cell.training.status; // keep
+            renderTrainingStatus(cellId);
+            updateNotebook();
+          }
+        } catch(_) {}
+      });
+      es.addEventListener('status', (e) => {
+        try {
+          const s = JSON.parse(e.data);
+          const nb = getActiveNotebook();
+          const cell = nb?.cells.find(c => c.id === cellId);
+          if (cell && cell.training) {
+            cell.training.status = s.status;
+            renderTrainingStatus(cellId);
+            updateNotebook();
+          }
+        } catch(_) {}
+      });
+      es.addEventListener('log', (e) => {
+        try {
+          const l = JSON.parse(e.data);
+          const nb = getActiveNotebook();
+          const cell = nb?.cells.find(c => c.id === cellId);
+          if (cell && cell.training) {
+            cell.training.logs.push(l.line);
+            if (cell.training.logs.length > 200) cell.training.logs.shift();
+            const logsEl = document.getElementById(`tr-${cellId}-logs`);
+            if (logsEl) { logsEl.style.display = ''; logsEl.textContent = cell.training.logs.slice(-40).join('\n'); logsEl.scrollTop = logsEl.scrollHeight; }
+            updateNotebook();
+          }
+        } catch(_) {}
+      });
+      es.addEventListener('done', (e) => {
+        try {
+          const d = JSON.parse(e.data);
+          const nb = getActiveNotebook();
+          const cell = nb?.cells.find(c => c.id === cellId);
+          if (cell && cell.training) {
+            cell.training.status = d.status || cell.training.status;
+            renderTrainingStatus(cellId);
+            updateNotebook();
+            if (d.status === 'finished') {
+              setTimeout(() => renderTrainingComplete(cellId), 500);
+            }
+          }
+        } catch(_) {}
+        try { es.close(); } catch(_) {}
+        delete trainingStreams[cellId];
+      });
+      es.onerror = () => {
+        // SSE failed, fallback to polling
+        try { es.close(); } catch(_) {}
+        delete trainingStreams[cellId];
+        // only fallback if still running
+        const nb = getActiveNotebook();
+        const cell = nb?.cells.find(c => c.id === cellId);
+        if (cell && cell.training && ['queued','loading','training','evaluating'].includes(cell.training.status)) {
+          startTrainingPolling(cellId, jobId);
+        }
+      };
+    }
+
+    function handleTrainingMetric(cellId, m) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training) return;
+      cell.training.metrics.push(m);
+      if (cell.training.metrics.length > 300) cell.training.metrics.shift();
+      // update progress shortcuts
+      cell.training.progress.current_step = m.step;
+      cell.training.progress.current_epoch = m.epoch;
+      if (m.train_loss !== undefined) cell.training.progress.train_loss = m.train_loss;
+      if (m.eval_loss !== undefined) cell.training.progress.eval_loss = m.eval_loss;
+      if (m.learning_rate !== undefined) cell.training.progress.learning_rate = m.learning_rate;
+      if (m.elapsed_time !== undefined) cell.training.progress.elapsed_time = m.elapsed_time;
+      renderTrainingStatus(cellId);
+      updateTrainingChart(cellId, m);
+      updateNotebook();
+    }
+
+    function startTrainingPolling(cellId, jobId) {
+      if (trainingPollTimers[cellId]) clearInterval(trainingPollTimers[cellId]);
+      trainingPollTimers[cellId] = setInterval(async () => {
+        const nb = getActiveNotebook();
+        const cell = nb?.cells.find(c => c.id === cellId);
+        if (!cell || !cell.training) { clearInterval(trainingPollTimers[cellId]); return; }
+        if (['finished','failed'].includes(cell.training.status)) { clearInterval(trainingPollTimers[cellId]); return; }
+        try {
+          const res = await fetch(`/api/train/status/${jobId}`);
+          if (!res.ok) return;
+          const data = await res.json();
+          cell.training.status = data.status;
+          cell.training.progress = data.progress;
+          cell.training.logs = cell.training.logs || [];
+          renderTrainingStatus(cellId);
+          // fetch new metrics
+          const mRes = await fetch(`/api/train/metrics/${jobId}?limit=20`);
+          if (mRes.ok) {
+            const mData = await mRes.json();
+            const existingSteps = new Set(cell.training.metrics.map(mm => mm.step));
+            for (const mm of (mData.metrics || [])) {
+              if (!existingSteps.has(mm.step)) {
+                handleTrainingMetric(cellId, mm);
+              }
+            }
+          }
+          if (['finished','failed'].includes(data.status)) {
+            clearInterval(trainingPollTimers[cellId]);
+            delete trainingPollTimers[cellId];
+            // final chart refresh
+            initTrainingChart(cellId);
+            // re-populate chart with all metrics
+            if (cell.training.metrics.length) {
+              const chart = trainingCharts[cellId];
+              if (chart) {
+                chart.data.labels = cell.training.metrics.map(mm => mm.step);
+                chart.data.datasets[0].data = cell.training.metrics.map(mm => mm.train_loss);
+                chart.data.datasets[1].data = cell.training.metrics.map(mm => mm.eval_loss ?? null);
+                chart.update();
+              }
+            }
+            if (data.status === 'finished') {
+              setTimeout(() => renderTrainingComplete(cellId), 500);
+            }
+          }
+          updateNotebook();
+        } catch(_) {}
+      }, 1500);
+    }
+
+    // expose for inline handlers
+    window.startTrainingCell = startTrainingCell;
+    window.stopTrainingCell = stopTrainingCell;
+    window.updateTrainingField = updateTrainingField;
+    window.updateTrainingMethod = updateTrainingMethod;
+    window.attachTrainingSSE = attachTrainingSSE;
+
     function initCellEditor(cell) {
-      if (cell.type === 'parameter') return; // param cells manage their own editor lazily
+      if (cell.type === 'parameter' || cell.type === 'training') return; // these manage their own UI
       if (typeof CodeMirror === 'undefined') return;
       const host = document.querySelector(`#cell-${cell.id} .cm-host`);
       if (!host) return;
@@ -1810,23 +3047,38 @@
 
       const typeLabel = cell.type === 'model'     ? '🤖 Model Cell' :
                        cell.type === 'markdown'  ? '📝 Markdown'   :
-                       cell.type === 'parameter' ? '🎛️ Parameters' : '💻 Code';
+                       cell.type === 'parameter' ? '🎛️ Parameters' :
+                       cell.type === 'training'  ? '🏋️ Training Cell' : '💻 Code';
 
       const header = document.createElement('div');
       header.className = 'cell-header';
-      header.innerHTML = `
-        <span class="cell-type">${typeLabel}</span>
-        <div class="cell-controls">
-          ${cell.type === 'model' ? '<button class="cell-btn" onclick="openModelPicker(' + cell.id + ')">Select Model</button>' : ''}
-          ${cell.type !== 'parameter' ? `<button class="cell-btn run" onclick="runCell(${cell.id})">▶ Run</button>` : ''}
-          <button class="cell-btn delete" onclick="deleteCell(${cell.id})">Delete</button>
-        </div>
-      `;
+      if (cell.type === 'training') {
+        const isRunning = cell.training && ['queued','loading','training','evaluating'].includes(cell.training.status);
+        header.innerHTML = `
+          <span class="cell-type">${typeLabel}</span>
+          <div class="cell-controls">
+            <button class="cell-btn run" onclick="startTrainingCell(${cell.id})" ${isRunning ? 'disabled style="opacity:0.5;cursor:not-allowed;"' : ''}>▶ Start Training</button>
+            <button class="cell-btn" style="background:#dc2626;color:white;" onclick="stopTrainingCell(${cell.id})" ${!isRunning ? 'disabled style="opacity:0.5;cursor:not-allowed;"' : ''}>⏹ Stop</button>
+            <button class="cell-btn delete" onclick="deleteCell(${cell.id})">Delete</button>
+          </div>
+        `;
+      } else {
+        header.innerHTML = `
+          <span class="cell-type">${typeLabel}</span>
+          <div class="cell-controls">
+            ${cell.type === 'model' ? '<button class="cell-btn" onclick="openModelPicker(' + cell.id + ')">Select Model</button>' : ''}
+            ${cell.type !== 'parameter' ? `<button class="cell-btn run" onclick="runCell(${cell.id})">▶ Run</button>` : ''}
+            <button class="cell-btn delete" onclick="deleteCell(${cell.id})">Delete</button>
+          </div>
+        `;
+      }
 
       div.appendChild(header);
 
       if (cell.type === 'parameter') {
         div.appendChild(buildParamCellBody(cell));
+      } else if (cell.type === 'training') {
+        div.appendChild(buildTrainingCellBody(cell));
       } else {
         const inputContainer = document.createElement('div');
         inputContainer.className = 'cell-input';
@@ -1869,6 +3121,9 @@
       
       const cell = notebook.cells.find(c => c.id === cellId);
       if (!cell) return;
+      if (cell.type === 'training') {
+        return startTrainingCell(cellId);
+      }
       if (cell.status === 'running') return;
 
       // Modal starts a fresh Python namespace for each request.  When an
@@ -1943,10 +3198,54 @@
             cell.outputFormat = 'error';
           }
         } else if (cell.type === 'code' || cell.type === 'model') {
-          // ZeroGPU provider: the Space loads and runs the model itself, so
-          // we send a structured { model_id, task, inputs:{prompt,max_new_tokens} }
-          // request to /api/zerogpu-run instead of forwarding arbitrary Python.
-          if (gpuProvider.provider === 'zerogpu' &&
+          // Trained model inference: use dedicated local endpoint that handles LoRA/full from training_outputs
+          const _isTrained = cell.modelInfo?.isTrained || loaderCell?.modelInfo?.isTrained;
+          const _trainedJobId = cell.modelInfo?.job_id || loaderCell?.modelInfo?.job_id || cell.modelInfo?.jobId || loaderCell?.modelInfo?.jobId;
+          if (_isTrained && _trainedJobId) {
+            // For trained models, try the trained inference endpoint first (handles LoRA correctly)
+            // Extract a prompt from the inference cell's code or use a default
+            let _prompt = "Hello, world!";
+            try {
+              const m = (cell.content || '').match(/prompt\s*=\s*["']([^"']+)["']/);
+              if (m && m[1]) _prompt = m[1];
+              else if (cell.content && cell.content.includes('prompt')) {
+                // fallback: use first 100 chars of content as prompt
+                _prompt = cell.content.slice(0, 200).replace(/\n/g, ' ').slice(0, 100);
+              }
+            } catch(_) {}
+            const _task = cell.modelInfo?.task || loaderCell?.modelInfo?.task || 'text-generation';
+            // Show interim
+            const _interim = document.createElement('div');
+            _interim.className = 'cell-output';
+            _interim.innerHTML = `<pre>⏳ Running trained inference (job ${_trainedJobId})...</pre>`;
+            const _existing = cellElement.querySelector('.cell-output');
+            if (_existing) _existing.remove();
+            cellElement.appendChild(_interim);
+            try {
+              const _res = await fetch('/api/inference/trained', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ job_id: _trainedJobId, prompt: _prompt, max_new_tokens: 64, task: _task })
+              });
+              const _data = await _res.json();
+              if (!_res.ok) throw new Error(_data.error || `HTTP ${_res.status}`);
+              output = _data.output || _data.text || JSON.stringify(_data);
+              hasError = false;
+              cell.outputFormat = 'text';
+            } catch (err) {
+              // Fallback to normal ZeroGPU/Modal path if trained endpoint fails
+              console.warn('Trained inference endpoint failed, falling back to normal:', err);
+              if (gpuProvider.provider === 'zerogpu' &&
+                  (cell.type === 'model' || cell.modelInfo?.role === 'inference') &&
+                  (gpuProvider.zerogpu?.enabled ?? true)) {
+                output = await runCellViaZeroGPU(notebook, cell);
+                hasError = output === null;
+                cell.outputFormat = hasError ? 'error' : 'text';
+              } else {
+                throw err;
+              }
+            }
+          } else if (gpuProvider.provider === 'zerogpu' &&
               (cell.type === 'model' || cell.modelInfo?.role === 'inference') &&
               (gpuProvider.zerogpu?.enabled ?? true)) {
             output = await runCellViaZeroGPU(notebook, cell);

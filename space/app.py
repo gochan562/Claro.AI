@@ -46,7 +46,7 @@ def _parse_structured(prompt_or_json: str):
     the local provider send a single structured blob.
     """
     if not isinstance(prompt_or_json, str):
-        return prompt_or_json, None, None, None, None
+        return prompt_or_json, None, None, None, None, None
     s = prompt_or_json.strip()
     if s.startswith("{") and s.endswith("}"):
         try:
@@ -58,10 +58,11 @@ def _parse_structured(prompt_or_json: str):
                     obj.get("task"),
                     obj.get("max_new_tokens"),
                     obj.get("do_sample"),
+                    obj.get("adapter_path") or obj.get("adapter_dir"),
                 )
         except Exception:
             pass
-    return prompt_or_json, None, None, None, None
+    return prompt_or_json, None, None, None, None, None
 
 
 def _gpu_duration(max_new_tokens, task, model_id, *_args, **_kwargs):
@@ -83,7 +84,7 @@ def _gpu_duration(max_new_tokens, task, model_id, *_args, **_kwargs):
 
 
 @spaces.GPU(duration=_gpu_duration)
-def _gpu_infer(prompt, max_new_tokens, task, model_id, gguf_file, revision, temperature, top_p, do_sample):
+def _gpu_infer(prompt, max_new_tokens, task, model_id, gguf_file, revision, temperature, top_p, do_sample, adapter_path=None):
     """GPU-scoped inference: moves the CPU-cached model onto CUDA, runs the
     requested task, and offloads it again.  Model *loading* deliberately happens
     on the CPU worker (see generate()) so cold loads do not consume GPU seconds.
@@ -98,10 +99,11 @@ def _gpu_infer(prompt, max_new_tokens, task, model_id, gguf_file, revision, temp
         temperature=temperature,
         top_p=top_p,
         do_sample=do_sample,
+        adapter_path=adapter_path,
     )
 
 
-def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=None, revision=None, temperature=0.7, top_p=0.9, do_sample=True):
+def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=None, revision=None, temperature=0.7, top_p=0.9, do_sample=True, adapter_path=None):
     """Structured endpoint.
 
     Args:
@@ -125,7 +127,7 @@ def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=Non
     """
     # Unwrap an optional structured JSON payload passed through `prompt`.
     if model_id is None and task is None:
-        p, mid, t, mnt, ds = _parse_structured(prompt)
+        p, mid, t, mnt, ds, ap = _parse_structured(prompt)
         if mid is not None:
             model_id = mid
             task = t
@@ -133,10 +135,28 @@ def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=Non
                 max_new_tokens = mnt
             if ds is not None:
                 do_sample = bool(ds)
+            if ap is not None:
+                adapter_path = ap
             prompt = p
 
     model_id = (model_id or DEFAULT_MODEL_ID).strip()
     task = (task or DEFAULT_TASK).strip().lower()
+    # Validate adapter_path if provided — must not be traversal, must be safe
+    if adapter_path:
+        adapter_path = str(adapter_path).strip()
+        # Reject traversal and absolute paths from untrusted client — only allow HF ids or training_outputs/... 
+        if ".." in adapter_path or adapter_path.startswith("/") or adapter_path.startswith("\\"):
+            return f"[CLARO:bad_request] invalid adapter_path"
+        # For HF ids, must be owner/name; for local, must be under training_outputs
+        if "/" in adapter_path and not adapter_path.startswith("training_outputs/"):
+            # HF id — validate format
+            if not __import__('re').match(r'^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$', adapter_path):
+                # also allow training_outputs path
+                if not adapter_path.startswith("training_outputs/"):
+                    return f"[CLARO:bad_request] invalid adapter_path"
+        elif "/" not in adapter_path and adapter_path:
+            # single name not allowed for adapter
+            return f"[CLARO:bad_request] invalid adapter_path"
     if not prompt or not isinstance(prompt, str):
         return f"[CLARO:bad_request] prompt is required"
 
@@ -177,7 +197,7 @@ def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=Non
         # 1) Model load happens HERE, on the CPU worker (no @spaces.GPU), so
         #    downloads/from_pretrained never consume GPU-seconds.  Repeated
         #    requests for the same model hit the LRU cache and cost ~0 time.
-        load_model(model_id, gguf_file=gguf_file, revision=revision)
+        load_model(model_id, gguf_file=gguf_file, revision=revision, adapter_path=adapter_path)
         # 2) GPU quota is consumed ONLY by the explicit inference call below,
         #    with a workload-sized duration window.
         text = _gpu_infer(
@@ -190,6 +210,7 @@ def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=Non
             temperature,
             top_p,
             do_sample,
+            adapter_path,
         )
         # Return the generated text verbatim on success — the local Claro.AI
         # provider returns it directly to the dashboard.  Debug info (model

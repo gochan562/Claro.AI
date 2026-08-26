@@ -19,6 +19,9 @@ const {
 } = require('./gpu_backends');
 const gpuBackend = resolveBackend(process.env);
 
+// Training backend — generic engine (inference vs training are independent)
+const trainingBackend = require('./training_backend');
+
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname)));
@@ -300,7 +303,234 @@ app.post('/api/run-cell', async (req, res) => {
   }
 });
 
-// ── POST /api/train ───────────────────────────────────────────────────────────
+// ── Training Engine — generic backend (independent from inference) ──────────
+// Supports ZeroGPU | Local Python | Modal (future). Uses HF Trainer + task-aware
+// preprocessing (AutoTokenizer / AutoImageProcessor) and auto-detects model class
+// via hf_loader logic (inside training_runner.py).
+//
+// Jobs: { job_id, status, progress, metrics } with statuses:
+//   queued | loading | training | evaluating | finished | failed
+
+// POST /api/train/start — create and launch a background training job
+app.post('/api/train/start', async (req, res) => {
+  try {
+    const config = trainingBackend.validateTrainingRequest(req.body);
+    const job = trainingBackend.createJob(config);
+    trainingBackend.startJob(job);
+    return res.json({
+      job_id: job.job_id,
+      status: job.status,
+      config: job.config,
+      message: 'Training job queued',
+    });
+  } catch (err) {
+    const status = err.status || 400;
+    const code = err.code || 'bad_request';
+    return res.status(status).json({ error: err.message, code });
+  }
+});
+
+// GET /api/train/status/:job_id — current job snapshot (polling fallback)
+app.get('/api/train/status/:job_id', (req, res) => {
+  const job = trainingBackend.getJob(req.params.job_id);
+  if (!job) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
+  return res.json({
+    job_id: job.job_id,
+    status: job.status,
+    progress: job.progress,
+    config: job.config,
+    error: job.error,
+    created_at: job.created_at,
+    metrics_count: job.metrics.length,
+    artifacts_dir: job.artifacts_dir,
+  });
+});
+
+// GET /api/train/metrics/:job_id — return recent metrics as JSON, or SSE stream if requested
+app.get('/api/train/metrics/:job_id', (req, res) => {
+  const job = trainingBackend.getJob(req.params.job_id);
+  if (!job) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
+
+  const wantsSSE = (req.headers.accept || '').includes('text/event-stream') || req.query.stream === '1' || req.query.stream === 'true';
+  if (wantsSSE) {
+    res.set({
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    res.flushHeaders();
+    // replay + attach
+    trainingBackend.attachSSE(job.job_id, res);
+    // keep-alive ping every 15s
+    const ping = setInterval(() => {
+      try { res.write(': ping\n\n'); } catch (_) { clearInterval(ping); }
+    }, 15000);
+    req.on('close', () => {
+      clearInterval(ping);
+      // attachSSE handles removal on res close
+    });
+    return;
+  }
+
+  // polling JSON
+  const limit = Math.min(parseInt(req.query.limit || '100', 10) || 100, 500);
+  const slice = job.metrics.slice(-limit);
+  return res.json({
+    job_id: job.job_id,
+    status: job.status,
+    progress: job.progress,
+    metrics: slice,
+  });
+});
+
+// GET /api/train/stream/:job_id — dedicated SSE stream (alias for metrics SSE)
+app.get('/api/train/stream/:job_id', (req, res) => {
+  const job = trainingBackend.getJob(req.params.job_id);
+  if (!job) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.flushHeaders();
+  trainingBackend.attachSSE(job.job_id, res);
+  const ping = setInterval(() => {
+    try { res.write(': ping\n\n'); } catch (_) { clearInterval(ping); }
+  }, 15000);
+  req.on('close', () => clearInterval(ping));
+});
+
+// GET /api/train/list — list all jobs (debug)
+app.get('/api/train/list', (req, res) => {
+  return res.json({ jobs: trainingBackend.listJobs() });
+});
+
+// POST /api/train/stop — stop a running job
+app.post('/api/train/stop', (req, res) => {
+  const job_id = String(req.body.job_id || req.body.jobId || req.query.job_id || '').trim();
+  if (!job_id) return res.status(400).json({ error: 'job_id is required', code: 'bad_request' });
+  const job = trainingBackend.stopJob(job_id);
+  if (!job) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
+  return res.json({ job_id, status: job.status, message: 'Job stopped' });
+});
+
+// also support POST /api/train/stop/:job_id
+app.post('/api/train/stop/:job_id', (req, res) => {
+  const job = trainingBackend.stopJob(req.params.job_id);
+  if (!job) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
+  return res.json({ job_id: job.job_id, status: job.status, message: 'Job stopped' });
+});
+
+// GET /api/train/artifacts/:job_id — inference-ready artifact metadata
+app.get('/api/train/artifacts/:job_id', (req, res) => {
+  try {
+    const meta = trainingBackend.getArtifactMetadata(req.params.job_id);
+    return res.json(meta);
+  } catch (err) {
+    const status = err.status || 500;
+    const code = err.code || 'artifact_error';
+    return res.status(status).json({ error: err.message, code });
+  }
+});
+
+// POST /api/inference/trained — run inference with a trained model (full or LoRA)
+app.post('/api/inference/trained', async (req, res) => {
+  const { job_id, prompt, max_new_tokens, task } = req.body || {};
+  if (!job_id) return res.status(400).json({ error: 'job_id is required', code: 'bad_request' });
+  if (!prompt || typeof prompt !== 'string') return res.status(400).json({ error: 'prompt is required', code: 'bad_request' });
+
+  // Validate job and artifacts server-side (never trust client path)
+  let meta;
+  try {
+    meta = trainingBackend.getArtifactMetadata(String(job_id).trim());
+  } catch (err) {
+    const status = err.status || 500;
+    const code = err.code || 'artifact_error';
+    return res.status(status).json({ error: err.message, code });
+  }
+
+  // Use artifact metadata to derive paths — never use client-provided paths
+  const jobId = meta.job_id;
+  const taskType = String(task || meta.task_type || 'text-generation').toLowerCase();
+  const maxTokens = Math.min(parseInt(max_new_tokens, 10) || 100, 2048);
+  const promptStr = String(prompt).slice(0, 4000);
+
+  const pythonBin = process.env.PYTHON_BIN || 'python3';
+  const runnerPath = path.join(__dirname, 'inference_runner.py');
+  if (!require('fs').existsSync(runnerPath)) {
+    return res.status(500).json({ error: 'inference_runner.py not found', code: 'inference_error' });
+  }
+
+  const args = [
+    runnerPath,
+    '--job_id', jobId,
+    '--prompt', promptStr,
+    '--max_new_tokens', String(maxTokens),
+    '--task_type', taskType,
+  ];
+
+  const { spawn } = require('child_process');
+  let proc;
+  try {
+    proc = spawn(pythonBin, args, { cwd: __dirname, env: process.env });
+  } catch (e) {
+    return res.status(500).json({ error: `Failed to spawn inference: ${e.message}`, code: 'inference_error' });
+  }
+
+  let stdout = '';
+  let stderr = '';
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try { proc.kill('SIGKILL'); } catch (_) {}
+  }, 60000); // 60s timeout for inference
+
+  proc.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8'); });
+  proc.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
+
+  proc.on('close', (code) => {
+    clearTimeout(timer);
+    if (timedOut) {
+      return res.status(504).json({ error: 'Inference timed out', code: 'inference_timeout' });
+    }
+    if (code !== 0) {
+      // Try to parse JSON error from stdout
+      try {
+        const parsed = JSON.parse(stdout.trim().split('\n').pop());
+        if (parsed && parsed.error) {
+          return res.status(500).json({ error: parsed.error, code: 'inference_error', stderr: stderr.slice(0, 1000) });
+        }
+      } catch (_) {}
+      return res.status(500).json({ error: `Inference failed (exit ${code}): ${stderr.slice(0, 1000) || stdout.slice(0, 1000)}`, code: 'inference_error' });
+    }
+    // stdout should be a JSON line with {"output": ...}
+    try {
+      const lines = stdout.trim().split('\n');
+      let data = null;
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i].trim();
+        if (line.startsWith('{') && line.endsWith('}')) {
+          try { data = JSON.parse(line); break; } catch (_) {}
+        }
+      }
+      if (!data || !data.output) {
+        return res.status(500).json({ error: `No output from inference: ${stdout.slice(0, 1000)}`, code: 'inference_error', stderr: stderr.slice(0, 500) });
+      }
+      return res.json({ output: data.output, label: data.label, confidence: data.confidence, raw: data });
+    } catch (e) {
+      return res.status(500).json({ error: `Failed to parse inference output: ${e.message}`, code: 'inference_error', stdout: stdout.slice(0, 1000), stderr: stderr.slice(0, 500) });
+    }
+  });
+
+  proc.on('error', (err) => {
+    clearTimeout(timer);
+    return res.status(500).json({ error: `Inference spawn error: ${err.message}`, code: 'inference_error' });
+  });
+});
+
+// ── POST /api/train (legacy) ──────────────────────────────────────────────────
 // Kicks off a fine-tuning job (kept for programmatic use).
 app.post('/api/train', async (req, res) => {
   const { MODAL_URL } = process.env;

@@ -88,7 +88,8 @@ function normalizeStructuredRequest(body) {
   const task = String(body.task || 'text-generation').toLowerCase().trim();
   const inputs = body.inputs && typeof body.inputs === 'object' ? body.inputs : {};
 
-  if (!/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(modelId)) {
+  const _isLocalPath = modelId.startsWith('training_outputs/') || modelId.startsWith('./training_outputs/');
+  if (!_isLocalPath && !/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(modelId)) {
     throw new GpuError(
       `Invalid model_id: ${modelId || '(empty)'}`,
       'invalid_model_id',
@@ -152,8 +153,37 @@ function normalizeStructuredRequest(body) {
   const top_p = inputs.top_p !== undefined ? Number(inputs.top_p) : 0.9;
   const gguf_file = inputs.gguf_file || null;
   const revision = inputs.revision || null;
+  // LoRA adapter: may be HF id or local training_outputs path — validated server-side from job_id
+  let adapter_path = body.adapter_path || body.adapter_dir || inputs.adapter_path || inputs.adapter_dir || null;
+  if (adapter_path) {
+    adapter_path = String(adapter_path).trim();
+    if (adapter_path.includes('..') || adapter_path.startsWith('/') || adapter_path.startsWith('\\')) {
+      throw new GpuError('Invalid adapter_path (traversal)', 'bad_request', 400);
+    }
+    // For HF adapter ids, must be owner/name; for local, must be under training_outputs
+    if (adapter_path.includes('/') && !adapter_path.startsWith('training_outputs/')) {
+      if (!/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(adapter_path)) {
+        throw new GpuError('Invalid adapter_path', 'bad_request', 400);
+      }
+    } else if (!adapter_path.includes('/') && adapter_path) {
+      throw new GpuError('Invalid adapter_path', 'bad_request', 400);
+    }
+  } else {
+    adapter_path = null;
+  }
 
-  return { modelId, task, prompt, max_new_tokens: maxNewTokens, temperature, top_p, gguf_file, revision };
+  // Allow local training output paths for full fine-tuned models (e.g. training_outputs/train_xxx)
+  // These are not HF ids but local dirs validated server-side via job_id
+  const isLocalPath = modelId.startsWith('training_outputs/') || modelId.startsWith('./training_outputs/');
+  if (!isLocalPath && !/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(modelId)) {
+    throw new GpuError(
+      `Invalid model_id: ${modelId || '(empty)'}`,
+      'invalid_model_id',
+      400
+    );
+  }
+
+  return { modelId, task, prompt, max_new_tokens: maxNewTokens, temperature, top_p, gguf_file, revision, adapter_path };
 }
 
 // Generate a deduplication key for a request
@@ -219,7 +249,7 @@ class ZeroGPUBackend {
   // supported repo (Transformers / Diffusers / GGUF) instead of hard-coding
   // a single model.  We forward the validated model_id/task alongside the
   // prompt so the Space actually does the requested work.
-  async _postGenerate(prompt, maxNewTokens, signal, modelId, task, authToken, temperature, top_p, gguf_file, revision) {
+  async _postGenerate(prompt, maxNewTokens, signal, modelId, task, authToken, temperature, top_p, gguf_file, revision, adapter_path) {
     const url = `${this.base}/gradio_api/call/v2/generate`;
     const body = { prompt, max_new_tokens: maxNewTokens };
     if (modelId) body.model_id = modelId;
@@ -229,6 +259,7 @@ class ZeroGPUBackend {
     if (top_p !== undefined && top_p !== 0.9) body.top_p = top_p;
     if (gguf_file) body.gguf_file = gguf_file;
     if (revision) body.revision = revision;
+    if (adapter_path) body.adapter_path = adapter_path;
     const headers = { 'Content-Type': 'application/json' };
     if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
     const res = await fetch(url, {

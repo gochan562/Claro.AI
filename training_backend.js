@@ -91,7 +91,7 @@ function validateTrainingRequest(body) {
   const dataset_id = String(body.dataset_id || body.datasetId || '').trim();
   const task_type = normalizeTask(body.task_type || body.task || body.taskType);
 
-  if (!model_id || !/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(model_id)) {
+  if (!model_id || !/^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)?$/.test(model_id)) {
     throw Object.assign(new Error(`Invalid model_id: ${model_id || '(empty)'}`), { code: 'invalid_model_id', status: 400 });
   }
   if (!dataset_id || !/^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)?$/.test(dataset_id)) {

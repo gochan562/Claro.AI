@@ -46,7 +46,7 @@ async function run() {
   console.log('✓ learning_rate limit enforced');
 
   err=null;
-  try { tb.validateTrainingRequest({model_id:'bad',dataset_id:'c/d',task_type:'text-classification'}); } catch(e){ err=e; }
+  try { tb.validateTrainingRequest({model_id:'bad!',dataset_id:'c/d',task_type:'text-classification'}); } catch(e){ err=e; }
   assert(err && err.code==='invalid_model_id');
   err=null;
   try { tb.validateTrainingRequest({model_id:'a/b',dataset_id:'bad//',task_type:'text-classification'}); } catch(e){ err=e; }
@@ -54,7 +54,10 @@ async function run() {
   err=null;
   try { tb.validateTrainingRequest({model_id:'a/b',dataset_id:'',task_type:'text-classification'}); } catch(e){ err=e; }
   assert(err && err.code==='invalid_dataset_id');
-  console.log('✓ model/dataset validation');
+  // single-segment model_id like distilbert-base-uncased must now be valid (regression for DOMException)
+  const singleCfg = tb.validateTrainingRequest({model_id:'distilbert-base-uncased', dataset_id:'stanfordnlp/imdb', task_type:'text-classification'});
+  assert.strictEqual(singleCfg.model_id, 'distilbert-base-uncased');
+  console.log('✓ model/dataset validation (including single-segment distilbert-base-uncased)');
 
   // 3. job creation + real Trainer metrics shape (test-only mock, never production exp(-step))
   // In production, metrics come ONLY from training_runner.py Trainer callback.

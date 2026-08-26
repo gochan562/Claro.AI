@@ -2420,8 +2420,12 @@
       else container.innerHTML = `<div class="training-complete"><h4>✅ Training complete</h4><div style="font-size:12px;color:#94a3b8;">Loading artifacts...</div></div>`;
 
       try {
-        const res = await fetch(`/api/train/artifacts/${encodeURIComponent(jobId)}`);
+        const artUrl = new URL(`/api/train/artifacts/${encodeURIComponent(jobId)}`, window.location.href).toString();
+        console.log(`[TRAIN-DIAG] fetch artifacts ${artUrl} href=${window.location.href}`);
+        const res = await fetch(artUrl);
+        console.log(`[TRAIN-DIAG] artifacts response status=${res.status} content-type=${res.headers.get('content-type')}`);
         const data = await res.json();
+        console.log(`[TRAIN-DIAG] artifacts data`, data);
         if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
         // data: {ready, training_method, base_model_id, task_type, artifact_dir, adapter_dir, model_dir, files, ...}
         const isLora = data.training_method === 'lora';
@@ -2472,8 +2476,12 @@
       // Fetch artifact metadata server-side (never trust client path)
       let data;
       try {
-        const res = await fetch(`/api/train/artifacts/${encodeURIComponent(jobId)}`);
+        const artUrl2 = new URL(`/api/train/artifacts/${encodeURIComponent(jobId)}`, window.location.href).toString();
+        console.log(`[TRAIN-DIAG] useTrained fetch ${artUrl2}`);
+        const res = await fetch(artUrl2);
+        console.log(`[TRAIN-DIAG] useTrained response status=${res.status}`);
         data = await res.json();
+        console.log(`[TRAIN-DIAG] useTrained data`, data);
         if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
       } catch (err) {
         alert(`Cannot use training: ${err.message}`);
@@ -2708,26 +2716,31 @@ print(f"Loaded trained model from {MODEL_DIR}")
       }
 
       try {
-        const res = await fetch('/api/train/start', {
+        const startUrl = new URL('/api/train/start', window.location.href).toString();
+        const startBody = {
+          model_id: t.model_id,
+          dataset_id: t.dataset_id,
+          task_type: t.task_type,
+          epochs: Number(t.epochs),
+          batch_size: Number(t.batch_size),
+          learning_rate: Number(t.learning_rate),
+          max_steps: t.max_steps === '' || t.max_steps == null ? null : Number(t.max_steps),
+          validation_split: Number(t.validation_split),
+          training_method: t.training_method,
+          lora_r: Number(t.lora_r),
+          lora_alpha: Number(t.lora_alpha),
+          lora_dropout: Number(t.lora_dropout),
+          target_modules: t.target_modules,
+        };
+        console.log(`[TRAIN-DIAG] POST ${startUrl} body=`, startBody, ` href=${window.location.href}`);
+        const res = await fetch(startUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model_id: t.model_id,
-            dataset_id: t.dataset_id,
-            task_type: t.task_type,
-            epochs: Number(t.epochs),
-            batch_size: Number(t.batch_size),
-            learning_rate: Number(t.learning_rate),
-            max_steps: t.max_steps === '' || t.max_steps == null ? null : Number(t.max_steps),
-            validation_split: Number(t.validation_split),
-            training_method: t.training_method,
-            lora_r: Number(t.lora_r),
-            lora_alpha: Number(t.lora_alpha),
-            lora_dropout: Number(t.lora_dropout),
-            target_modules: t.target_modules,
-          })
+          body: JSON.stringify(startBody)
         });
+        console.log(`[TRAIN-DIAG] POST response status=${res.status} content-type=${res.headers.get('content-type')}`);
         const data = await res.json();
+        console.log(`[TRAIN-DIAG] POST response data=`, data);
         if (!res.ok) throw new Error(data.error || 'Failed to start training');
 
         t.job_id = data.job_id;
@@ -2762,12 +2775,16 @@ print(f"Loaded trained model from {MODEL_DIR}")
       const cell = nb?.cells.find(c => c.id === cellId);
       if (!cell || !cell.training || !cell.training.job_id) return;
       try {
-        const res = await fetch('/api/train/stop', {
+        const stopUrl = new URL('/api/train/stop', window.location.href).toString();
+        console.log(`[TRAIN-DIAG] POST ${stopUrl} job_id=${cell.training.job_id}`);
+        const res = await fetch(stopUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ job_id: cell.training.job_id })
         });
+        console.log(`[TRAIN-DIAG] stop response status=${res.status}`);
         const data = await res.json();
+        console.log(`[TRAIN-DIAG] stop data`, data);
         if (!res.ok) throw new Error(data.error || 'Stop failed');
         cell.training.status = 'failed';
         cell.training.logs.push('⏹ Stopped by user');
@@ -2797,8 +2814,29 @@ print(f"Loaded trained model from {MODEL_DIR}")
 
       let es;
       try {
-        es = new EventSource(`/api/train/metrics/${jobId}?stream=1`);
+        // Diagnostics for URL construction
+        console.log(`[TRAIN-DIAG] attachTrainingSSE cellId=${cellId} jobId=${jobId} href=${window.location.href}`);
+        const urlStr = `/api/train/metrics/${encodeURIComponent(jobId)}?stream=1`;
+        console.log(`[TRAIN-DIAG] EventSource URL string: ${urlStr}`);
+        const url = new URL(urlStr, window.location.href);
+        console.log(`[TRAIN-DIAG] EventSource URL resolved: ${url.toString()}`);
+        try {
+          es = new EventSource(url.toString());
+          console.log(`[TRAIN-DIAG] EventSource created for ${jobId}`);
+        } catch (e) {
+          console.error(`[TRAIN-DIAG] EventSource constructor threw for ${url.toString()}:`, e);
+          throw e;
+        }
       } catch (e) {
+        console.error(`[TRAIN-DIAG] EventSource construction failed for jobId=${jobId}`, e);
+        // Also try to surface the real error in the UI instead of generic
+        const nb = getActiveNotebook();
+        const cell = nb?.cells.find(c => c.id === cellId);
+        if (cell && cell.training) {
+          cell.training.logs.push(`❌ EventSource failed: ${e.message} (jobId=${jobId}, href=${window.location.href})`);
+          const logsEl = document.getElementById(`tr-${cellId}-logs`);
+          if (logsEl) { logsEl.style.display = ''; logsEl.textContent = cell.training.logs.slice(-40).join('\n'); }
+        }
         // fallback to polling
         startTrainingPolling(cellId, jobId);
         return;
@@ -2906,15 +2944,21 @@ print(f"Loaded trained model from {MODEL_DIR}")
         if (!cell || !cell.training) { clearInterval(trainingPollTimers[cellId]); return; }
         if (['finished','failed'].includes(cell.training.status)) { clearInterval(trainingPollTimers[cellId]); return; }
         try {
-          const res = await fetch(`/api/train/status/${jobId}`);
-          if (!res.ok) return;
+          const statusUrl = new URL(`/api/train/status/${encodeURIComponent(jobId)}`, window.location.href).toString();
+          console.log(`[TRAIN-DIAG] polling status ${statusUrl}`);
+          const res = await fetch(statusUrl);
+          if (!res.ok) {
+            console.warn(`[TRAIN-DIAG] status fetch failed ${res.status} for ${jobId}`);
+            return;
+          }
           const data = await res.json();
           cell.training.status = data.status;
           cell.training.progress = data.progress;
           cell.training.logs = cell.training.logs || [];
           renderTrainingStatus(cellId);
           // fetch new metrics
-          const mRes = await fetch(`/api/train/metrics/${jobId}?limit=20`);
+          const metricsUrl = new URL(`/api/train/metrics/${encodeURIComponent(jobId)}?limit=20`, window.location.href).toString();
+          const mRes = await fetch(metricsUrl);
           if (mRes.ok) {
             const mData = await mRes.json();
             const existingSteps = new Set(cell.training.metrics.map(mm => mm.step));
@@ -3222,17 +3266,22 @@ print(f"Loaded trained model from {MODEL_DIR}")
             if (_existing) _existing.remove();
             cellElement.appendChild(_interim);
             try {
-              const _res = await fetch('/api/inference/trained', {
+              const _inferUrl = new URL('/api/inference/trained', window.location.href).toString();
+              console.log(`[TRAIN-DIAG] POST ${_inferUrl} job_id=${_trainedJobId} prompt=${_prompt.slice(0,50)} task=${_task}`);
+              const _res = await fetch(_inferUrl, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ job_id: _trainedJobId, prompt: _prompt, max_new_tokens: 64, task: _task })
               });
+              console.log(`[TRAIN-DIAG] inference response status=${_res.status} content-type=${_res.headers.get('content-type')}`);
               const _data = await _res.json();
+              console.log(`[TRAIN-DIAG] inference data`, _data);
               if (!_res.ok) throw new Error(_data.error || `HTTP ${_res.status}`);
               output = _data.output || _data.text || JSON.stringify(_data);
               hasError = false;
               cell.outputFormat = 'text';
             } catch (err) {
+              console.error(`[TRAIN-DIAG] trained inference failed for ${_trainedJobId}:`, err);
               // Fallback to normal ZeroGPU/Modal path if trained endpoint fails
               console.warn('Trained inference endpoint failed, falling back to normal:', err);
               if (gpuProvider.provider === 'zerogpu' &&

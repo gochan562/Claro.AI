@@ -197,15 +197,20 @@ async function run() {
     const dirs = fs2.readdirSync(trainingOutputs);
     for (const d of dirs) {
       const jobPath = path.join(trainingOutputs, d, 'job.json');
-      if (fs2.existsSync(jobPath)) {
+      const adapterModelPath = path.join(trainingOutputs, d, 'adapter_model.safetensors');
+      if (fs2.existsSync(jobPath) && fs2.existsSync(adapterModelPath)) {
         try {
           const j = JSON.parse(fs2.readFileSync(jobPath, 'utf8'));
           if (j.config && j.config.training_method === 'lora' && j.status === 'finished') {
             const adapterPath = path.join(trainingOutputs, d, 'adapter_config.json');
             if (fs2.existsSync(adapterPath)) {
-              realLoraJobId = d;
-              realLoraDir = path.join(trainingOutputs, d);
-              break;
+              // ensure it's a real adapter (size > 5K, not dummy "dummy" 5 bytes)
+              const stat = fs2.statSync(adapterModelPath);
+              if (stat.size > 5000) {
+                realLoraJobId = d;
+                realLoraDir = path.join(trainingOutputs, d);
+                break;
+              }
             }
           }
         } catch (_) {}

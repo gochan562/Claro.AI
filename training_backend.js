@@ -472,6 +472,7 @@ function _startPythonTraining(job) {
     const msg = `training_runner.py not found at ${runnerPath}`;
     _log(job, `[TRAIN] training_error: ${msg}`);
     _setStatus(job, 'failed');
+    _updateProgress(job, { gpu_status: 'idle', eta: 0 });
     job.error = 'training_error';
     job.end_time = _now();
     _broadcast(job, 'done', { status: 'failed', error: job.error, message: msg });
@@ -516,6 +517,7 @@ function _startPythonTraining(job) {
     const msg = `Failed to spawn Python (${pythonBin}): ${e.message}`;
     _log(job, `[TRAIN] training_error: ${msg}`);
     _setStatus(job, 'failed');
+    _updateProgress(job, { gpu_status: 'idle', eta: 0 });
     job.error = 'training_error';
     job.end_time = _now();
     _broadcast(job, 'done', { status: 'failed', error: job.error, message: msg });
@@ -600,6 +602,7 @@ function _startPythonTraining(job) {
         if (low.includes('training_error')) {
           // runner reported fatal error
           _setStatus(job, 'failed');
+          _updateProgress(job, { gpu_status: 'idle', eta: 0 });
           job.error = 'training_error';
         } else if (low.includes('loading')) {
           _setStatus(job, 'loading');
@@ -638,6 +641,11 @@ function _startPythonTraining(job) {
     const elapsed = (_now() - job.start_time) / 1000;
     if (elapsed > cfg.max_time_sec + 30) { // 30s grace
       _log(job, `[TRAIN] training_error: max training time ${cfg.max_time_sec}s exceeded (elapsed ${Math.round(elapsed)}s)`);
+      _setStatus(job, 'failed');
+      _updateProgress(job, { gpu_status: 'idle', eta: 0 });
+      job.error = 'training_error';
+      job.end_time = _now();
+      _broadcast(job, 'done', { status: 'failed', error: job.error, message: 'max_training_time_exceeded' });
       try { job._pythonProc.kill('SIGKILL'); } catch (_) {}
       clearInterval(watchdog);
     }
@@ -653,7 +661,8 @@ function _startPythonTraining(job) {
     }
 
     if (job.status === 'failed' && !job.artifacts_dir) {
-      // already marked failed via training_error in stdout — ensure artifacts saved
+      // already marked failed via training_error in stdout — ensure artifacts saved and GPU idle
+      _updateProgress(job, { gpu_status: 'idle', eta: 0 });
       _saveArtifacts(job);
       return;
     }
@@ -675,6 +684,7 @@ function _startPythonTraining(job) {
         const msg = 'Trainer produced no metrics';
         _log(job, `[TRAIN] training_error: ${msg} (stderr: ${stderrBuf.slice(0,500)})`);
         _setStatus(job, 'failed');
+        _updateProgress(job, { gpu_status: 'idle', eta: 0 });
         job.error = 'training_error';
         job.end_time = _now();
         _broadcast(job, 'done', { status: 'failed', error: job.error, message: msg });
@@ -686,13 +696,17 @@ function _startPythonTraining(job) {
         const tail = stderrBuf.slice(-800).trim();
         _log(job, `[TRAIN] training_error: Python ${msg} ${tail ? '— ' + tail : ''}`);
         _setStatus(job, 'failed');
+        _updateProgress(job, { gpu_status: 'idle', eta: 0 });
         job.error = 'training_error';
         job.end_time = _now();
         _broadcast(job, 'done', { status: 'failed', error: job.error, message: msg });
+      } else if (job.status === 'failed') {
+        _updateProgress(job, { gpu_status: 'idle', eta: 0 });
       }
       if (!job.artifacts_dir) _saveArtifacts(job);
     } else {
-      // edge: code 0 but status already failed, ensure artifacts
+      // edge: code 0 but status already failed, ensure artifacts and idle
+      _updateProgress(job, { gpu_status: 'idle', eta: 0 });
       if (!job.artifacts_dir) _saveArtifacts(job);
     }
   });
@@ -704,6 +718,7 @@ function _startPythonTraining(job) {
     job._pythonProc = null;
     if (!job._aborted && job.status !== 'finished') {
       _setStatus(job, 'failed');
+      _updateProgress(job, { gpu_status: 'idle', eta: 0 });
       job.error = 'training_error';
       job.end_time = _now();
       _broadcast(job, 'done', { status: 'failed', error: job.error, message: msg });

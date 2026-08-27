@@ -28,6 +28,7 @@ def load_trained_model(job_id, artifact_dir, training_method, base_model_id, tas
     """
     Load a trained model for inference.
     Returns (model, preprocessor, loaded_class)
+    preprocessor is tokenizer for text tasks, image_processor for image tasks
     """
     artifact_path = Path(artifact_dir)
     if not artifact_path.exists():
@@ -88,25 +89,43 @@ def load_trained_model(job_id, artifact_dir, training_method, base_model_id, tas
                 else:
                     base_model = AutoModelForCausalLM.from_pretrained(base_model_id, trust_remote_code=False)
 
-            # Load tokenizer from adapter dir or base
-            try:
-                from transformers import AutoTokenizer
+            # Load preprocessor: tokenizer or image_processor depending on task
+            tokenizer = None
+            image_processor = None
+            if task_type == "image-classification":
                 try:
-                    tokenizer = AutoTokenizer.from_pretrained(str(artifact_path), trust_remote_code=False)
-                    _log(f"tokenizer from adapter dir")
-                except Exception:
-                    tokenizer = AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=False)
-                    _log(f"tokenizer from base {base_model_id}")
-                if tokenizer.pad_token is None and tokenizer.eos_token:
-                    tokenizer.pad_token = tokenizer.eos_token
-            except Exception as e:
-                _log(f"tokenizer load failed: {e}")
-                tokenizer = None
+                    from transformers import AutoImageProcessor
+                    try:
+                        image_processor = AutoImageProcessor.from_pretrained(str(artifact_path), trust_remote_code=False)
+                        _log(f"image_processor from adapter dir")
+                    except Exception:
+                        image_processor = AutoImageProcessor.from_pretrained(base_model_id, trust_remote_code=False)
+                        _log(f"image_processor from base {base_model_id}")
+                    tokenizer = None
+                except Exception as e:
+                    _log(f"image_processor load failed: {e}")
+                    image_processor = None
+            else:
+                try:
+                    from transformers import AutoTokenizer
+                    try:
+                        tokenizer = AutoTokenizer.from_pretrained(str(artifact_path), trust_remote_code=False)
+                        _log(f"tokenizer from adapter dir")
+                    except Exception:
+                        tokenizer = AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=False)
+                        _log(f"tokenizer from base {base_model_id}")
+                    if tokenizer and tokenizer.pad_token is None and tokenizer.eos_token:
+                        tokenizer.pad_token = tokenizer.eos_token
+                except Exception as e:
+                    _log(f"tokenizer load failed: {e}")
+                    tokenizer = None
 
             # Load adapter
             model = PeftModel.from_pretrained(base_model, str(artifact_path))
             _log(f"LoRA adapter loaded from {artifact_path}, active: {model.active_adapter}")
             model.eval()
+            if task_type == "image-classification" and image_processor is not None:
+                return model, image_processor, model.__class__.__name__
             return model, tokenizer, model.__class__.__name__
 
         except ImportError as e:
@@ -136,26 +155,48 @@ def load_trained_model(job_id, artifact_dir, training_method, base_model_id, tas
                 from transformers import AutoModel
                 model = AutoModel.from_pretrained(str(artifact_path), trust_remote_code=False)
 
-            # Tokenizer from artifact_dir
-            try:
-                from transformers import AutoTokenizer
-                tokenizer = AutoTokenizer.from_pretrained(str(artifact_path), trust_remote_code=False)
-                if tokenizer.pad_token is None and tokenizer.eos_token:
-                    tokenizer.pad_token = tokenizer.eos_token
-            except Exception as e:
-                _log(f"tokenizer from artifact failed: {e}, trying base")
+            # Tokenizer / ImageProcessor from artifact_dir
+            tokenizer = None
+            image_processor = None
+            if task_type == "image-classification":
+                try:
+                    from transformers import AutoImageProcessor
+                    image_processor = AutoImageProcessor.from_pretrained(str(artifact_path), trust_remote_code=False)
+                    _log(f"image_processor from artifact dir")
+                except Exception as e:
+                    _log(f"image_processor from artifact failed: {e}, trying base")
+                    try:
+                        # try base
+                        import json as js
+                        job_cfg = json.loads((artifact_path / "job.json").read_text())
+                        base_id = job_cfg.get("config", {}).get("model_id", "")
+                        from transformers import AutoImageProcessor
+                        image_processor = AutoImageProcessor.from_pretrained(base_id, trust_remote_code=False)
+                    except Exception:
+                        image_processor = None
+                model.eval()
+                return model, image_processor, model.__class__.__name__
+            else:
                 try:
                     from transformers import AutoTokenizer
-                    # try base
-                    import json as js
-                    job_cfg = json.loads((artifact_path / "job.json").read_text())
-                    base_id = job_cfg.get("config", {}).get("model_id", "")
-                    tokenizer = AutoTokenizer.from_pretrained(base_id, trust_remote_code=False)
-                except Exception:
-                    tokenizer = None
-
-            model.eval()
-            return model, tokenizer, model.__class__.__name__
+                    tokenizer = AutoTokenizer.from_pretrained(str(artifact_path), trust_remote_code=False)
+                    if tokenizer and tokenizer.pad_token is None and tokenizer.eos_token:
+                        tokenizer.pad_token = tokenizer.eos_token
+                except Exception as e:
+                    _log(f"tokenizer from artifact failed: {e}, trying base")
+                    try:
+                        from transformers import AutoTokenizer
+                        # try base
+                        import json as js
+                        job_cfg = json.loads((artifact_path / "job.json").read_text())
+                        base_id = job_cfg.get("config", {}).get("model_id", "")
+                        tokenizer = AutoTokenizer.from_pretrained(base_id, trust_remote_code=False)
+                        if tokenizer.pad_token is None and tokenizer.eos_token:
+                            tokenizer.pad_token = tokenizer.eos_token
+                    except Exception:
+                        tokenizer = None
+                model.eval()
+                return model, tokenizer, model.__class__.__name__
         except Exception as e:
             _fail(f"Full model load failed: {e}\n{traceback.format_exc()}")
 
@@ -167,12 +208,14 @@ def run_inference(job_id, prompt, max_new_tokens=100, task_type="text-generation
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--job_id', required=True)
-    p.add_argument('--prompt', required=True)
+    p.add_argument('--prompt', required=False, default=None)
     p.add_argument('--max_new_tokens', type=int, default=100)
     p.add_argument('--task_type', type=str, default="text-generation")
     p.add_argument('--artifact_dir', type=str, default=None)
     p.add_argument('--training_method', type=str, default=None)
     p.add_argument('--base_model_id', type=str, default=None)
+    p.add_argument('--image_path', type=str, default=None)
+    p.add_argument('--image_base64', type=str, default=None)
     args = p.parse_args()
 
     # Resolve artifact_dir server-side from job_id (security: never trust client path)
@@ -238,6 +281,8 @@ def main():
 
     try:
         if task_type in ("text-generation", "text2text-generation", "summarization", "translation", "conversational", "chat"):
+            if not prompt:
+                _fail("prompt is required for text generation")
             inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
             is_enc_dec = bool(getattr(model.config, "is_encoder_decoder", False))
             with torch.no_grad():
@@ -254,36 +299,132 @@ def main():
             else:
                 new_ids = out[0][inputs["input_ids"].shape[-1]:]
             text = tokenizer.decode(new_ids, skip_special_tokens=True)
-            print(json.dumps({"output": text}))
+            print(json.dumps({"task": "text-generation", "output": text}))
         elif task_type == "text-classification":
+            if not prompt:
+                _fail("prompt is required for text-classification")
             inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(model.device)
             with torch.no_grad():
                 logits = model(**inputs).logits
-                probs = torch.softmax(logits, dim=-1)
+                probs = torch.softmax(logits, dim=-1)[0]
                 idx = int(logits.argmax(-1).item())
-                label = model.config.id2label.get(idx, str(idx)) if hasattr(model.config, "id2label") else str(idx)
-                conf = float(probs[0, idx].item())
-                print(json.dumps({"output": label, "label": label, "confidence": conf, "logits": logits[0].tolist()[:5]}))
+                # Use id2label mapping if available, else Label <id>
+                id2label = getattr(model.config, "id2label", None) or {}
+                # Sometimes id2label keys are ints, sometimes strings
+                label = id2label.get(idx, id2label.get(str(idx), f"Label {idx}")) if id2label else f"Label {idx}"
+                conf = float(probs[idx].item())
+                # Build scores array sorted descending
+                scores = []
+                for i in range(len(probs)):
+                    lab = id2label.get(i, id2label.get(str(i), f"Label {i}")) if id2label else f"Label {i}"
+                    scores.append({"label": lab, "label_id": i, "score": float(probs[i].item())})
+                scores_sorted = sorted(scores, key=lambda x: x["score"], reverse=True)
+                best = scores_sorted[0] if scores_sorted else {"label": label, "score": conf}
+                print(json.dumps({
+                    "task": "text-classification",
+                    "output": best["label"],
+                    "prediction": {"label": best["label"], "label_id": best["label_id"], "score": best["score"]},
+                    "scores": scores_sorted,
+                    "label": best["label"],
+                    "confidence": best["score"]
+                }))
         elif task_type == "token-classification":
+            if not prompt:
+                _fail("prompt is required for token-classification")
             inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(model.device)
             tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
             with torch.no_grad():
                 logits = model(**inputs).logits
                 pred_ids = logits.argmax(-1)[0].tolist()
-                labels = [model.config.id2label.get(pid, str(pid)) for pid in pred_ids]
-                # filter O
-                out = []
+                id2label = getattr(model.config, "id2label", None) or {}
+                labels = [id2label.get(pid, id2label.get(str(pid), f"Label {pid}")) for pid in pred_ids]
+                # Build full token list
+                full = []
                 for tok, lab in zip(tokens, labels):
-                    if lab != "O":
-                        out.append({"token": tok, "label": lab})
-                print(json.dumps({"output": str(out), "entities": out}))
+                    full.append({"token": tok, "label": lab})
+                # Filtered entities (non-O) for convenience
+                entities = [{"token": tok, "label": lab} for tok, lab in zip(tokens, labels) if lab != "O"]
+                print(json.dumps({
+                    "task": "token-classification",
+                    "output": " ".join([f"{t}:{l}" for t,l in zip(tokens, labels)]),
+                    "tokens": full,
+                    "entities": entities
+                }))
         elif task_type == "image-classification":
-            _fail("Image classification inference not yet implemented for local path (need image input)")
+            # Expect image_path or image_base64
+            image = None
+            image_path = args.image_path
+            image_b64 = args.image_base64
+            if image_b64:
+                try:
+                    import base64, io
+                    from PIL import Image
+                    # Handle data URL prefix
+                    if "," in image_b64:
+                        image_b64 = image_b64.split(",", 1)[1]
+                    data = base64.b64decode(image_b64)
+                    image = Image.open(io.BytesIO(data)).convert("RGB")
+                except Exception as e:
+                    _fail(f"Failed to decode image_base64: {e}")
+            elif image_path:
+                try:
+                    from PIL import Image
+                    image = Image.open(image_path).convert("RGB")
+                except Exception as e:
+                    _fail(f"Failed to load image_path {image_path}: {e}")
+            elif prompt and prompt.startswith("data:image"):
+                try:
+                    import base64, io
+                    from PIL import Image
+                    b64 = prompt.split(",",1)[1] if "," in prompt else prompt
+                    data = base64.b64decode(b64)
+                    image = Image.open(io.BytesIO(data)).convert("RGB")
+                except Exception as e:
+                    _fail(f"Failed to decode prompt as image: {e}")
+            else:
+                _fail("Image input required for image-classification (provide image_base64 or image_path)")
+
+            if image is None:
+                _fail("No image provided")
+
+            # tokenizer here is actually image_processor for this task
+            processor = tokenizer  # from load_trained_model, for image task tokenizer==image_processor
+            if processor is None:
+                _fail("No image processor found")
+
+            inputs = processor(images=image, return_tensors="pt")
+            # Move to device
+            try:
+                inputs = {k: v.to(device) if hasattr(v, 'to') else v for k, v in inputs.items()}
+            except Exception:
+                pass
+            with torch.no_grad():
+                logits = model(**inputs).logits
+                probs = torch.softmax(logits, dim=-1)[0]
+                idx = int(logits.argmax(-1).item())
+                id2label = getattr(model.config, "id2label", None) or {}
+                label = id2label.get(idx, id2label.get(str(idx), f"Label {idx}")) if id2label else f"Label {idx}"
+                conf = float(probs[idx].item())
+                scores = []
+                for i in range(len(probs)):
+                    lab = id2label.get(i, id2label.get(str(i), f"Label {i}")) if id2label else f"Label {i}"
+                    scores.append({"label": lab, "label_id": i, "score": float(probs[i].item())})
+                scores_sorted = sorted(scores, key=lambda x: x["score"], reverse=True)
+                print(json.dumps({
+                    "task": "image-classification",
+                    "output": label,
+                    "prediction": {"label": label, "label_id": idx, "score": conf},
+                    "scores": scores_sorted,
+                    "label": label,
+                    "confidence": conf
+                }))
         else:
+            if not prompt:
+                _fail(f"prompt required for task {task_type}")
             inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
             with torch.no_grad():
                 out = model(**inputs)
-                print(json.dumps({"output": str(out)[:1000]}))
+                print(json.dumps({"task": task_type, "output": str(out)[:1000]}))
     except Exception as e:
         _fail(f"Inference failed: {e}\n{traceback.format_exc()}")
 

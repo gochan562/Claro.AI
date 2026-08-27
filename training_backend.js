@@ -737,11 +737,18 @@ function startJob(job) {
   return job;
 }
 
-function stopJob(job_id) {
+function stopJob(job_id, opts = {}) {
   const job = jobs.get(job_id);
   if (!job) return null;
   if (['finished', 'failed'].includes(job.status)) return job;
   job._aborted = true;
+  const caller = opts.caller || 'unknown';
+  const cellId = opts.cellId || 'unknown';
+  const userInitiated = opts.userInitiated;
+  const stack = opts.stack || '';
+  const ts = new Date().toISOString();
+  console.log(`[TRAIN-DIAG] stopJob job_id=${job_id} caller=${caller} cellId=${cellId} userInitiated=${userInitiated} status=${job.status} step=${job.progress?.current_step}/${job.progress?.total_steps} pid=${job._pythonProc?.pid} ts=${ts} stack=${String(stack).slice(0,800)}`);
+  _log(job, `[TRAIN-DIAG] stopJob caller=${caller} cellId=${cellId} userInitiated=${userInitiated} stack=${String(stack).slice(0,500)}`);
 
   // Terminate Python process and its children if possible
   if (job._pythonProc) {
@@ -750,7 +757,7 @@ function stopJob(job_id) {
     try {
       // try graceful SIGTERM first, then SIGKILL after 3s
       proc.kill('SIGTERM');
-      _log(job, `[TRAIN] SIGTERM sent to ${proc.pid}`);
+      _log(job, `[TRAIN] SIGTERM sent to ${proc.pid} (caller=${caller})`);
       const killTimer = setTimeout(() => {
         try {
           if (!proc.killed) proc.kill('SIGKILL');
@@ -761,6 +768,8 @@ function stopJob(job_id) {
     } catch (e) {
       _log(job, `[TRAIN] stop failed: ${e.message}`);
     }
+  } else {
+    _log(job, `[TRAIN] stopJob called but no _pythonProc (already exited?) caller=${caller}`);
   }
 
   _setStatus(job, 'failed');
@@ -768,7 +777,7 @@ function stopJob(job_id) {
   job.end_time = _now();
   _updateProgress(job, { gpu_status: 'idle', eta: 0 });
   _broadcast(job, 'done', { status: 'failed', error: job.error, message: 'stopped by user' });
-  _log(job, `[TRAIN] Stopped by user`);
+  _log(job, `[TRAIN] Stopped by user (caller=${caller})`);
   _saveArtifacts(job);
   return job;
 }

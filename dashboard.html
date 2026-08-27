@@ -1152,6 +1152,278 @@
       font-size: 13px;
     }
     .training-complete-btn:hover { background: #059669; }
+
+    /* ── Redesigned Training Cell (progressive disclosure) ── */
+    .train-header-title {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 16px;
+      font-weight: 700;
+      color: #bfdbfe;
+      margin-bottom: 2px;
+    }
+    .train-header-title span.icon { font-size: 20px; }
+    .train-subtitle {
+      font-size: 12px;
+      color: #64748b;
+      margin-bottom: 14px;
+    }
+    .train-section-label {
+      font-size: 11px;
+      font-weight: 700;
+      color: #94a3b8;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .train-help-tooltip {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: #1e293b;
+      border: 1px solid #334155;
+      color: #94a3b8;
+      font-size: 10px;
+      cursor: help;
+      position: relative;
+    }
+    .train-help-tooltip:hover::after {
+      content: attr(data-tooltip);
+      position: absolute;
+      bottom: 130%;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #0f172a;
+      border: 1px solid #334155;
+      color: #e2e8f0;
+      padding: 8px 10px;
+      border-radius: 8px;
+      font-size: 11px;
+      white-space: normal;
+      width: 220px;
+      text-transform: none;
+      letter-spacing: 0;
+      font-weight: 400;
+      box-shadow: 0 8px 20px rgba(0,0,0,0.4);
+      z-index: 100;
+      line-height: 1.4;
+    }
+    .train-field-hint {
+      font-size: 11px;
+      color: #64748b;
+      margin-top: 2px;
+      line-height: 1.3;
+    }
+    .train-field-error {
+      font-size: 11px;
+      color: #fca5a5;
+      background: rgba(239,68,68,0.08);
+      border: 1px solid rgba(239,68,68,0.3);
+      border-radius: 6px;
+      padding: 6px 8px;
+      margin-top: 4px;
+      white-space: pre-wrap;
+      display: none;
+    }
+    .train-field-error.visible { display: block; }
+    .train-input.invalid {
+      border-color: #ef4444 !important;
+      box-shadow: 0 0 0 2px rgba(239,68,68,0.15);
+    }
+    .train-task-explanation {
+      font-size: 11px;
+      color: #94a3b8;
+      background: #0f172a;
+      border: 1px solid #1e293b;
+      border-radius: 6px;
+      padding: 7px 10px;
+      margin-top: 6px;
+      font-style: italic;
+    }
+    .train-summary-strip {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: #0f172a;
+      border: 1px solid #1e293b;
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 12px;
+      color: #94a3b8;
+    }
+    .train-summary-strip strong { color: #e2e8f0; font-weight: 600; }
+    .train-customize-toggle, .train-advanced-toggle {
+      width: 100%;
+      padding: 9px 12px;
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      color: #94a3b8;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      text-align: center;
+      transition: 0.15s;
+    }
+    .train-customize-toggle:hover, .train-advanced-toggle:hover {
+      border-color: #60a5fa;
+      color: #e2e8f0;
+      background: #1e293b;
+    }
+    .train-customize-toggle.open, .train-advanced-toggle.open {
+      background: #1e293b;
+      border-color: #475569;
+      color: #e2e8f0;
+    }
+    .train-customize-panel, .train-advanced-panel {
+      background: #0f172a;
+      border: 1px solid #1e293b;
+      border-radius: 10px;
+      padding: 14px;
+      display: none;
+    }
+    .train-customize-panel.open, .train-advanced-panel.open { display: block; }
+    .train-customize-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    @media (max-width: 700px) { .train-customize-grid { grid-template-columns: 1fr; } }
+    .train-preview-box {
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 10px;
+      padding: 12px;
+    }
+    .train-preview-box h4 {
+      font-size: 11px;
+      font-weight: 700;
+      color: #94a3b8;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 8px;
+    }
+    .train-preview-grid {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 4px 12px;
+      font-size: 12px;
+    }
+    .train-preview-label { color: #64748b; }
+    .train-preview-value { color: #e2e8f0; font-family: 'Consolas', monospace; font-weight: 600; word-break: break-all; }
+    .train-preview-divider {
+      height: 1px;
+      background: #1e293b;
+      margin: 8px 0;
+    }
+    .train-validation-box {
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 12px;
+      display: flex;
+      gap: 8px;
+      align-items: flex-start;
+    }
+    .train-validation-box.good {
+      background: rgba(34,197,94,0.08);
+      border: 1px solid rgba(34,197,94,0.25);
+      color: #6ee7b7;
+    }
+    .train-validation-box.warn {
+      background: rgba(245,158,11,0.08);
+      border: 1px solid rgba(245,158,11,0.25);
+      color: #fcd34d;
+    }
+    .train-validation-box.error {
+      background: rgba(239,68,68,0.08);
+      border: 1px solid rgba(239,68,68,0.25);
+      color: #fecaca;
+    }
+    .train-compat-box {
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .train-compat-box.error {
+      background: rgba(239,68,68,0.08);
+      border: 1px solid rgba(239,68,68,0.3);
+      color: #fecaca;
+    }
+    .train-compat-box.ok {
+      background: rgba(34,197,94,0.06);
+      border: 1px solid rgba(34,197,94,0.18);
+      color: #94a3b8;
+    }
+    .train-compat-box.unknown {
+      background: #0f172a;
+      border: 1px solid #1e293b;
+      color: #64748b;
+      font-style: italic;
+    }
+    .train-compat-fix {
+      margin-top: 8px;
+      padding: 6px 12px;
+      background: #334155;
+      border: none;
+      border-radius: 6px;
+      color: #e2e8f0;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .train-compat-fix:hover { background: #475569; }
+    .train-start-wrap {
+      display: flex;
+      justify-content: center;
+      padding: 6px 0;
+    }
+    .train-start-wrap .training-btn.primary {
+      padding: 11px 26px;
+      font-size: 14px;
+      border-radius: 10px;
+      min-width: 180px;
+    }
+    .train-start-wrap .training-btn.primary:disabled {
+      background: #1e293b;
+      border: 1px solid #334155;
+    }
+    .train-stop-confirm {
+      background: #0f172a;
+      border: 1px solid #dc2626;
+      border-radius: 10px;
+      padding: 14px;
+      display: none;
+    }
+    .train-stop-confirm.visible { display: block; }
+    .train-stop-confirm p {
+      font-size: 12px;
+      color: #fecaca;
+      margin-bottom: 10px;
+      line-height: 1.4;
+    }
+    .train-stop-confirm-actions {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+    .train-divider {
+      height: 1px;
+      background: #1e293b;
+      margin: 2px 0;
+    }
+    .train-beginner-grid {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
   </style>
 </head>
 <body>
@@ -1395,6 +1667,7 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/markdown/markdown.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script src="/pyodide_local.js"></script>
+  <script src="training_ui.js"></script>
   <script>
     let notebookRegistry = {
       notebooks: {},
@@ -1534,6 +1807,8 @@
               if (!('training_method' in cell.training.progress)) cell.training.progress.training_method = cell.training.training_method;
               if (!('trainable_params' in cell.training.progress)) cell.training.progress.trainable_params = null;
               if (!('total_params' in cell.training.progress)) cell.training.progress.total_params = null;
+              if (!('_uiCustomizeOpen' in cell.training)) cell.training._uiCustomizeOpen = false;
+              if (!('_uiAdvancedOpen' in cell.training)) cell.training._uiAdvancedOpen = false;
             }
           }
         }
@@ -1658,6 +1933,8 @@
           progress: { current_epoch: 0, current_step: 0, train_loss: null, eval_loss: null, eta: null, gpu_status: 'idle', training_method: 'auto', trainable_params: null, total_params: null },
           metrics: [],
           logs: [],
+          _uiCustomizeOpen: false,
+          _uiAdvancedOpen: false,
         };
         // training cells store config in cell.training, not cell.content
         cell.content = JSON.stringify(cell.training, null, 2);
@@ -1676,7 +1953,8 @@
         // stop running job when cell deleted
         const t = cell.training;
         if (['queued','loading','training','evaluating'].includes(t.status)) {
-          stopTrainingCell(cellId);
+          console.log(`[TRAIN-DIAG] deleteCell auto-stop cellId=${cellId} job_id=${t.job_id} status=${t.status}`);
+          stopTrainingCell(cellId, { caller: 'deleteCell', userInitiated: true });
         }
         if (trainingCharts[cellId]) {
           try { trainingCharts[cellId].destroy(); } catch(_) {}
@@ -2027,6 +2305,7 @@
     }
 
     function isLargeModelFrontend(modelId) {
+      if (typeof TrainingUI !== 'undefined' && TrainingUI.isLargeModelFrontend) return TrainingUI.isLargeModelFrontend(modelId);
       const m = String(modelId||'').toLowerCase();
       const mm = m.match(/(\d+(?:\.\d+)?)\s*b\b/);
       if (mm) {
@@ -2035,6 +2314,13 @@
       }
       if (/(?:^|[-_\/\s])(?:1b|1\.5b|3b|7b|8b|13b|30b|70b)(?:$|[-_\/\s])/i.test(m)) return true;
       return false;
+    }
+
+    function getEffectiveMethod(t) {
+      if (typeof TrainingUI !== 'undefined' && TrainingUI.getEffectiveTrainingMethod) return TrainingUI.getEffectiveTrainingMethod(t);
+      const m = String(t.training_method||'auto').toLowerCase();
+      if (m === 'auto') return isLargeModelFrontend(t.model_id) ? 'lora' : 'full';
+      return m;
     }
 
     function buildTrainingCellBody(cell) {
@@ -2058,8 +2344,13 @@
           progress: { current_epoch: 0, current_step: 0, train_loss: null, eval_loss: null, eta: null, gpu_status: 'idle', training_method: 'auto', trainable_params: null, total_params: null },
           metrics: [],
           logs: [],
+          _uiCustomizeOpen: false,
+          _uiAdvancedOpen: false,
         };
       }
+      // ensure UI flags exist (migration)
+      if (cell.training._uiCustomizeOpen === undefined) cell.training._uiCustomizeOpen = false;
+      if (cell.training._uiAdvancedOpen === undefined) cell.training._uiAdvancedOpen = false;
       const t = cell.training;
       const wrap = document.createElement('div');
       wrap.className = 'training-cell-body';
@@ -2068,112 +2359,212 @@
       const isRunning = ['queued','loading','training','evaluating'].includes(t.status);
       const locked = isRunning ? 'disabled' : '';
 
-      const _effMethod = t.training_method === 'auto' ? (isLargeModelFrontend(t.model_id) ? 'lora' : 'full') : t.training_method;
-      const _loraVisible = _effMethod === 'lora' ? '' : 'display:none;';
+      const effMethod = getEffectiveMethod(t);
+      const isLoraEffective = effMethod === 'lora';
+      const customizeOpen = !!t._uiCustomizeOpen;
+      const advancedOpen = !!t._uiAdvancedOpen;
+      // summary text
+      const summaryText = (typeof TrainingUI !== 'undefined' && TrainingUI.getTrainingSummary) ? TrainingUI.getTrainingSummary(t) : `${t.epochs} epochs \u00b7 batch ${t.batch_size} \u00b7 ${t.validation_split}% validation`;
+      const effLabel = isLoraEffective ? 'LoRA' : (t.training_method === 'auto' ? (isLargeModelFrontend(t.model_id) ? 'LoRA' : 'Full fine-tuning') : (t.training_method === 'lora' ? 'LoRA' : 'Full fine-tuning'));
+      // task explanation
+      const taskExplain = (typeof TrainingUI !== 'undefined' && TrainingUI.getTaskExplanation) ? TrainingUI.getTaskExplanation(t.task_type) : '';
+      // validation & compat will be computed after DOM attached, but initial render
+      const valInfo = (typeof TrainingUI !== 'undefined' && TrainingUI.validateTrainingConfigFrontend) ? TrainingUI.validateTrainingConfigFrontend(t) : {valid:true, errors:{}};
+      const compatInfo = (typeof TrainingUI !== 'undefined' && TrainingUI.getCompatibilityInfo) ? TrainingUI.getCompatibilityInfo(t) : {status:'unknown', message:'Compatibility will be checked when training starts.'};
+      const preview = (typeof TrainingUI !== 'undefined' && TrainingUI.getPreviewData) ? TrainingUI.getPreviewData(t) : {task:t.task_type, model:t.model_id, dataset:t.dataset_id, method:effLabel, epochs:t.epochs, batch_size:t.batch_size, validation:t.validation_split+'%', estimatedSteps:'Estimate unavailable', estimatedTime:'Estimate unavailable', resourceUsage:'Estimate unavailable'};
+
+      // friendly labels for task
+      const taskOptions = [
+        {v:'text-classification', label:'Text classification'},
+        {v:'text-generation', label:'Text generation'},
+        {v:'image-classification', label:'Image classification'},
+        {v:'token-classification', label:'Token classification'},
+      ];
+
       wrap.innerHTML = `
-        <div class="training-form-grid">
-          <div class="training-field">
-            <label>Model ID</label>
-            <input type="text" id="tr-${cell.id}-model" value="${t.model_id}" placeholder="owner/model-name" ${locked} oninput="updateTrainingField(${cell.id},'model_id',this.value)" />
+        <div class="train-beginner-grid">
+          <div>
+            <div class="train-header-title"><span class="icon">\uD83E\uDDE0</span> Train Model</div>
+            <div class="train-subtitle">Fine-tune a model on your dataset — start with the basics, then customize.</div>
           </div>
-          <div class="training-field">
-            <label>Dataset ID</label>
-            <input type="text" id="tr-${cell.id}-dataset" value="${t.dataset_id}" placeholder="owner/dataset-name" ${locked} oninput="updateTrainingField(${cell.id},'dataset_id',this.value)" />
-          </div>
-          <div class="training-field">
-            <label>Task Type</label>
-            <select id="tr-${cell.id}-task" ${locked} onchange="updateTrainingField(${cell.id},'task_type',this.value)">
-              <option value="text-generation" ${t.task_type==='text-generation'?'selected':''}>Text Generation</option>
-              <option value="text-classification" ${t.task_type==='text-classification'?'selected':''}>Text Classification</option>
-              <option value="image-classification" ${t.task_type==='image-classification'?'selected':''}>Image Classification</option>
-              <option value="token-classification" ${t.task_type==='token-classification'?'selected':''}>Token Classification</option>
-            </select>
-          </div>
-          <div class="training-field">
-            <label>Training Method</label>
-            <select id="tr-${cell.id}-method" ${locked} onchange="updateTrainingMethod(${cell.id},this.value)">
-              <option value="auto" ${t.training_method==='auto'?'selected':''}>Auto (${isLargeModelFrontend(t.model_id) ? 'LoRA for ≥1B' : 'Full for <1B'})</option>
-              <option value="full" ${t.training_method==='full'?'selected':''}>Full Fine-tuning</option>
-              <option value="lora" ${t.training_method==='lora'?'selected':''}>LoRA (PEFT)</option>
-            </select>
-            <div class="lora-hint" id="tr-${cell.id}-method-hint">${_effMethod==='lora' ? 'Will train only LoRA adapters (efficient for ≥1B)' : 'Will fine-tune all weights'}</div>
-          </div>
-          <div class="training-field">
-            <label>Validation Split (%)</label>
-            <input type="number" min="0" max="50" step="1" value="${t.validation_split}" ${locked} oninput="updateTrainingField(${cell.id},'validation_split',this.value)" />
-          </div>
-          <div class="training-field">
-            <label>Epochs (max ${MAX_TRAIN_EPOCHS||5})</label>
-            <input type="number" min="1" max="${MAX_TRAIN_EPOCHS||5}" step="1" value="${t.epochs}" ${locked} oninput="updateTrainingField(${cell.id},'epochs',this.value)" />
-          </div>
-          <div class="training-field">
-            <label>Batch Size</label>
-            <input type="number" min="1" max="32" step="1" value="${t.batch_size}" ${locked} oninput="updateTrainingField(${cell.id},'batch_size',this.value)" />
-          </div>
-          <div class="training-field">
-            <label>Learning Rate</label>
-            <input type="number" step="0.000001" value="${t.learning_rate}" ${locked} oninput="updateTrainingField(${cell.id},'learning_rate',this.value)" />
-          </div>
-          <div class="training-field">
-            <label>Max Steps (optional)</label>
-            <input type="number" min="1" placeholder="auto" value="${t.max_steps}" ${locked} oninput="updateTrainingField(${cell.id},'max_steps',this.value)" />
-          </div>
-        </div>
 
-        <div class="lora-section" id="tr-${cell.id}-lora-section" style="${_loraVisible}">
-          <h4>🔧 LoRA Config <span style="font-weight:normal;text-transform:none;color:#64748b;">(auto target_modules)</span></h4>
-          <div class="lora-grid">
+          <div>
+            <div class="train-section-label">What should it learn? <span class="train-help-tooltip" data-tooltip="Choose the kind of task you want the model to learn. You can change this later.">?</span></div>
             <div class="training-field">
-              <label>r (rank)</label>
-              <input type="number" min="1" max="64" step="1" value="${t.lora_r}" ${locked} oninput="updateTrainingField(${cell.id},'lora_r',this.value)" />
-            </div>
-            <div class="training-field">
-              <label>lora_alpha</label>
-              <input type="number" min="1" max="128" step="1" value="${t.lora_alpha}" ${locked} oninput="updateTrainingField(${cell.id},'lora_alpha',this.value)" />
-            </div>
-            <div class="training-field">
-              <label>lora_dropout</label>
-              <input type="number" min="0" max="0.5" step="0.01" value="${t.lora_dropout}" ${locked} oninput="updateTrainingField(${cell.id},'lora_dropout',this.value)" />
-            </div>
-            <div class="training-field">
-              <label>target_modules</label>
-              <input type="text" placeholder="auto" value="${t.target_modules}" ${locked} oninput="updateTrainingField(${cell.id},'target_modules',this.value)" />
+              <select id="tr-${cell.id}-task" ${locked} onchange="updateTrainingField(${cell.id},'task_type',this.value)">
+                ${taskOptions.map(o=>`<option value="${o.v}" ${t.task_type===o.v?'selected':''}>${o.label}</option>`).join('')}
+              </select>
+              <div class="train-task-explanation" id="tr-${cell.id}-task-explain">${taskExplain}</div>
+              <div class="train-field-error" id="tr-${cell.id}-err-task"></div>
             </div>
           </div>
-          <div class="lora-hint">auto = infer from architecture (e.g. q_proj/v_proj for Llama, query/value for BERT). Use comma-separated to override.</div>
-        </div>
 
-        <div class="training-actions">
-          <button class="training-btn primary" id="tr-${cell.id}-start" onclick="startTrainingCell(${cell.id})" ${isRunning ? 'disabled' : ''}>▶ Start Training</button>
-          <button class="training-btn stop" id="tr-${cell.id}-stop" onclick="stopTrainingCell(${cell.id})" ${!isRunning ? 'disabled style="opacity:0.5;cursor:not-allowed;"' : ''}>⏹ Stop</button>
-          <div class="training-status-row" id="tr-${cell.id}-statusrow">
+          <div>
+            <div class="train-section-label">Model <span class="train-help-tooltip" data-tooltip="The AI model you\u2019ll train. For example: distilbert-base-uncased">?</span></div>
+            <div class="training-field">
+              <input type="text" id="tr-${cell.id}-model" class="train-input" value="${String(t.model_id).replace(/"/g,'&quot;')}" placeholder="distilbert-base-uncased or owner/model-name" ${locked} oninput="updateTrainingField(${cell.id},'model_id',this.value)" />
+              <div class="train-field-hint">The AI model you\u2019ll train.</div>
+              <div class="train-field-error" id="tr-${cell.id}-err-model"></div>
+            </div>
+          </div>
+
+          <div>
+            <div class="train-section-label">Dataset <span class="train-help-tooltip" data-tooltip="The examples the model will learn from. For example: stanfordnlp/imdb">?</span></div>
+            <div class="training-field">
+              <input type="text" id="tr-${cell.id}-dataset" class="train-input" value="${String(t.dataset_id).replace(/"/g,'&quot;')}" placeholder="stanfordnlp/imdb or owner/dataset-name" ${locked} oninput="updateTrainingField(${cell.id},'dataset_id',this.value)" />
+              <div class="train-field-hint">The examples the model will learn from.</div>
+              <div class="train-field-error" id="tr-${cell.id}-err-dataset"></div>
+            </div>
+          </div>
+
+          <div class="train-divider"></div>
+
+          <div class="train-summary-strip" id="tr-${cell.id}-summary-strip">
+            <span>Training: <strong id="tr-${cell.id}-summary-text">${summaryText}</strong></span>
+            <span style="font-size:10px;background:#1e293b;border:1px solid #334155;border-radius:20px;padding:3px 8px;color:#94a3b8;" id="tr-${cell.id}-summary-method">${effLabel}</span>
+          </div>
+
+          <button class="train-customize-toggle ${customizeOpen?'open':''}" id="tr-${cell.id}-customize-toggle" onclick="toggleCustomizeSettings(${cell.id})">${customizeOpen?'▾ Customize settings':'▸ Customize settings'}</button>
+
+          <div class="train-customize-panel ${customizeOpen?'open':''}" id="tr-${cell.id}-customize-panel">
+            <div class="train-customize-grid">
+              <div class="training-field">
+                <label>Epochs <span class="train-help-tooltip" data-tooltip="How many times the model sees the training dataset.">?</span></label>
+                <input type="number" id="tr-${cell.id}-epochs" class="train-input" min="1" max="5" step="1" value="${t.epochs}" ${locked} oninput="updateTrainingField(${cell.id},'epochs',this.value)" />
+                <div class="train-field-hint">How many times the model sees the training dataset.</div>
+                <div class="train-field-error" id="tr-${cell.id}-err-epochs"></div>
+              </div>
+              <div class="training-field">
+                <label>Batch size <span class="train-help-tooltip" data-tooltip="How many examples the model processes at once. Larger batches usually need more memory.">?</span></label>
+                <input type="number" id="tr-${cell.id}-batch" class="train-input" min="1" max="32" step="1" value="${t.batch_size}" ${locked} oninput="updateTrainingField(${cell.id},'batch_size',this.value)" />
+                <div class="train-field-hint">How many examples the model processes at once.</div>
+                <div class="train-field-error" id="tr-${cell.id}-err-batch_size"></div>
+              </div>
+              <div class="training-field">
+                <label>Learning rate <span class="train-help-tooltip" data-tooltip="How strongly the model changes its parameters during training.">?</span></label>
+                <input type="number" id="tr-${cell.id}-lr" class="train-input" step="0.000001" value="${t.learning_rate}" ${locked} oninput="updateTrainingField(${cell.id},'learning_rate',this.value)" />
+                <div class="train-field-hint">How strongly the model changes its parameters during training.</div>
+                <div class="train-field-error" id="tr-${cell.id}-err-learning_rate"></div>
+              </div>
+              <div class="training-field">
+                <label>Validation split (%) <span class="train-help-tooltip" data-tooltip="The percentage of examples kept aside to check whether the model generalizes to data it wasn\u2019t trained on.">?</span></label>
+                <input type="number" id="tr-${cell.id}-vs" class="train-input" min="0" max="50" step="1" value="${t.validation_split}" ${locked} oninput="updateTrainingField(${cell.id},'validation_split',this.value)" />
+                <div class="train-field-hint">The percentage of examples kept aside to check generalization.</div>
+                <div class="train-field-error" id="tr-${cell.id}-err-validation_split"></div>
+              </div>
+              <div class="training-field" style="grid-column:1 / -1;">
+                <label>Training method <span class="train-help-tooltip" data-tooltip="Claro.AI can automatically pick the best method. LoRA trains a small set of additional parameters for large models.">?</span></label>
+                <select id="tr-${cell.id}-method" ${locked} onchange="updateTrainingMethod(${cell.id},this.value)">
+                  <option value="auto" ${t.training_method==='auto'?'selected':''}>Recommended</option>
+                  <option value="full" ${t.training_method==='full'?'selected':''}>Full fine-tuning</option>
+                  <option value="lora" ${t.training_method==='lora'?'selected':''}>LoRA</option>
+                </select>
+                <div class="train-field-hint" id="tr-${cell.id}-method-hint">${t.training_method==='auto' ? 'Claro.AI automatically chooses the best training method for the model.' : (t.training_method==='full' ? 'Updates the model\u2019s existing parameters. Best for smaller models.' : 'Trains a small set of additional parameters. Usually much more efficient for large models.')}</div>
+                <div class="train-field-error" id="tr-${cell.id}-err-training_method"></div>
+              </div>
+            </div>
+
+            <button class="train-advanced-toggle ${advancedOpen?'open':''}" id="tr-${cell.id}-advanced-toggle" style="${isLoraEffective ? '' : 'display:none;'}" onclick="toggleAdvancedSettings(${cell.id})">${advancedOpen?'▾ Advanced (LoRA)':'▸ Advanced (LoRA)'}</button>
+            <div class="train-advanced-panel ${advancedOpen && isLoraEffective?'open':''}" id="tr-${cell.id}-advanced-panel" style="${isLoraEffective ? '' : 'display:none;'}">
+              <div style="font-size:11px;color:#64748b;margin-bottom:8px;font-style:italic;">LoRA lets large models learn by updating a much smaller set of parameters.</div>
+              <div class="lora-grid">
+                <div class="training-field">
+                  <label>LoRA rank (r)</label>
+                  <input type="number" id="tr-${cell.id}-lora_r" class="train-input" min="1" max="64" step="1" value="${t.lora_r}" ${locked} oninput="updateTrainingField(${cell.id},'lora_r',this.value)" />
+                  <div class="train-field-error" id="tr-${cell.id}-err-lora_r"></div>
+                </div>
+                <div class="training-field">
+                  <label>LoRA alpha</label>
+                  <input type="number" id="tr-${cell.id}-lora_alpha" class="train-input" min="1" max="128" step="1" value="${t.lora_alpha}" ${locked} oninput="updateTrainingField(${cell.id},'lora_alpha',this.value)" />
+                  <div class="train-field-error" id="tr-${cell.id}-err-lora_alpha"></div>
+                </div>
+                <div class="training-field">
+                  <label>LoRA dropout</label>
+                  <input type="number" id="tr-${cell.id}-lora_dropout" class="train-input" min="0" max="0.5" step="0.01" value="${t.lora_dropout}" ${locked} oninput="updateTrainingField(${cell.id},'lora_dropout',this.value)" />
+                  <div class="train-field-error" id="tr-${cell.id}-err-lora_dropout"></div>
+                </div>
+                <div class="training-field">
+                  <label>target_modules</label>
+                  <input type="text" id="tr-${cell.id}-target" class="train-input" placeholder="auto" value="${String(t.target_modules).replace(/"/g,'&quot;')}" ${locked} oninput="updateTrainingField(${cell.id},'target_modules',this.value)" />
+                  <div class="train-field-hint">auto = infer from architecture. Comma-separated to override.</div>
+                  <div class="train-field-error" id="tr-${cell.id}-err-target_modules"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="train-compat-box ${compatInfo.status}" id="tr-${cell.id}-compat" style="${compatInfo.status==='ok' || compatInfo.status==='error' || compatInfo.status==='unknown' ? '' : 'display:none;'}">
+            <div id="tr-${cell.id}-compat-text">${compatInfo.message || ''}</div>
+            ${compatInfo.status==='error' && compatInfo.fix ? `<button class="train-compat-fix" id="tr-${cell.id}-compat-fix" onclick="fixCompatibility(${cell.id})">Fix automatically</button><div style="font-size:11px;color:#64748b;margin-top:4px;">${compatInfo.fix}</div>` : ''}
+          </div>
+
+          <div class="train-preview-box" id="tr-${cell.id}-preview">
+            <h4>Training preview</h4>
+            <div class="train-preview-grid">
+              <span class="train-preview-label">Task</span><span class="train-preview-value" id="tr-${cell.id}-pv-task">${preview.task}</span>
+              <span class="train-preview-label">Model</span><span class="train-preview-value" id="tr-${cell.id}-pv-model">${String(preview.model).slice(0,64)}</span>
+              <span class="train-preview-label">Dataset</span><span class="train-preview-value" id="tr-${cell.id}-pv-dataset">${String(preview.dataset).slice(0,64)}</span>
+              <span class="train-preview-label">Method</span><span class="train-preview-value" id="tr-${cell.id}-pv-method">${preview.method}</span>
+              <span class="train-preview-label">Epochs</span><span class="train-preview-value" id="tr-${cell.id}-pv-epochs">${preview.epochs}</span>
+              <span class="train-preview-label">Batch size</span><span class="train-preview-value" id="tr-${cell.id}-pv-batch">${preview.batch_size}</span>
+              <span class="train-preview-label">Validation</span><span class="train-preview-value" id="tr-${cell.id}-pv-val">${preview.validation}</span>
+            </div>
+            <div class="train-preview-divider"></div>
+            <div class="train-preview-grid">
+              <span class="train-preview-label">Estimated steps</span><span class="train-preview-value" id="tr-${cell.id}-pv-steps">${preview.estimatedSteps}</span>
+              <span class="train-preview-label">Estimated time</span><span class="train-preview-value" id="tr-${cell.id}-pv-time">${preview.estimatedTime}</span>
+              <span class="train-preview-label">Resource usage</span><span class="train-preview-value" id="tr-${cell.id}-pv-resource">${preview.resourceUsage}</span>
+            </div>
+          </div>
+
+          <div class="train-validation-box ${valInfo.valid ? 'good' : 'error'}" id="tr-${cell.id}-validation">
+            <span id="tr-${cell.id}-validation-icon">${valInfo.valid ? '\u2713' : '\u274C'}</span>
+            <span id="tr-${cell.id}-validation-text">${valInfo.valid ? 'Configuration looks good' : Object.values(valInfo.errors)[0] || 'Check the highlighted fields.'}</span>
+          </div>
+
+          <div class="train-start-wrap">
+            <button class="training-btn primary" id="tr-${cell.id}-start" onclick="startTrainingCell(${cell.id})" ${isRunning ? 'disabled' : (valInfo.valid ? '' : 'disabled')}>🚀 Start Training</button>
+          </div>
+          <div style="display:flex;gap:8px;justify-content:center;">
+            <button class="training-btn stop" id="tr-${cell.id}-stop" onclick="showStopConfirm(${cell.id})" ${!isRunning ? 'disabled style="opacity:0.5;cursor:not-allowed;"' : ''}>⏹ Stop</button>
+          </div>
+          <div class="train-stop-confirm" id="tr-${cell.id}-stop-confirm">
+            <p><strong>Stop this training run?</strong><br>The current run will be stopped. The resulting model may be incomplete.</p>
+            <div class="train-stop-confirm-actions">
+              <button class="training-btn secondary" onclick="cancelStopTraining(${cell.id})">Cancel</button>
+              <button class="training-btn stop" onclick="confirmStopTraining(${cell.id})">Stop Training</button>
+            </div>
+          </div>
+
+          <div class="training-status-row" id="tr-${cell.id}-statusrow" style="justify-content:center;">
             <span class="training-status-badge ${t.status}" id="tr-${cell.id}-badge">${t.status}</span>
             <span class="training-gpu-badge"><span class="training-gpu-dot ${t.status}" id="tr-${cell.id}-gpudot"></span><span id="tr-${cell.id}-gputext">${t.progress?.gpu_status || 'idle'}</span></span>
             ${t.job_id ? `<span style="font-size:11px;color:#64748b;font-family:monospace;">${t.job_id}</span>` : ''}
           </div>
-        </div>
-        ${t.status==='failed' && t.error ? `<div id="tr-${cell.id}-errorbox" style="background:rgba(239,68,68,0.12);border:1px solid #dc2626;border-radius:8px;padding:10px 12px;color:#fecaca;font-size:12px;font-family:Consolas,monospace;white-space:pre-wrap;word-break:break-word;">❌ training_error: ${String(t.error).slice(0,500)}<br><span style="color:#fca5a5;font-size:11px;">${(t.logs||[]).slice(-2).join('<br>').slice(0,600)}</span></div>` : `<div id="tr-${cell.id}-errorbox" style="display:none;"></div>`}
+          ${t.status==='failed' && t.error ? `<div id="tr-${cell.id}-errorbox" style="background:rgba(239,68,68,0.12);border:1px solid #dc2626;border-radius:8px;padding:10px 12px;color:#fecaca;font-size:12px;font-family:Consolas,monospace;white-space:pre-wrap;word-break:break-word;">${(typeof TrainingUI!=='undefined'&&TrainingUI.translateBackendError) ? TrainingUI.translateBackendError(t.error) : t.error}<br><span style="color:#fca5a5;font-size:11px;">${(t.logs||[]).slice(-2).join('<br>').slice(0,600)}</span><div style="margin-top:8px;"><a href="#" onclick="event.preventDefault(); toggleTrainingLogs(${cell.id})" style="color:#60a5fa;font-size:11px;">Training Logs</a></div></div>` : `<div id="tr-${cell.id}-errorbox" style="display:none;"></div>`}
 
-        <div class="training-metrics-grid" id="tr-${cell.id}-metrics">
-          <div class="training-metric-card"><div class="training-metric-label">Epoch</div><div class="training-metric-value" id="tr-${cell.id}-epoch">${t.progress?.current_epoch ?? 0}</div></div>
-          <div class="training-metric-card"><div class="training-metric-label">Step</div><div class="training-metric-value" id="tr-${cell.id}-step">${t.progress?.current_step ?? 0}</div></div>
-          <div class="training-metric-card"><div class="training-metric-label">Train Loss</div><div class="training-metric-value" id="tr-${cell.id}-train">${t.progress?.train_loss != null ? Number(t.progress.train_loss).toFixed(4) : '—'}</div></div>
-          <div class="training-metric-card"><div class="training-metric-label">Val Loss</div><div class="training-metric-value" id="tr-${cell.id}-eval">${t.progress?.eval_loss != null ? Number(t.progress.eval_loss).toFixed(4) : '—'}</div></div>
-          <div class="training-metric-card"><div class="training-metric-label">ETA</div><div class="training-metric-value small" id="tr-${cell.id}-eta">${formatETA(t.progress?.eta)}</div></div>
-          <div class="training-metric-card"><div class="training-metric-label">GPU</div><div class="training-metric-value small" id="tr-${cell.id}-gpu">${t.progress?.gpu_status || 'idle'}</div></div>
-          <div class="training-metric-card"><div class="training-metric-label">Trainable</div><div class="training-metric-value small" id="tr-${cell.id}-trainable">${t.progress?.trainable_params ? `${(t.progress.trainable_params/1000).toFixed(1)}k / ${(t.progress.total_params/1000000).toFixed(2)}M (${(t.progress.trainable_params/t.progress.total_params*100).toFixed(2)}%)` : (t.progress?.training_method==='lora' || _effMethod==='lora' ? 'LoRA' : 'Full')}</div></div>
-        </div>
+          <div class="training-metrics-grid" id="tr-${cell.id}-metrics">
+            <div class="training-metric-card"><div class="training-metric-label">Epoch</div><div class="training-metric-value" id="tr-${cell.id}-epoch">${t.progress?.current_epoch ?? 0}</div></div>
+            <div class="training-metric-card"><div class="training-metric-label">Step</div><div class="training-metric-value" id="tr-${cell.id}-step">${t.progress?.current_step ?? 0}</div></div>
+            <div class="training-metric-card"><div class="training-metric-label">Train Loss</div><div class="training-metric-value" id="tr-${cell.id}-train">${t.progress?.train_loss != null ? Number(t.progress.train_loss).toFixed(4) : '—'}</div></div>
+            <div class="training-metric-card"><div class="training-metric-label">Val Loss</div><div class="training-metric-value" id="tr-${cell.id}-eval">${t.progress?.eval_loss != null ? Number(t.progress.eval_loss).toFixed(4) : '—'}</div></div>
+            <div class="training-metric-card"><div class="training-metric-label">ETA</div><div class="training-metric-value small" id="tr-${cell.id}-eta">${formatETA(t.progress?.eta)}</div></div>
+            <div class="training-metric-card"><div class="training-metric-label">GPU</div><div class="training-metric-value small" id="tr-${cell.id}-gpu">${t.progress?.gpu_status || 'idle'}</div></div>
+            <div class="training-metric-card"><div class="training-metric-label">Trainable</div><div class="training-metric-value small" id="tr-${cell.id}-trainable">${t.progress?.trainable_params ? `${(t.progress.trainable_params/1000).toFixed(1)}k / ${(t.progress.total_params/1000000).toFixed(2)}M (${(t.progress.trainable_params/t.progress.total_params*100).toFixed(2)}%)` : (t.progress?.training_method==='lora' || effMethod==='lora' ? 'LoRA' : 'Full')}</div></div>
+          </div>
 
-        <div id="tr-${cell.id}-complete" style="${t.status==='finished' ? '' : 'display:none;'}">
-          ${t.status==='finished' ? `<div class="training-complete" id="tr-${cell.id}-complete-inner"><h4>✅ Training complete</h4><div style="font-size:12px;color:#94a3b8;">Loading artifacts...</div></div>` : ''}
-        </div>
+          <div id="tr-${cell.id}-complete" style="${t.status==='finished' ? '' : 'display:none;'}">
+            ${t.status==='finished' ? `<div class="training-complete" id="tr-${cell.id}-complete-inner"><h4>✅ Training complete</h4><div style="font-size:12px;color:#94a3b8;">Loading artifacts...</div></div>` : ''}
+          </div>
 
-        <div class="training-chart-wrap">
-          <h4>📈 Loss — training vs validation</h4>
-          <canvas id="tr-${cell.id}-chart" height="180"></canvas>
-        </div>
+          <div class="training-chart-wrap">
+            <h4>📈 Loss — training vs validation</h4>
+            <canvas id="tr-${cell.id}-chart" height="180"></canvas>
+          </div>
 
-        <div class="training-logs" id="tr-${cell.id}-logs" style="${t.logs && t.logs.length ? '' : 'display:none;'}">${(t.logs || []).slice(-40).join('\n')}</div>
+          <div class="training-logs" id="tr-${cell.id}-logs" style="${t.logs && t.logs.length ? '' : 'display:none;'}">${(t.logs || []).slice(-40).join('\n')}</div>
+          <div style="font-size:11px;color:#475569;margin-top:-8px;display:${t.logs && t.logs.length ? 'block' : 'none'};" id="tr-${cell.id}-logs-toggle"><a href="#" onclick="event.preventDefault(); toggleTrainingLogs(${cell.id})" style="color:#64748b;">Training Logs</a> — click to expand/collapse</div>
+        </div>
       `;
 
       // init chart after DOM attach
@@ -2182,10 +2573,303 @@
       if (t.job_id && isRunning) {
         setTimeout(() => attachTrainingSSE(cell.id, t.job_id), 300);
       }
+      // initial validation UI
+      setTimeout(() => updateTrainingValidationUI(cell.id), 10);
       return wrap;
     }
 
     const MAX_TRAIN_EPOCHS = 5;
+
+    function toggleCustomizeSettings(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training) return;
+      cell.training._uiCustomizeOpen = !cell.training._uiCustomizeOpen;
+      // if closing, also close advanced
+      if (!cell.training._uiCustomizeOpen) cell.training._uiAdvancedOpen = false;
+      updateNotebook();
+      const panel = document.getElementById(`tr-${cellId}-customize-panel`);
+      const toggle = document.getElementById(`tr-${cellId}-customize-toggle`);
+      if (panel && toggle) {
+        if (cell.training._uiCustomizeOpen) {
+          panel.classList.add('open');
+          panel.style.display = '';
+          toggle.classList.add('open');
+          toggle.textContent = '\u25BE Customize settings';
+        } else {
+          panel.classList.remove('open');
+          panel.style.display = 'none';
+          toggle.classList.remove('open');
+          toggle.textContent = '\u25B8 Customize settings';
+        }
+      }
+      // also sync advanced visibility based on effective method
+      syncAdvancedVisibility(cellId);
+    }
+
+    function toggleAdvancedSettings(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training) return;
+      cell.training._uiAdvancedOpen = !cell.training._uiAdvancedOpen;
+      updateNotebook();
+      const panel = document.getElementById(`tr-${cellId}-advanced-panel`);
+      const toggle = document.getElementById(`tr-${cellId}-advanced-toggle`);
+      if (panel && toggle) {
+        if (cell.training._uiAdvancedOpen) {
+          panel.classList.add('open');
+          panel.style.display = '';
+          toggle.classList.add('open');
+          toggle.textContent = '\u25BE Advanced (LoRA)';
+        } else {
+          panel.classList.remove('open');
+          panel.style.display = 'none';
+          toggle.classList.remove('open');
+          toggle.textContent = '\u25B8 Advanced (LoRA)';
+        }
+      }
+    }
+
+    function syncAdvancedVisibility(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training) return;
+      const eff = getEffectiveMethod(cell.training);
+      const isLora = eff === 'lora';
+      const advToggle = document.getElementById(`tr-${cellId}-advanced-toggle`);
+      const advPanel = document.getElementById(`tr-${cellId}-advanced-panel`);
+      if (advToggle) advToggle.style.display = isLora ? '' : 'none';
+      if (advPanel) {
+        if (!isLora) {
+          advPanel.style.display = 'none';
+          advPanel.classList.remove('open');
+        } else if (cell.training._uiAdvancedOpen) {
+          advPanel.style.display = '';
+          advPanel.classList.add('open');
+        }
+      }
+      // also update method hint
+      const hint = document.getElementById(`tr-${cellId}-method-hint`);
+      if (hint) {
+        const m = cell.training.training_method;
+        if (m === 'auto') hint.textContent = 'Claro.AI automatically chooses the best training method for the model.';
+        else if (m === 'full') hint.textContent = 'Updates the model\u2019s existing parameters. Best for smaller models.';
+        else hint.textContent = 'Trains a small set of additional parameters. Usually much more efficient for large models.';
+      }
+    }
+
+    function updateTrainingValidationUI(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training) return;
+      const t = cell.training;
+      const ui = (typeof TrainingUI !== 'undefined') ? TrainingUI : null;
+      const validation = ui ? ui.validateTrainingConfigFrontend(t) : {valid:true, errors:{}};
+      const compat = ui ? ui.getCompatibilityInfo(t) : {status:'unknown', message:'Compatibility will be checked when training starts.'};
+      const preview = ui ? ui.getPreviewData(t) : null;
+
+      // Update field errors
+      const fieldMap = {
+        'model_id': 'model',
+        'dataset_id': 'dataset',
+        'task_type': 'task',
+        'epochs': 'epochs',
+        'batch_size': 'batch_size',
+        'learning_rate': 'learning_rate',
+        'validation_split': 'validation_split',
+        'training_method': 'training_method',
+        'lora_r': 'lora_r',
+        'lora_alpha': 'lora_alpha',
+        'lora_dropout': 'lora_dropout',
+        'target_modules': 'target_modules',
+        'max_steps': 'max_steps'
+      };
+      for (const [key, suffix] of Object.entries(fieldMap)) {
+        const errEl = document.getElementById(`tr-${cellId}-err-${suffix}`);
+        const inputEl = document.getElementById(`tr-${cellId}-${suffix === 'model' ? 'model' : suffix === 'dataset' ? 'dataset' : suffix === 'task' ? 'task' : suffix === 'batch_size' ? 'batch' : suffix === 'validation_split' ? 'vs' : suffix === 'learning_rate' ? 'lr' : suffix === 'lora_r' ? 'lora_r' : suffix === 'lora_alpha' ? 'lora_alpha' : suffix === 'lora_dropout' ? 'lora_dropout' : suffix === 'target_modules' ? 'target' : suffix}`);
+        // fallback for ids: we have specific ids for some
+        let actualInput = inputEl;
+        if (!actualInput) {
+          // try alternative ids
+          actualInput = document.getElementById(`tr-${cellId}-${suffix}`);
+        }
+        const msg = validation.errors[key];
+        if (errEl) {
+          if (msg) {
+            errEl.textContent = msg;
+            errEl.classList.add('visible');
+          } else {
+            errEl.textContent = '';
+            errEl.classList.remove('visible');
+          }
+        }
+        if (actualInput) {
+          if (msg) actualInput.classList.add('invalid');
+          else actualInput.classList.remove('invalid');
+        }
+      }
+      // special for model/dataset generic target id
+      const modelErr = validation.errors['model_id'];
+      const modelInput = document.getElementById(`tr-${cellId}-model`);
+      const modelErrEl = document.getElementById(`tr-${cellId}-err-model`);
+      if (modelErrEl) { if (modelErr) { modelErrEl.textContent = modelErr; modelErrEl.classList.add('visible'); } else { modelErrEl.textContent=''; modelErrEl.classList.remove('visible'); } }
+      if (modelInput) { if (modelErr) modelInput.classList.add('invalid'); else modelInput.classList.remove('invalid'); }
+      const datasetErr = validation.errors['dataset_id'];
+      const datasetInput = document.getElementById(`tr-${cellId}-dataset`);
+      const datasetErrEl = document.getElementById(`tr-${cellId}-err-dataset`);
+      if (datasetErrEl) { if (datasetErr) { datasetErrEl.textContent = datasetErr; datasetErrEl.classList.add('visible'); } else { datasetErrEl.textContent=''; datasetErrEl.classList.remove('visible'); } }
+      if (datasetInput) { if (datasetErr) datasetInput.classList.add('invalid'); else datasetInput.classList.remove('invalid'); }
+
+      // Update validation box
+      const valBox = document.getElementById(`tr-${cellId}-validation`);
+      const valText = document.getElementById(`tr-${cellId}-validation-text`);
+      const valIcon = document.getElementById(`tr-${cellId}-validation-icon`);
+      if (valBox && valText && valIcon) {
+        if (validation.valid && compat.status !== 'error') {
+          valBox.className = 'train-validation-box good';
+          valIcon.textContent = '\u2713';
+          valText.textContent = compat.status === 'unknown' ? 'Configuration looks good' : (compat.message || 'Configuration looks good');
+        } else if (compat.status === 'error') {
+          valBox.className = 'train-validation-box error';
+          valIcon.textContent = '\u274C';
+          valText.textContent = compat.message;
+        } else {
+          valBox.className = 'train-validation-box error';
+          valIcon.textContent = '\u274C';
+          const firstErr = Object.values(validation.errors)[0];
+          valText.textContent = firstErr || 'Check the highlighted fields.';
+        }
+      }
+
+      // Update compat box
+      const compatBox = document.getElementById(`tr-${cellId}-compat`);
+      const compatText = document.getElementById(`tr-${cellId}-compat-text`);
+      if (compatBox && compatText) {
+        if (compat.status === 'error') {
+          compatBox.className = 'train-compat-box error';
+          compatBox.style.display = '';
+          compatText.textContent = compat.message;
+          // update fix button if exists
+          const fixBtn = document.getElementById(`tr-${cellId}-compat-fix`);
+          if (fixBtn) fixBtn.style.display = '';
+        } else if (compat.status === 'ok') {
+          compatBox.className = 'train-compat-box ok';
+          compatBox.style.display = '';
+          compatText.textContent = compat.message;
+          const fixBtn = document.getElementById(`tr-${cellId}-compat-fix`);
+          if (fixBtn) fixBtn.style.display = 'none';
+        } else if (compat.status === 'unknown') {
+          compatBox.className = 'train-compat-box unknown';
+          compatBox.style.display = '';
+          compatText.textContent = compat.message;
+          const fixBtn = document.getElementById(`tr-${cellId}-compat-fix`);
+          if (fixBtn) fixBtn.style.display = 'none';
+        } else {
+          compatBox.style.display = 'none';
+        }
+      }
+
+      // Update preview
+      if (preview) {
+        const setIf = (id, val) => {
+          const el = document.getElementById(id);
+          if (el) el.textContent = val;
+        };
+        setIf(`tr-${cellId}-pv-task`, preview.task);
+        setIf(`tr-${cellId}-pv-model`, String(preview.model).slice(0,64));
+        setIf(`tr-${cellId}-pv-dataset`, String(preview.dataset).slice(0,64));
+        setIf(`tr-${cellId}-pv-method`, preview.method);
+        setIf(`tr-${cellId}-pv-epochs`, preview.epochs);
+        setIf(`tr-${cellId}-pv-batch`, preview.batch_size);
+        setIf(`tr-${cellId}-pv-val`, preview.validation);
+        setIf(`tr-${cellId}-pv-steps`, preview.estimatedSteps);
+        setIf(`tr-${cellId}-pv-time`, preview.estimatedTime);
+        setIf(`tr-${cellId}-pv-resource`, preview.resourceUsage);
+      }
+
+      // Update summary strip
+      const summaryEl = document.getElementById(`tr-${cellId}-summary-text`);
+      const summaryMethodEl = document.getElementById(`tr-${cellId}-summary-method`);
+      if (summaryEl) {
+        const s = ui ? ui.getTrainingSummary(t) : `${t.epochs} epochs \u00b7 batch ${t.batch_size} \u00b7 ${t.validation_split}% validation`;
+        summaryEl.textContent = s;
+      }
+      if (summaryMethodEl) {
+        const eff = getEffectiveMethod(t);
+        summaryMethodEl.textContent = eff === 'lora' ? 'LoRA' : 'Full fine-tuning';
+      }
+
+      // Update task explanation
+      const taskExplainEl = document.getElementById(`tr-${cellId}-task-explain`);
+      if (taskExplainEl && ui) {
+        taskExplainEl.textContent = ui.getTaskExplanation(t.task_type) || '';
+      }
+
+      // Disable start if invalid or running or compat error
+      const isRunning = ['queued','loading','training','evaluating'].includes(t.status);
+      const startBtn = document.getElementById(`tr-${cellId}-start`);
+      if (startBtn) {
+        const shouldDisable = isRunning || !validation.valid || compat.status === 'error';
+        startBtn.disabled = shouldDisable;
+        startBtn.title = !validation.valid ? 'Fix the highlighted fields before starting' : (compat.status==='error' ? 'Fix compatibility issue before starting' : '');
+      }
+
+      // Sync advanced visibility
+      syncAdvancedVisibility(cellId);
+    }
+
+    function fixCompatibility(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training || typeof TrainingUI === 'undefined') return;
+      const info = TrainingUI.getCompatibilityInfo(cell.training);
+      if (info.status !== 'error') return;
+      // Simple safe fixes
+      if (info.code === 'dataset_task_mismatch') {
+        // If image dataset but text task => switch to image task
+        // If text dataset but image task => switch to text
+        const dataset = String(cell.training.dataset_id).toLowerCase();
+        const isImageDataset = ['cifar','imagenet','mnist','coco','fashion','flowers','food101','celeba','voc','cityscapes'].some(k=>dataset.includes(k));
+        if (isImageDataset && cell.training.task_type !== 'image-classification') {
+          cell.training.task_type = 'image-classification';
+        } else if (!isImageDataset && cell.training.task_type === 'image-classification') {
+          cell.training.task_type = 'text-classification';
+        }
+      } else if (info.code === 'model_task_mismatch') {
+        const task = cell.training.task_type;
+        if (task === 'image-classification') {
+          // suggest text task? easier to switch task to match model
+          // if model is texty, switch task to text
+          cell.training.task_type = 'text-classification';
+        } else {
+          cell.training.task_type = 'image-classification';
+        }
+      }
+      updateNotebook();
+      // Rebuild UI or at least update fields
+      const taskSel = document.getElementById(`tr-${cellId}-task`);
+      if (taskSel) taskSel.value = cell.training.task_type;
+      updateTrainingValidationUI(cellId);
+    }
+
+    function showStopConfirm(cellId) {
+      const el = document.getElementById(`tr-${cellId}-stop-confirm`);
+      if (el) el.classList.add('visible');
+    }
+    function cancelStopTraining(cellId) {
+      const el = document.getElementById(`tr-${cellId}-stop-confirm`);
+      if (el) el.classList.remove('visible');
+    }
+    async function confirmStopTraining(cellId) {
+      const el = document.getElementById(`tr-${cellId}-stop-confirm`);
+      if (el) el.classList.remove('visible');
+      await stopTrainingCell(cellId, {caller:'user Stop confirm', userInitiated:true});
+    }
+    function toggleTrainingLogs(cellId) {
+      const el = document.getElementById(`tr-${cellId}-logs`);
+      if (!el) return;
+      el.style.display = el.style.display === 'none' ? '' : 'none';
+    }
 
     function updateTrainingField(cellId, key, value) {
       const nb = getActiveNotebook();
@@ -2201,20 +2885,8 @@
       } else {
         cell.training[key] = value;
       }
-      // if model_id changed and method is auto, update hint / lora visibility
-      if (key === 'model_id') {
-        const eff = cell.training.training_method === 'auto' ? (isLargeModelFrontend(value) ? 'lora' : 'full') : cell.training.training_method;
-        const sec = document.getElementById(`tr-${cellId}-lora-section`);
-        const hint = document.getElementById(`tr-${cellId}-method-hint`);
-        if (sec) sec.style.display = eff === 'lora' ? '' : 'none';
-        if (hint) hint.textContent = eff === 'lora' ? 'Will train only LoRA adapters (efficient for ≥1B)' : 'Will fine-tune all weights';
-        // also update the Auto option text
-        const sel = document.getElementById(`tr-${cellId}-method`);
-        if (sel && cell.training.training_method === 'auto' && sel.options[0]) {
-          sel.options[0].text = `Auto (${eff==='lora' ? 'LoRA for ≥1B' : 'Full for <1B'})`;
-        }
-      }
       updateNotebook();
+      updateTrainingValidationUI(cellId);
     }
 
     function updateTrainingMethod(cellId, value) {
@@ -2222,18 +2894,8 @@
       const cell = nb?.cells.find(c => c.id === cellId);
       if (!cell || !cell.training) return;
       cell.training.training_method = value;
-      // update visibility of LoRA section
-      const eff = value === 'auto' ? (isLargeModelFrontend(cell.training.model_id) ? 'lora' : 'full') : value;
-      const sec = document.getElementById(`tr-${cellId}-lora-section`);
-      const hint = document.getElementById(`tr-${cellId}-method-hint`);
-      if (sec) sec.style.display = eff === 'lora' ? '' : 'none';
-      if (hint) hint.textContent = eff === 'lora' ? 'Will train only LoRA adapters (efficient for ≥1B)' : 'Will fine-tune all weights';
-      // update Auto text
-      const sel = document.getElementById(`tr-${cellId}-method`);
-      if (sel && value === 'auto' && sel.options[0]) {
-        sel.options[0].text = `Auto (${eff==='lora' ? 'LoRA for ≥1B' : 'Full for <1B'})`;
-      }
       updateNotebook();
+      updateTrainingValidationUI(cellId);
     }
 
     function initTrainingChart(cellId) {
@@ -2352,12 +3014,8 @@
           trEl.textContent = 'Full';
         }
       }
-      // keep lora section visibility in sync with effective method
-      const loraSec = document.getElementById(`tr-${cellId}-lora-section`);
-      if (loraSec) {
-        const eff = t.training_method === 'auto' ? (isLargeModelFrontend(t.model_id) ? 'lora' : 'full') : t.training_method;
-        loraSec.style.display = eff === 'lora' ? '' : 'none';
-      }
+      // keep LoRA/Advanced visibility in sync with effective method
+      try { syncAdvancedVisibility(cellId); } catch(_) {}
 
       // locks
       const formInputs = document.querySelectorAll(`#training-body-${cellId} input, #training-body-${cellId} select`);
@@ -2365,8 +3023,23 @@
       formInputs.forEach(el => el.disabled = isRunning);
       const startBtn = document.getElementById(`tr-${cellId}-start`);
       const stopBtn = document.getElementById(`tr-${cellId}-stop`);
-      if (startBtn) startBtn.disabled = isRunning;
+      // start button also respects validation errors (updateTrainingValidationUI will re-evaluate)
+      if (startBtn) {
+        if (isRunning) startBtn.disabled = true;
+        else {
+          // let validation decide, but at least ensure not running
+          if (typeof TrainingUI !== 'undefined' && TrainingUI.validateTrainingConfigFrontend) {
+            const v = TrainingUI.validateTrainingConfigFrontend(t);
+            const c = TrainingUI.getCompatibilityInfo(t);
+            startBtn.disabled = !v.valid || c.status === 'error';
+          } else {
+            startBtn.disabled = false;
+          }
+        }
+      }
       if (stopBtn) stopBtn.disabled = !isRunning;
+      // also update validation UI for live status changes (e.g., after start)
+      try { updateTrainingValidationUI(cellId); } catch(_) {}
 
       // header buttons too
       const cellEl = document.getElementById(`cell-${cellId}`);
@@ -2683,10 +3356,34 @@ print(f"Loaded trained model from {MODEL_DIR}")
       if (!cell || !cell.training) return;
       const t = cell.training;
 
-      // validate
-      if (!t.model_id || !t.dataset_id) {
-        alert('Model ID and Dataset ID are required');
-        return;
+      // --- Frontend guardrails: validate before sending ---
+      if (typeof TrainingUI !== 'undefined' && TrainingUI.validateTrainingConfigFrontend) {
+        const v = TrainingUI.validateTrainingConfigFrontend(t);
+        const compat = TrainingUI.getCompatibilityInfo(t);
+        updateTrainingValidationUI(cellId);
+        if (!v.valid) {
+          const first = Object.values(v.errors)[0];
+          // show inline already via updateTrainingValidationUI, also ensure customization open to reveal errors if hidden
+          if (!cell.training._uiCustomizeOpen) {
+            cell.training._uiCustomizeOpen = true;
+            updateNotebook();
+            renderNotebookEditor();
+          }
+          return;
+        }
+        if (compat.status === 'error') {
+          if (!cell.training._uiCustomizeOpen) {
+            cell.training._uiCustomizeOpen = true;
+            updateNotebook();
+            renderNotebookEditor();
+          }
+          return;
+        }
+      } else {
+        if (!t.model_id || !t.dataset_id) {
+          alert('Model ID and Dataset ID are required');
+          return;
+        }
       }
 
       // reset previous state if finished/failed
@@ -2770,19 +3467,28 @@ print(f"Loaded trained model from {MODEL_DIR}")
       }
     }
 
-    async function stopTrainingCell(cellId) {
+    async function stopTrainingCell(cellId, opts = {}) {
+      const isUserInitiated = opts.userInitiated !== false; // default true when called from button
+      const caller = opts.caller || (isUserInitiated ? 'user-click Stop button' : 'automatic');
       const nb = getActiveNotebook();
       const cell = nb?.cells.find(c => c.id === cellId);
-      if (!cell || !cell.training || !cell.training.job_id) return;
+      if (!cell || !cell.training || !cell.training.job_id) {
+        console.warn(`[TRAIN-DIAG] stopTrainingCell called but no job_id cellId=${cellId} caller=${caller}`);
+        return;
+      }
+      const jobId = cell.training.job_id;
+      const ts = new Date().toISOString();
+      const stack = (new Error().stack || '').split('\n').slice(1,5).join(' | ');
+      console.log(`[TRAIN-DIAG] stopTrainingCell cellId=${cellId} job_id=${jobId} caller=${caller} userInitiated=${isUserInitiated} status=${cell.training.status} step=${cell.training.progress?.current_step}/${cell.training.progress?.total_steps} ts=${ts} href=${window.location.href} stack=${stack}`);
       try {
         const stopUrl = new URL('/api/train/stop', window.location.href).toString();
-        console.log(`[TRAIN-DIAG] POST ${stopUrl} job_id=${cell.training.job_id}`);
+        console.log(`[TRAIN-DIAG] POST ${stopUrl} job_id=${jobId} caller=${caller}`);
         const res = await fetch(stopUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ job_id: cell.training.job_id })
+          body: JSON.stringify({ job_id: jobId, _diag_caller: caller, _diag_cellId: cellId, _diag_userInitiated: isUserInitiated, _diag_stack: stack })
         });
-        console.log(`[TRAIN-DIAG] stop response status=${res.status}`);
+        console.log(`[TRAIN-DIAG] stop response status=${res.status} for ${jobId} caller=${caller}`);
         const data = await res.json();
         console.log(`[TRAIN-DIAG] stop data`, data);
         if (!res.ok) throw new Error(data.error || 'Stop failed');
@@ -2998,6 +3704,17 @@ print(f"Loaded trained model from {MODEL_DIR}")
     window.updateTrainingField = updateTrainingField;
     window.updateTrainingMethod = updateTrainingMethod;
     window.attachTrainingSSE = attachTrainingSSE;
+    window.toggleCustomizeSettings = toggleCustomizeSettings;
+    window.toggleAdvancedSettings = toggleAdvancedSettings;
+    window.updateTrainingValidationUI = updateTrainingValidationUI;
+    window.fixCompatibility = fixCompatibility;
+    window.showStopConfirm = showStopConfirm;
+    window.cancelStopTraining = cancelStopTraining;
+    window.confirmStopTraining = confirmStopTraining;
+    window.toggleTrainingLogs = toggleTrainingLogs;
+    window.isLargeModelFrontend = isLargeModelFrontend;
+    window.getEffectiveMethod = getEffectiveMethod;
+
 
     function initCellEditor(cell) {
       if (cell.type === 'parameter' || cell.type === 'training') return; // these manage their own UI
@@ -3102,7 +3819,7 @@ print(f"Loaded trained model from {MODEL_DIR}")
           <span class="cell-type">${typeLabel}</span>
           <div class="cell-controls">
             <button class="cell-btn run" onclick="startTrainingCell(${cell.id})" ${isRunning ? 'disabled style="opacity:0.5;cursor:not-allowed;"' : ''}>▶ Start Training</button>
-            <button class="cell-btn" style="background:#dc2626;color:white;" onclick="stopTrainingCell(${cell.id})" ${!isRunning ? 'disabled style="opacity:0.5;cursor:not-allowed;"' : ''}>⏹ Stop</button>
+            <button class="cell-btn" style="background:#dc2626;color:white;" onclick="showStopConfirm(${cell.id})" ${!isRunning ? 'disabled style="opacity:0.5;cursor:not-allowed;"' : ''}>⏹ Stop</button>
             <button class="cell-btn delete" onclick="deleteCell(${cell.id})">Delete</button>
           </div>
         `;

@@ -410,15 +410,21 @@ app.get('/api/train/list', (req, res) => {
 // POST /api/train/stop — stop a running job
 app.post('/api/train/stop', (req, res) => {
   const job_id = String(req.body.job_id || req.body.jobId || req.query.job_id || '').trim();
+  const diagCaller = req.body._diag_caller || req.headers['x-diag-caller'] || 'unknown';
+  const diagCellId = req.body._diag_cellId || req.body.cellId || 'unknown';
+  const diagUserInitiated = req.body._diag_userInitiated;
+  const diagStack = req.body._diag_stack || '';
+  console.log(`[TRAIN-DIAG] POST /api/train/stop job_id=${job_id} caller=${diagCaller} cellId=${diagCellId} userInitiated=${diagUserInitiated} ts=${new Date().toISOString()} ip=${req.ip} stack=${String(diagStack).slice(0,500)}`);
   if (!job_id) return res.status(400).json({ error: 'job_id is required', code: 'bad_request' });
-  const job = trainingBackend.stopJob(job_id);
+  const job = trainingBackend.stopJob(job_id, { caller: diagCaller, cellId: diagCellId, userInitiated: diagUserInitiated, stack: diagStack });
   if (!job) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
   return res.json({ job_id, status: job.status, message: 'Job stopped' });
 });
 
 // also support POST /api/train/stop/:job_id
 app.post('/api/train/stop/:job_id', (req, res) => {
-  const job = trainingBackend.stopJob(req.params.job_id);
+  console.log(`[TRAIN-DIAG] POST /api/train/stop/:job_id job_id=${req.params.job_id} ts=${new Date().toISOString()} ip=${req.ip}`);
+  const job = trainingBackend.stopJob(req.params.job_id, { caller: 'stop/:job_id', userInitiated: false });
   if (!job) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
   return res.json({ job_id: job.job_id, status: job.status, message: 'Job stopped' });
 });

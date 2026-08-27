@@ -23,7 +23,7 @@ const gpuBackend = resolveBackend(process.env);
 const trainingBackend = require('./training_backend');
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname)));
 
 // ── GET /api/hf-loader ───────────────────────────────────────────────────────
@@ -442,11 +442,10 @@ app.get('/api/train/artifacts/:job_id', (req, res) => {
 });
 
 // POST /api/inference/trained — run inference with a trained model (full or LoRA)
+// Supports text tasks via prompt and image tasks via image_base64 / image
 app.post('/api/inference/trained', async (req, res) => {
-  const { job_id, prompt, max_new_tokens, task } = req.body || {};
+  const { job_id, prompt, max_new_tokens, task, image, image_base64, imageBase64 } = req.body || {};
   if (!job_id) return res.status(400).json({ error: 'job_id is required', code: 'bad_request' });
-  if (!prompt || typeof prompt !== 'string') return res.status(400).json({ error: 'prompt is required', code: 'bad_request' });
-
   // Validate job and artifacts server-side (never trust client path)
   let meta;
   try {
@@ -461,7 +460,28 @@ app.post('/api/inference/trained', async (req, res) => {
   const jobId = meta.job_id;
   const taskType = String(task || meta.task_type || 'text-generation').toLowerCase();
   const maxTokens = Math.min(parseInt(max_new_tokens, 10) || 100, 2048);
-  const promptStr = String(prompt).slice(0, 4000);
+  // For image tasks, allow image payload; for text tasks, prompt required
+  const isImageTask = taskType === 'image-classification';
+  const imagePayload = image_base64 || image || imageBase64 || null;
+  let promptStr = null;
+  if (!isImageTask) {
+    if (!prompt || typeof prompt !== 'string' || !prompt.trim()) return res.status(400).json({ error: 'prompt is required', code: 'bad_request' });
+    promptStr = String(prompt).slice(0, 4000);
+  } else {
+    // image task: need image, allow prompt to carry image if provided as data URL
+    if (imagePayload) {
+      promptStr = String(prompt || '').slice(0, 4000); // not used but keep
+    } else if (prompt && typeof prompt === 'string' && prompt.startsWith('data:image')) {
+      // allow prompt to be data URL
+      promptStr = prompt.slice(0, 5000000); // allow large data URL (up to 5MB, limit enforced by json limit)
+    } else if (prompt && typeof prompt === 'string' && prompt.trim()) {
+      // If image task but prompt looks like text, treat as error to guide UI
+      // But allow text prompt if user mistakenly sends text; we will handle as image path failure
+      promptStr = String(prompt).slice(0, 4000);
+    } else {
+      return res.status(400).json({ error: 'image is required for image-classification (send image_base64)', code: 'bad_request' });
+    }
+  }
 
   const pythonBin = process.env.PYTHON_BIN || 'python3';
   const runnerPath = path.join(__dirname, 'inference_runner.py');
@@ -472,10 +492,21 @@ app.post('/api/inference/trained', async (req, res) => {
   const args = [
     runnerPath,
     '--job_id', jobId,
-    '--prompt', promptStr,
-    '--max_new_tokens', String(maxTokens),
     '--task_type', taskType,
+    '--max_new_tokens', String(maxTokens),
   ];
+  if (isImageTask) {
+    if (imagePayload) {
+      args.push('--image_base64', String(imagePayload).slice(0, 8000000));
+    } else if (promptStr && promptStr.startsWith('data:image')) {
+      args.push('--image_base64', promptStr);
+    } else if (promptStr) {
+      // fallback for text misuse
+      args.push('--prompt', promptStr);
+    }
+  } else {
+    args.push('--prompt', promptStr);
+  }
 
   const { spawn } = require('child_process');
   let proc;
@@ -511,7 +542,7 @@ app.post('/api/inference/trained', async (req, res) => {
       } catch (_) {}
       return res.status(500).json({ error: `Inference failed (exit ${code}): ${stderr.slice(0, 1000) || stdout.slice(0, 1000)}`, code: 'inference_error' });
     }
-    // stdout should be a JSON line with {"output": ...}
+    // stdout should be a JSON line with {"output": ...} plus structured fields
     try {
       const lines = stdout.trim().split('\n');
       let data = null;
@@ -521,10 +552,21 @@ app.post('/api/inference/trained', async (req, res) => {
           try { data = JSON.parse(line); break; } catch (_) {}
         }
       }
-      if (!data || !data.output) {
+      if (!data || (data.output === undefined && data.label === undefined && data.scores === undefined)) {
         return res.status(500).json({ error: `No output from inference: ${stdout.slice(0, 1000)}`, code: 'inference_error', stderr: stderr.slice(0, 500) });
       }
-      return res.json({ output: data.output, label: data.label, confidence: data.confidence, raw: data });
+      // Forward full structured response (task, prediction, scores, tokens etc.) but ensure output exists
+      return res.json({
+        task: data.task || taskType,
+        output: data.output !== undefined ? data.output : (data.label || JSON.stringify(data)),
+        label: data.label,
+        confidence: data.confidence,
+        prediction: data.prediction,
+        scores: data.scores,
+        tokens: data.tokens,
+        entities: data.entities,
+        raw: data
+      });
     } catch (e) {
       return res.status(500).json({ error: `Failed to parse inference output: ${e.message}`, code: 'inference_error', stdout: stdout.slice(0, 1000), stderr: stderr.slice(0, 500) });
     }

@@ -1424,6 +1424,110 @@
       flex-direction: column;
       gap: 14px;
     }
+    /* ── Test Model playground (Training Cell) ── */
+    .test-model-box {
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 10px;
+      padding: 14px;
+    }
+    .test-model-box h4 {
+      font-size: 13px;
+      font-weight: 700;
+      color: #93c5fd;
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .test-model-identity {
+      font-size: 11px;
+      color: #64748b;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 8px 10px;
+      margin-bottom: 12px;
+    }
+    .test-model-identity strong { color: #e2e8f0; font-family: 'Consolas', monospace; font-weight: 600; }
+    .test-input-label { font-size: 11px; font-weight: 700; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px; }
+    .test-input-hint { font-size: 11px; color: #64748b; font-style: italic; margin-bottom: 6px; }
+    .test-textarea, .test-input-text {
+      width: 100%;
+      padding: 10px;
+      background: #0a101f;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      color: #e2e8f0;
+      font-size: 13px;
+      outline: none;
+      resize: vertical;
+    }
+    .test-textarea:focus, .test-input-text:focus { border-color: #60a5fa; }
+    .test-image-drop {
+      border: 2px dashed #334155;
+      border-radius: 10px;
+      padding: 20px;
+      text-align: center;
+      color: #94a3b8;
+      cursor: pointer;
+      transition: 0.15s;
+      background: #0a101f;
+    }
+    .test-image-drop:hover, .test-image-drop.dragover { border-color: #60a5fa; background: #0f172a; color: #e2e8f0; }
+    .test-image-preview { max-width: 100%; max-height: 180px; border-radius: 8px; margin-top: 10px; border: 1px solid #334155; }
+    .test-run-btn {
+      padding: 10px 18px;
+      background: #16a34a;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 13px;
+      cursor: pointer;
+      transition: 0.15s;
+      min-width: 120px;
+    }
+    .test-run-btn:hover { background: #22c55e; }
+    .test-run-btn:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
+    .test-result-box {
+      margin-top: 12px;
+      background: #0a101f;
+      border: 1px solid #1e293b;
+      border-radius: 8px;
+      padding: 12px;
+    }
+    .test-result-label { font-size: 11px; font-weight: 700; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px; }
+    .test-result-main { font-size: 16px; font-weight: 700; color: #e2e8f0; margin-bottom: 6px; }
+    .test-result-scores { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+    .test-score-row { display: flex; justify-content: space-between; font-size: 12px; color: #cbd5e1; background: #1e293b; border-radius: 6px; padding: 6px 8px; }
+    .test-score-row.best { background: rgba(34,197,94,0.12); border: 1px solid rgba(34,197,94,0.25); color: #6ee7b7; }
+    .test-token-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 6px; }
+    .test-token-table th { text-align: left; font-size: 10px; color: #64748b; text-transform: uppercase; padding: 6px; border-bottom: 1px solid #334155; }
+    .test-token-table td { padding: 6px; border-bottom: 1px solid #1e293b; color: #e2e8f0; font-family: 'Consolas', monospace; }
+    .test-token-tag { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 11px; font-weight: 600; background: #1e293b; color: #93c5fd; }
+    .test-token-tag.O { background: #0f172a; color: #64748b; }
+    .test-error-box {
+      margin-top: 10px;
+      background: rgba(239,68,68,0.08);
+      border: 1px solid rgba(239,68,68,0.25);
+      color: #fecaca;
+      border-radius: 8px;
+      padding: 10px;
+      font-size: 12px;
+      white-space: pre-wrap;
+    }
+    .test-clear-btn {
+      margin-top: 8px;
+      padding: 6px 12px;
+      background: #334155;
+      color: #e2e8f0;
+      border: none;
+      border-radius: 6px;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    .test-clear-btn:hover { background: #475569; }
   </style>
 </head>
 <body>
@@ -1809,6 +1913,11 @@
               if (!('total_params' in cell.training.progress)) cell.training.progress.total_params = null;
               if (!('_uiCustomizeOpen' in cell.training)) cell.training._uiCustomizeOpen = false;
               if (!('_uiAdvancedOpen' in cell.training)) cell.training._uiAdvancedOpen = false;
+              if (!('testInput' in cell.training)) cell.training.testInput = '';
+              if (!('testImageData' in cell.training)) cell.training.testImageData = null;
+              if (!('testMaxTokens' in cell.training)) cell.training.testMaxTokens = 64;
+              if (!('testResult' in cell.training)) cell.training.testResult = null;
+              if (!('testError' in cell.training)) cell.training.testError = null;
             }
           }
         }
@@ -1935,6 +2044,11 @@
           logs: [],
           _uiCustomizeOpen: false,
           _uiAdvancedOpen: false,
+          testInput: '',
+          testImageData: null,
+          testMaxTokens: 64,
+          testResult: null,
+          testError: null,
         };
         // training cells store config in cell.training, not cell.content
         cell.content = JSON.stringify(cell.training, null, 2);
@@ -2346,6 +2460,11 @@
           logs: [],
           _uiCustomizeOpen: false,
           _uiAdvancedOpen: false,
+          testInput: '',
+          testImageData: null,
+          testMaxTokens: 64,
+          testResult: null,
+          testError: null,
         };
       }
       // ensure UI flags exist (migration)
@@ -2557,6 +2676,23 @@
             ${t.status==='finished' ? `<div class="training-complete" id="tr-${cell.id}-complete-inner"><h4>✅ Training complete</h4><div style="font-size:12px;color:#94a3b8;">Loading artifacts...</div></div>` : ''}
           </div>
 
+          <div class="test-model-box" id="tr-${cell.id}-test-box" style="${t.status==='finished' ? '' : 'display:none;'}">
+            <h4>🧪 Test your trained model</h4>
+            <div class="test-model-identity" id="tr-${cell.id}-test-identity">
+              Using your trained model<br>
+              <strong>${String(t.model_id).slice(0,48)} · ${isLoraEffective ? 'LoRA' : 'Full'}${isLoraEffective ? ' <span style="font-weight:normal;color:#94a3b8;">(Base: '+String(t.model_id).slice(0,32)+')</span>' : ''}</strong><br>
+              <span style="font-size:11px;color:#64748b;">Task: ${t.task_type}</span>
+            </div>
+            <div id="tr-${cell.id}-test-input-area"></div>
+            <div style="margin-top:10px; display:flex; gap:8px; align-items:center;">
+              <button class="test-run-btn" id="tr-${cell.id}-run-test" onclick="runTestModel(${cell.id})">Run Test</button>
+              <button class="test-clear-btn" id="tr-${cell.id}-clear-test" onclick="clearTestModel(${cell.id})" style="display:none;">Clear</button>
+              <span id="tr-${cell.id}-test-loading" style="font-size:12px;color:#f59e0b;display:none;">Testing trained model…</span>
+            </div>
+            <div class="test-error-box" id="tr-${cell.id}-test-error" style="display:none;"></div>
+            <div class="test-result-box" id="tr-${cell.id}-test-result" style="display:none;"></div>
+          </div>
+
           <div class="training-chart-wrap">
             <h4>📈 Loss — training vs validation</h4>
             <canvas id="tr-${cell.id}-chart" height="180"></canvas>
@@ -2573,8 +2709,11 @@
       if (t.job_id && isRunning) {
         setTimeout(() => attachTrainingSSE(cell.id, t.job_id), 300);
       }
-      // initial validation UI
+      // initial validation UI and test model input
       setTimeout(() => updateTrainingValidationUI(cell.id), 10);
+      if (t.status === 'finished') {
+        setTimeout(() => renderTestModelInput(cell.id), 20);
+      }
       return wrap;
     }
 
@@ -2871,6 +3010,338 @@
       el.style.display = el.style.display === 'none' ? '' : 'none';
     }
 
+    // ── Test Model playground ─────────────────────────────────────────────
+    function getTestPlaceholder(task) {
+      if (task === 'text-classification') return 'This movie was absolutely fantastic!';
+      if (task === 'text-generation') return 'Once upon a time,';
+      if (task === 'token-classification') return 'John lives in Tokyo';
+      if (task === 'image-classification') return '';
+      return 'Hello, world!';
+    }
+    function getTestHint(task) {
+      if (task === 'text-classification') return 'Try something like: \u201CThis movie was surprisingly good.\u201D';
+      if (task === 'text-generation') return 'Try something like: \u201COnce upon a time there was a brave knight...\u201D';
+      if (task === 'token-classification') return 'Try something like: \u201CHugging Face was founded in New York.\u201D';
+      if (task === 'image-classification') return 'Upload an image to test your trained model.';
+      return '';
+    }
+
+    function renderTestModelInput(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(cc => cc.id === cellId);
+      if (!cell || !cell.training) return;
+      const t = cell.training;
+      const area = document.getElementById(`tr-${cellId}-test-input-area`);
+      if (!area) return;
+      const task = t.task_type;
+      // persist testInput if not present
+      if (t.testInput === undefined) t.testInput = '';
+      if (t.testMaxTokens === undefined) t.testMaxTokens = 64;
+      if (t.testImageData === undefined) t.testImageData = null;
+
+      let html = '';
+      if (task === 'text-classification') {
+        html = `
+          <div class="test-input-label">Your input</div>
+          <div class="test-input-hint">${getTestHint(task)}</div>
+          <textarea class="test-textarea" id="tr-${cellId}-test-input" rows="3" placeholder="${getTestPlaceholder(task)}" oninput="updateTestInput(${cellId}, this.value)">${(t.testInput || '').replace(/</g,'&lt;')}</textarea>
+        `;
+      } else if (task === 'text-generation') {
+        html = `
+          <div class="test-input-label">Prompt</div>
+          <div class="test-input-hint">${getTestHint(task)}</div>
+          <textarea class="test-textarea" id="tr-${cellId}-test-input" rows="3" placeholder="${getTestPlaceholder(task)}" oninput="updateTestInput(${cellId}, this.value)">${(t.testInput || '').replace(/</g,'&lt;')}</textarea>
+          <div style="margin-top:8px; display:flex; align-items:center; gap:8px;">
+            <span class="test-input-label" style="margin:0;">Max new tokens</span>
+            <input type="number" min="1" max="512" value="${t.testMaxTokens}" style="width:80px; padding:6px; background:#0a101f; border:1px solid #334155; border-radius:6px; color:#e2e8f0;" oninput="updateTestMaxTokens(${cellId}, this.value)" />
+          </div>
+        `;
+      } else if (task === 'token-classification') {
+        html = `
+          <div class="test-input-label">Your input</div>
+          <div class="test-input-hint">${getTestHint(task)}</div>
+          <input type="text" class="test-input-text" id="tr-${cellId}-test-input" placeholder="${getTestPlaceholder(task)}" value="${(t.testInput || '').replace(/"/g,'&quot;')}" oninput="updateTestInput(${cellId}, this.value)" />
+        `;
+      } else if (task === 'image-classification') {
+        const hasImg = !!t.testImageData;
+        html = `
+          <div class="test-input-label">Image input</div>
+          <div class="test-input-hint">${getTestHint(task)}</div>
+          <div class="test-image-drop" id="tr-${cellId}-image-drop" onclick="document.getElementById('tr-${cellId}-image-file').click()" ondragover="handleImageDragOver(event, ${cellId})" ondragleave="handleImageDragLeave(event, ${cellId})" ondrop="handleImageDrop(event, ${cellId})">
+            ${hasImg ? `<img src="${t.testImageData}" class="test-image-preview" id="tr-${cellId}-image-preview" />` : `<div>Drop an image here<br>or<br><strong>Choose Image</strong></div>`}
+            <input type="file" id="tr-${cellId}-image-file" accept="image/*" style="display:none;" onchange="handleImageFileSelect(event, ${cellId})" />
+          </div>
+          ${hasImg ? `<div style="text-align:center; margin-top:8px;"><button class="test-clear-btn" onclick="clearTestImage(${cellId})">Remove image</button></div>` : ''}
+        `;
+      } else {
+        html = `
+          <div class="test-input-label">Your input</div>
+          <textarea class="test-textarea" id="tr-${cellId}-test-input" rows="3" placeholder="${getTestPlaceholder(task)}" oninput="updateTestInput(${cellId}, this.value)">${(t.testInput || '').replace(/</g,'&lt;')}</textarea>
+        `;
+      }
+      area.innerHTML = html;
+      // restore result if exists
+      if (t.testResult) {
+        renderTestResult(cellId, t.testResult);
+      }
+      // restore error if exists
+      if (t.testError) {
+        showTestError(cellId, t.testError);
+      }
+    }
+
+    function updateTestInput(cellId, val) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(cc => cc.id === cellId);
+      if (!cell || !cell.training) return;
+      cell.training.testInput = val;
+      // clear previous error/result when user edits
+      // keep result visible until next run? spec says keep latest visible, so don't clear
+      updateNotebook();
+    }
+    function updateTestMaxTokens(cellId, val) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(cc => cc.id === cellId);
+      if (!cell || !cell.training) return;
+      cell.training.testMaxTokens = Math.min(512, Math.max(1, parseInt(val,10) || 64));
+      updateNotebook();
+    }
+    function handleImageFileSelect(event, cellId) {
+      const file = event.target.files && event.target.files[0];
+      if (!file) return;
+      handleTestImageFile(cellId, file);
+    }
+    function handleImageDragOver(event, cellId) {
+      event.preventDefault();
+      const el = document.getElementById(`tr-${cellId}-image-drop`);
+      if (el) el.classList.add('dragover');
+    }
+    function handleImageDragLeave(event, cellId) {
+      const el = document.getElementById(`tr-${cellId}-image-drop`);
+      if (el) el.classList.remove('dragover');
+    }
+    function handleImageDrop(event, cellId) {
+      event.preventDefault();
+      const el = document.getElementById(`tr-${cellId}-image-drop`);
+      if (el) el.classList.remove('dragover');
+      const file = event.dataTransfer.files && event.dataTransfer.files[0];
+      if (file) handleTestImageFile(cellId, file);
+    }
+    function handleTestImageFile(cellId, file) {
+      if (!file.type.startsWith('image/')) {
+        showTestError(cellId, '\u274C Please select an image file.');
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        const nb = getActiveNotebook();
+        const cell = nb?.cells.find(cc => cc.id === cellId);
+        if (!cell || !cell.training) return;
+        cell.training.testImageData = e.target.result;
+        // persist file name hint (not weights)
+        cell.training.testInput = file.name;
+        updateNotebook();
+        renderTestModelInput(cellId);
+      };
+      reader.readAsDataURL(file);
+    }
+    function clearTestImage(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(cc => cc.id === cellId);
+      if (!cell || !cell.training) return;
+      cell.training.testImageData = null;
+      cell.training.testInput = '';
+      updateNotebook();
+      renderTestModelInput(cellId);
+      clearTestError(cellId);
+      const resEl = document.getElementById(`tr-${cellId}-test-result`);
+      if (resEl) { resEl.style.display='none'; resEl.innerHTML=''; }
+    }
+    function showTestError(cellId, msg) {
+      const el = document.getElementById(`tr-${cellId}-test-error`);
+      if (!el) return;
+      el.textContent = msg;
+      el.style.display = '';
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(cc => cc.id === cellId);
+      if (cell && cell.training) { cell.training.testError = msg; updateNotebook(); }
+    }
+    function clearTestError(cellId) {
+      const el = document.getElementById(`tr-${cellId}-test-error`);
+      if (el) { el.style.display='none'; el.textContent=''; }
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(cc => cc.id === cellId);
+      if (cell && cell.training) { cell.training.testError = null; }
+    }
+    function renderTestResult(cellId, data) {
+      const el = document.getElementById(`tr-${cellId}-test-result`);
+      const clearBtn = document.getElementById(`tr-${cellId}-clear-test`);
+      if (!el) return;
+      const task = data.task || (getActiveNotebook()?.cells.find(cc=>cc.id===cellId)?.training?.task_type) || '';
+      let html = '<div class="test-result-label">Result</div>';
+      if (task === 'text-classification' && data.scores) {
+        const pred = data.prediction || data.scores[0];
+        html += `<div class="test-result-main">${pred.label} <span style="font-size:12px;color:#94a3b8;">${(pred.score*100).toFixed(1)}%</span></div>`;
+        html += '<div class="test-result-scores">';
+        for (const s of data.scores.slice(0,5)) {
+          const isBest = s.label === pred.label;
+          html += `<div class="test-score-row ${isBest?'best':''}"><span>${s.label}</span><span>${(s.score*100).toFixed(1)}%</span></div>`;
+        }
+        html += '</div>';
+      } else if (task === 'image-classification' && data.scores) {
+        const pred = data.prediction || data.scores[0];
+        html += `<div class="test-result-main">${pred.label} <span style="font-size:12px;color:#94a3b8;">${(pred.score*100).toFixed(1)}%</span></div>`;
+        html += '<div class="test-result-scores">';
+        for (const s of data.scores.slice(0,5)) {
+          const isBest = s.label === pred.label;
+          html += `<div class="test-score-row ${isBest?'best':''}"><span>${s.label}</span><span>${(s.score*100).toFixed(1)}%</span></div>`;
+        }
+        html += '</div>';
+      } else if (task === 'token-classification' && data.tokens) {
+        html += '<table class="test-token-table"><tr><th>Token</th><th>Label</th></tr>';
+        for (const tok of data.tokens) {
+          const cls = tok.label === 'O' ? 'O' : '';
+          html += `<tr><td>${tok.token}</td><td><span class="test-token-tag ${cls}">${tok.label}</span></td></tr>`;
+        }
+        html += '</table>';
+        if (data.entities && data.entities.length) {
+          html += '<div style="margin-top:8px; font-size:11px; color:#64748b;">Entities: ' + data.entities.map(e=>e.token+':'+e.label).join(', ') + '</div>';
+        }
+      } else if (task === 'text-generation' || data.output !== undefined) {
+        html += `<div class="test-result-main" style="font-size:13px; font-weight:500; white-space:pre-wrap; background:#0a101f; border:1px solid #1e293b; border-radius:8px; padding:10px;">${String(data.output).replace(/</g,'&lt;')}</div>`;
+      } else {
+        html += `<div class="test-result-main" style="font-size:13px; white-space:pre-wrap;">${String(data.output || JSON.stringify(data)).replace(/</g,'&lt;')}</div>`;
+      }
+      el.innerHTML = html;
+      el.style.display = '';
+      if (clearBtn) clearBtn.style.display = '';
+      // persist
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(cc => cc.id === cellId);
+      if (cell && cell.training) { cell.training.testResult = data; cell.training.testError = null; updateNotebook(); }
+    }
+    function clearTestModel(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(cc => cc.id === cellId);
+      if (!cell || !cell.training) return;
+      cell.training.testInput = '';
+      cell.training.testImageData = null;
+      cell.training.testResult = null;
+      cell.training.testError = null;
+      updateNotebook();
+      renderTestModelInput(cellId);
+      const resEl = document.getElementById(`tr-${cellId}-test-result`);
+      if (resEl) { resEl.style.display='none'; resEl.innerHTML=''; }
+      clearTestError(cellId);
+      const clearBtn = document.getElementById(`tr-${cellId}-clear-test`);
+      if (clearBtn) clearBtn.style.display='none';
+    }
+    async function runTestModel(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(cc => cc.id === cellId);
+      if (!cell || !cell.training) return;
+      const t = cell.training;
+      if (t.status !== 'finished' || !t.job_id) {
+        showTestError(cellId, '\u274C Training not finished yet.');
+        return;
+      }
+      if (!t.task_type) {
+        showTestError(cellId, '\u274C Unknown task type.');
+        return;
+      }
+      const runBtn = document.getElementById(`tr-${cellId}-run-test`);
+      const loading = document.getElementById(`tr-${cellId}-test-loading`);
+      const errorEl = document.getElementById(`tr-${cellId}-test-error`);
+      const resultEl = document.getElementById(`tr-${cellId}-test-result`);
+      // Prevent duplicate clicks
+      if (runBtn && runBtn.disabled) return;
+      // Validate input per task
+      let prompt = null;
+      let imageB64 = null;
+      if (t.task_type === 'image-classification') {
+        if (!t.testImageData) {
+          showTestError(cellId, '\u274C Please select an image first.');
+          return;
+        }
+        imageB64 = t.testImageData;
+      } else {
+        // text tasks
+        const inputEl = document.getElementById(`tr-${cellId}-test-input`);
+        const val = inputEl ? inputEl.value.trim() : (t.testInput || '').trim();
+        if (!val) {
+          showTestError(cellId, '\u274C Please enter some input.');
+          return;
+        }
+        prompt = val;
+        t.testInput = val;
+        updateNotebook();
+      }
+
+      // Loading state
+      if (runBtn) runBtn.disabled = true;
+      if (loading) loading.style.display = '';
+      if (errorEl) { errorEl.style.display='none'; errorEl.textContent=''; }
+      if (resultEl) { resultEl.style.display='none'; resultEl.innerHTML=''; }
+      clearTestError(cellId);
+
+      try {
+        const body = { job_id: t.job_id, task: t.task_type };
+        if (t.task_type === 'text-generation') {
+          body.prompt = prompt;
+          body.max_new_tokens = t.testMaxTokens || 64;
+        } else if (t.task_type === 'image-classification') {
+          body.image_base64 = imageB64;
+          // also send task explicitly
+        } else {
+          body.prompt = prompt;
+        }
+        // SECURITY: only job_id, never artifact_path
+        console.log(`[TEST-MODEL] POST /api/inference/trained job_id=${t.job_id} task=${t.task_type} prompt=${(prompt||'').slice(0,50)} hasImage=${!!imageB64}`);
+
+        const url = new URL('/api/inference/trained', window.location.href).toString();
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        const data = await res.json().catch(()=>({}));
+        if (!res.ok) {
+          const msg = data.error || `HTTP ${res.status}`;
+          // translate friendly
+          let friendly = msg;
+          const low = String(msg).toLowerCase();
+          if (low.includes('artifact') || low.includes('job not finished') || low.includes('missing')) {
+            friendly = '\u274C Could not load the trained model.\nThe saved training artifact may be missing.';
+          } else if (low.includes('task') || low.includes('cannot perform')) {
+            friendly = '\u274C This trained model cannot perform this task.';
+          } else if (low.includes('not found') || low.includes('invalid job')) {
+            friendly = '\u274C Could not find the trained model. Try retraining.';
+          } else {
+            friendly = '\u274C Inference failed.\nCheck the training logs for more information.\n' + String(msg).slice(0,400);
+          }
+          throw new Error(friendly);
+        }
+        // Ensure response is from trained artifact, not base fallback (check that raw contains no fallback error)
+        // Server guarantees trained model only; if we get here, it's real
+        const resultData = data.raw || data;
+        // Normalize for rendering: ensure task field present
+        resultData.task = resultData.task || t.task_type;
+        renderTestResult(cellId, resultData);
+      } catch (err) {
+        const msg = err.message || String(err);
+        // Do not expose raw traceback in main UI; show friendly
+        if (msg.includes('Traceback') || msg.includes('File \"')) {
+          showTestError(cellId, '\u274C Inference failed.\nCheck the training logs for more information.');
+          console.error('[TEST-MODEL] raw error', err);
+        } else {
+          showTestError(cellId, msg);
+        }
+      } finally {
+        if (runBtn) runBtn.disabled = false;
+        if (loading) loading.style.display = 'none';
+      }
+    }
+
     function updateTrainingField(cellId, key, value) {
       const nb = getActiveNotebook();
       const cell = nb?.cells.find(c => c.id === cellId);
@@ -3040,6 +3511,29 @@
       if (stopBtn) stopBtn.disabled = !isRunning;
       // also update validation UI for live status changes (e.g., after start)
       try { updateTrainingValidationUI(cellId); } catch(_) {}
+      // Test Model box: only for finished, hide otherwise
+      try {
+        const testBox = document.getElementById(`tr-${cellId}-test-box`);
+        if (testBox) {
+          if (t.status === 'finished' && t.job_id) {
+            testBox.style.display = '';
+            // ensure inputs rendered (after first time)
+            if (!testBox.dataset.rendered) {
+              testBox.dataset.rendered = '1';
+              setTimeout(() => renderTestModelInput(cellId), 10);
+            } else {
+              // update identity line when model/method changes (rare after finish)
+              const ident = document.getElementById(`tr-${cellId}-test-identity`);
+              if (ident) {
+                const eff = getEffectiveMethod(t);
+                ident.innerHTML = `Using your trained model<br><strong>${String(t.model_id).slice(0,48)} \u00b7 ${eff==='lora'?'LoRA':'Full'}${eff==='lora' ? ' <span style="font-weight:normal;color:#94a3b8;">(Base: '+String(t.model_id).slice(0,32)+')</span>' : ''}</strong><br><span style="font-size:11px;color:#64748b;">Task: ${t.task_type}</span>`;
+              }
+            }
+          } else {
+            testBox.style.display = 'none';
+          }
+        }
+      } catch(_) {}
 
       // header buttons too
       const cellEl = document.getElementById(`cell-${cellId}`);
@@ -3712,6 +4206,16 @@ print(f"Loaded trained model from {MODEL_DIR}")
     window.cancelStopTraining = cancelStopTraining;
     window.confirmStopTraining = confirmStopTraining;
     window.toggleTrainingLogs = toggleTrainingLogs;
+    window.renderTestModelInput = renderTestModelInput;
+    window.updateTestInput = updateTestInput;
+    window.updateTestMaxTokens = updateTestMaxTokens;
+    window.handleImageFileSelect = handleImageFileSelect;
+    window.handleImageDragOver = handleImageDragOver;
+    window.handleImageDragLeave = handleImageDragLeave;
+    window.handleImageDrop = handleImageDrop;
+    window.clearTestImage = clearTestImage;
+    window.runTestModel = runTestModel;
+    window.clearTestModel = clearTestModel;
     window.isLargeModelFrontend = isLargeModelFrontend;
     window.getEffectiveMethod = getEffectiveMethod;
 

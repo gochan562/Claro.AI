@@ -1,5 +1,12 @@
+require('dotenv').config();
 const express = require('express');
 const cors    = require('cors');
+const helmet  = require('helmet');
+const session = require('express-session');
+const rateLimit = require('express-rate-limit');
+const { ipKeyGenerator } = require('express-rate-limit');
+const bcrypt  = require('bcrypt');
+const fs      = require('fs');
 const path    = require('path');
 const { Readable } = require('stream');
 const { execFile } = require('child_process');
@@ -22,15 +29,189 @@ const gpuBackend = resolveBackend(process.env);
 // Training backend — generic engine (inference vs training are independent)
 const trainingBackend = require('./training_backend');
 
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
-app.use(express.static(path.join(__dirname)));
+// ── Security headers ───────────────────────────────────────────────────
+app.use(helmet());
 
-// ── GET /api/hf-loader ───────────────────────────────────────────────────────
-// The browser asks the Python loader package for Cell 1.  The package emits
-// runtime AutoConfig-based code; it never downloads or inspects a model on the
-// web server.  Keeping this adapter here lets the existing static dashboard
-// consume the new Python implementation without bundling Python into JS.
+// ── CORS allow-list ────────────────────────────────────────────────────
+const allowedOrigins = (process.env.FRONTEND_ORIGIN || 'http://localhost:5000')
+  .split(',').map(s=>s.trim()).filter(Boolean);
+app.use(cors({
+  origin: function(origin, cb){
+    // allow non-browser requests (no origin) and allow-listed origins
+    if (!origin) return cb(null, true);
+    if (allowedOrigins.includes(origin) || allowedOrigins.includes('*')) return cb(null, true);
+    // For development, allow localhost any port
+    if (origin.startsWith('http://localhost:') || origin.startsWith('http://127.0.0.1:')) return cb(null, true);
+    return cb(new Error('Not allowed by CORS'), false);
+  },
+  credentials: true
+}));
+
+// ── Body parsing ───────────────────────────────────────────────────────
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// ── Session ────────────────────────────────────────────────────────────
+const SESSION_SECRET = process.env.SESSION_SECRET || 'change-me-to-a-long-random-string-please-set-SESSION_SECRET';
+app.use(session({
+  secret: SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production', // true only over https in prod
+    sameSite: 'lax',
+    maxAge: 1000*60*60*24 // 1 day
+  }
+}));
+
+// ── Rate limiting ───────────────────────────────────────────────────────
+const globalLimiter = rateLimit({
+  windowMs: 15*60*1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use(globalLimiter);
+
+const strictLimiter = rateLimit({
+  windowMs: 60*1000,
+  max: 10,
+  keyGenerator: (req) => req.session?.userId || ipKeyGenerator(req.ip),
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req,res)=> res.status(429).json({ error: 'too many requests', code: 'rate_limited' })
+});
+
+// ── User store (file-based JSON outside web root) ─────────────────────
+const USERS_FILE = path.join(__dirname, 'users.json');
+function loadUsers(){
+  try {
+    if (!fs.existsSync(USERS_FILE)) return [];
+    const raw = fs.readFileSync(USERS_FILE,'utf8');
+    return JSON.parse(raw);
+  } catch { return []; }
+}
+function saveUsers(users){
+  try { fs.writeFileSync(USERS_FILE, JSON.stringify(users,null,2)); } catch(e){ console.error('Failed to save users', e); }
+}
+function findUserByEmail(email){
+  const users = loadUsers();
+  return users.find(u => u.email.toLowerCase() === String(email).toLowerCase());
+}
+function findUserById(id){
+  const users = loadUsers();
+  return users.find(u => u.id === id);
+}
+function validateEmail(email){
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email).trim());
+}
+
+// ── Auth middleware ────────────────────────────────────────────────────
+function requireAuth(req,res,next){
+  if (!req.session?.userId) return res.status(401).json({ error: 'unauthorized', code: 'unauthorized' });
+  const user = findUserById(req.session.userId);
+  if (!user) return res.status(401).json({ error: 'unauthorized', code: 'unauthorized' });
+  req.user = user;
+  next();
+}
+function requireAdmin(req,res,next){
+  if (!req.session?.userId) return res.status(401).json({ error: 'unauthorized', code: 'unauthorized' });
+  const user = findUserById(req.session.userId);
+  if (!user) return res.status(401).json({ error: 'unauthorized', code: 'unauthorized' });
+  const adminEmails = (process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || '').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
+  const isAdmin = user.role === 'admin' || adminEmails.includes(user.email.toLowerCase());
+  if (!isAdmin) return res.status(403).json({ error: 'forbidden', code: 'forbidden' });
+  req.user = user;
+  next();
+}
+function checkOwnershipOr404(job, userId, res){
+  if (!trainingBackend.isOwner(job, userId)) {
+    // Check admin override
+    const user = findUserById(userId);
+    const adminEmails = (process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || '').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
+    const isAdmin = user && (user.role === 'admin' || adminEmails.includes(user.email.toLowerCase()));
+    if (isAdmin) return true;
+    // Return 404 to avoid confirming existence
+    res.status(404).json({ error: 'Job not found', code: 'not_found' });
+    return false;
+  }
+  return true;
+}
+
+// ── Static serving (restricted to public/) ─────────────────────────────
+app.use(express.static(path.join(__dirname, 'public')));
+// Explicitly handle root
+app.get('/', (req,res)=>{
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// ── Auth endpoints ─────────────────────────────────────────────────────
+app.post('/api/auth/signup', async (req,res)=>{
+  try {
+    const { email, password, username, name } = req.body || {};
+    const cleanEmail = String(email||'').trim().toLowerCase();
+    const cleanUser = String(username || name || '').trim();
+    const pwd = String(password||'');
+    if (!validateEmail(cleanEmail)) return res.status(400).json({ error: 'Invalid email format', code: 'bad_request' });
+    if (!pwd || pwd.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters', code: 'bad_request' });
+    if (findUserByEmail(cleanEmail)) return res.status(409).json({ error: 'Email already registered', code: 'conflict' });
+    const hash = await bcrypt.hash(pwd, 12);
+    const users = loadUsers();
+    const id = 'user_' + require('crypto').randomBytes(6).toString('hex');
+    const role = users.length === 0 ? 'admin' : 'user'; // first user is admin for bootstrapping
+    const adminEmails = (process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || '').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
+    const finalRole = adminEmails.includes(cleanEmail) ? 'admin' : role;
+    const user = { id, email: cleanEmail, username: cleanUser || cleanEmail.split('@')[0], passwordHash: hash, role: finalRole, createdAt: new Date().toISOString() };
+    users.push(user);
+    saveUsers(users);
+    // Auto-login after signup
+    req.session.userId = user.id;
+    req.session.email = user.email;
+    req.session.role = user.role;
+    return res.json({ ok:true, user: { id: user.id, email: user.email, username: user.username, role: user.role } });
+  } catch(e){
+    console.error('signup error', e);
+    return res.status(500).json({ error: 'signup failed', code: 'server_error' });
+  }
+});
+
+app.post('/api/auth/login', async (req,res)=>{
+  try {
+    const { email, password } = req.body || {};
+    const cleanEmail = String(email||'').trim().toLowerCase();
+    const pwd = String(password||'');
+    if (!cleanEmail || !pwd) return res.status(400).json({ error: 'Email and password required', code: 'bad_request' });
+    const user = findUserByEmail(cleanEmail);
+    if (!user) return res.status(401).json({ error: 'Invalid credentials', code: 'unauthorized' });
+    const ok = await bcrypt.compare(pwd, user.passwordHash);
+    if (!ok) return res.status(401).json({ error: 'Invalid credentials', code: 'unauthorized' });
+    req.session.userId = user.id;
+    req.session.email = user.email;
+    req.session.role = user.role;
+    return res.json({ ok:true, user: { id: user.id, email: user.email, username: user.username, role: user.role } });
+  } catch(e){
+    console.error('login error', e);
+    return res.status(500).json({ error: 'login failed', code: 'server_error' });
+  }
+});
+
+app.post('/api/auth/logout', (req,res)=>{
+  req.session.destroy(err=>{
+    if (err) return res.status(500).json({ error: 'logout failed' });
+    res.clearCookie('connect.sid');
+    return res.json({ ok:true });
+  });
+});
+
+app.get('/api/auth/me', (req,res)=>{
+  if (!req.session?.userId) return res.status(401).json({ error: 'unauthorized', code: 'unauthorized' });
+  const user = findUserById(req.session.userId);
+  if (!user) return res.status(401).json({ error: 'unauthorized' });
+  return res.json({ user: { id: user.id, email: user.email, username: user.username, role: user.role } });
+});
+
+// ── GET /api/hf-loader (public, used for model picker) ─────────────────
 app.get('/api/hf-loader', async (req, res) => {
   const modelId = String(req.query.modelId || '').trim();
   if (!/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(modelId)) {
@@ -89,9 +270,6 @@ async function callModal(url, body) {
 }
 
 // ── GET /api/gpu-status ────────────────────────────────────────────────────────
-// Lightweight reachability check for the active GPU backend.  When the backend
-// is ZeroGPU this probes the Space's /gradio_api/config without queueing a GPU
-// call.  When Modal is selected this hits MODAL_RUN_URL with a GET.
 app.get('/api/gpu-status', async (req, res) => {
   try {
     const info = await gpuBackend.status();
@@ -106,9 +284,6 @@ app.get('/api/gpu-status', async (req, res) => {
 });
 
 // ── GET /api/gpu-config ──────────────────────────────────────────────────────
-// Returns which backend is active + Space info so the dashboard can route
-// inference/model-cell runs to the right endpoint (structured ZeroGPU vs.
-// Python-cell Modal) without guessing.
 app.get('/api/gpu-config', (req, res) => {
   res.json({
     provider: gpuBackend.kind,
@@ -122,12 +297,9 @@ app.get('/api/gpu-config', (req, res) => {
 });
 
 // ── GET /api/stream-logs ─────────────────────────────────────────────────────
-// Server-Sent Events endpoint. Streams a notebook cell's stdout/stderr to the
-// browser line-by-line as it's produced on the Modal GPU, so students watch
-// downloads/training print out in real time instead of waiting for one big
-// JSON blob. EventSource only supports GET, so the code is passed as a query
-// parameter.
-app.get('/api/stream-logs', async (req, res) => {
+// NOTE: This endpoint was previously open to RCE when GPU_PROVIDER=modal.
+// Now gated behind admin auth.
+app.get('/api/stream-logs', requireAuth, requireAdmin, async (req, res) => {
   const { MODAL_STREAM_URL, MODAL_AUTH_SECRET } = process.env;
   const code = req.query.code || '';
 
@@ -194,11 +366,7 @@ app.get('/api/stream-logs', async (req, res) => {
 });
 
 // ── POST /api/zerogpu-run ─────────────────────────────────────────────────────
-// Structured request to the ZeroGPU Space.  Accepts:
-//   { model_id: str, task: str, inputs: { prompt, max_new_tokens, ... } }
-// and returns { output, stderr }.  Never forwards arbitrary Python; the model
-// loads and runs inside the Space.
-app.post('/api/zerogpu-run', async (req, res) => {
+app.post('/api/zerogpu-run', requireAuth, strictLimiter, async (req, res) => {
   if (gpuBackend.kind !== 'zerogpu') {
     return res.status(400).json({
       error: `Not on ZeroGPU backend (current provider: ${gpuBackend.kind}). Set GPU_PROVIDER=zerogpu to use this endpoint.`,
@@ -223,10 +391,7 @@ app.post('/api/zerogpu-run', async (req, res) => {
 });
 
 // ── GET /api/zerogpu-stream ──────────────────────────────────────────────────
-// Server-Sent Events: opens a ZeroGPU Space call and streams the resulting
-// lines into the dashboard GPU terminal as they arrive.  Accepts the same
-// structured payload as /api/zerogpu-run but as URL-safe JSON in ?req=
-app.get('/api/zerogpu-stream', async (req, res) => {
+app.get('/api/zerogpu-stream', requireAuth, async (req, res) => {
   res.set({
     'Content-Type':      'text/event-stream',
     'Cache-Control':     'no-cache',
@@ -268,22 +433,15 @@ app.get('/api/zerogpu-stream', async (req, res) => {
 });
 
 // ── POST /api/run-cell ────────────────────────────────────────────────────────
-// Executes a notebook cell.  Behaviour depends on the active backend:
-//   • ZeroGPU (default) → rejects Python-cell requests for the inference/model
-//     cells; the dashboard must send structured requests to /api/zerogpu-run.
-//     Other code/parameter/markdown cells never reach here from a ZeroGPU
-//     model cell, but we keep the endpoint available for plain Python cells
-//     by forwarding to Modal *only if* Modal is configured.
-//   • Modal → runs arbitrary Python on the remote A10G (unchanged behaviour).
-app.post('/api/run-cell', async (req, res) => {
+// Disabled by default for security. Only admin may use it when explicitly enabled.
+// Even admin is rate-limited.
+app.post('/api/run-cell', requireAuth, requireAdmin, strictLimiter, async (req, res) => {
   const { code } = req.body || {};
   if (!code || !String(code).trim()) {
     return res.status(400).json({ error: 'No code provided.' });
   }
 
   if (gpuBackend.kind === 'zerogpu') {
-    // The local Claro.AI should only communicate with the Space; it does not
-    // run arbitrary Python anywhere when ZeroGPU is the active backend.
     return res.status(400).json({
       error:
         'ZeroGPU backend only accepts structured { model_id, task, inputs } ' +
@@ -293,7 +451,6 @@ app.post('/api/run-cell', async (req, res) => {
     });
   }
 
-  // Modal path (unchanged from the original implementation).
   try {
     const { status, data } = await gpuBackend.run({ code });
     return res.status(status).json(data);
@@ -303,19 +460,17 @@ app.post('/api/run-cell', async (req, res) => {
   }
 });
 
-// ── Training Engine — generic backend (independent from inference) ──────────
-// Supports ZeroGPU | Local Python | Modal (future). Uses HF Trainer + task-aware
-// preprocessing (AutoTokenizer / AutoImageProcessor) and auto-detects model class
-// via hf_loader logic (inside training_runner.py).
-//
-// Jobs: { job_id, status, progress, metrics } with statuses:
-//   queued | loading | training | evaluating | finished | failed
-
-// POST /api/train/start — create and launch a background training job
-app.post('/api/train/start', async (req, res) => {
+// ── Training Engine ────────────────────────────────────────────────────────
+app.post('/api/train/start', requireAuth, strictLimiter, async (req, res) => {
   try {
+    // Per-user quota: 1 concurrent job
+    const active = trainingBackend.getActiveJobCountForUser(req.session.userId);
+    const limit = parseInt(process.env.TRAIN_MAX_CONCURRENT_PER_USER || '1',10);
+    if (active >= limit) {
+      return res.status(429).json({ error: `Concurrent job limit reached (${limit}). Wait for your current job to finish.`, code: 'quota_exceeded' });
+    }
     const config = trainingBackend.validateTrainingRequest(req.body);
-    const job = trainingBackend.createJob(config);
+    const job = trainingBackend.createJob(config, req.session.userId);
     trainingBackend.startJob(job);
     return res.json({
       job_id: job.job_id,
@@ -330,10 +485,10 @@ app.post('/api/train/start', async (req, res) => {
   }
 });
 
-// GET /api/train/status/:job_id — current job snapshot (polling fallback)
-app.get('/api/train/status/:job_id', (req, res) => {
+app.get('/api/train/status/:job_id', requireAuth, (req, res) => {
   const job = trainingBackend.getJob(req.params.job_id);
   if (!job) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
+  if (!checkOwnershipOr404(job, req.session.userId, res)) return;
   return res.json({
     job_id: job.job_id,
     status: job.status,
@@ -346,10 +501,10 @@ app.get('/api/train/status/:job_id', (req, res) => {
   });
 });
 
-// GET /api/train/metrics/:job_id — return recent metrics as JSON, or SSE stream if requested
-app.get('/api/train/metrics/:job_id', (req, res) => {
+app.get('/api/train/metrics/:job_id', requireAuth, (req, res) => {
   const job = trainingBackend.getJob(req.params.job_id);
   if (!job) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
+  if (!checkOwnershipOr404(job, req.session.userId, res)) return;
 
   const wantsSSE = (req.headers.accept || '').includes('text/event-stream') || req.query.stream === '1' || req.query.stream === 'true';
   if (wantsSSE) {
@@ -360,20 +515,16 @@ app.get('/api/train/metrics/:job_id', (req, res) => {
       'X-Accel-Buffering': 'no',
     });
     res.flushHeaders();
-    // replay + attach
     trainingBackend.attachSSE(job.job_id, res);
-    // keep-alive ping every 15s
     const ping = setInterval(() => {
       try { res.write(': ping\n\n'); } catch (_) { clearInterval(ping); }
     }, 15000);
     req.on('close', () => {
       clearInterval(ping);
-      // attachSSE handles removal on res close
     });
     return;
   }
 
-  // polling JSON
   const limit = Math.min(parseInt(req.query.limit || '100', 10) || 100, 500);
   const slice = job.metrics.slice(-limit);
   return res.json({
@@ -384,10 +535,10 @@ app.get('/api/train/metrics/:job_id', (req, res) => {
   });
 });
 
-// GET /api/train/stream/:job_id — dedicated SSE stream (alias for metrics SSE)
-app.get('/api/train/stream/:job_id', (req, res) => {
+app.get('/api/train/stream/:job_id', requireAuth, (req, res) => {
   const job = trainingBackend.getJob(req.params.job_id);
   if (!job) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
+  if (!checkOwnershipOr404(job, req.session.userId, res)) return;
   res.set({
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -402,13 +553,11 @@ app.get('/api/train/stream/:job_id', (req, res) => {
   req.on('close', () => clearInterval(ping));
 });
 
-// GET /api/train/list — list all jobs (debug)
-app.get('/api/train/list', (req, res) => {
+app.get('/api/train/list', requireAuth, requireAdmin, (req, res) => {
   return res.json({ jobs: trainingBackend.listJobs() });
 });
 
-// POST /api/train/stop — stop a running job
-app.post('/api/train/stop', (req, res) => {
+app.post('/api/train/stop', requireAuth, (req, res) => {
   const job_id = String(req.body.job_id || req.body.jobId || req.query.job_id || '').trim();
   const diagCaller = req.body._diag_caller || req.headers['x-diag-caller'] || 'unknown';
   const diagCellId = req.body._diag_cellId || req.body.cellId || 'unknown';
@@ -416,21 +565,56 @@ app.post('/api/train/stop', (req, res) => {
   const diagStack = req.body._diag_stack || '';
   console.log(`[TRAIN-DIAG] POST /api/train/stop job_id=${job_id} caller=${diagCaller} cellId=${diagCellId} userInitiated=${diagUserInitiated} ts=${new Date().toISOString()} ip=${req.ip} stack=${String(diagStack).slice(0,500)}`);
   if (!job_id) return res.status(400).json({ error: 'job_id is required', code: 'bad_request' });
-  const job = trainingBackend.stopJob(job_id, { caller: diagCaller, cellId: diagCellId, userInitiated: diagUserInitiated, stack: diagStack });
+  const job = trainingBackend.getJob(job_id);
   if (!job) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
-  return res.json({ job_id, status: job.status, message: 'Job stopped' });
+  if (!checkOwnershipOr404(job, req.session.userId, res)) return;
+  const stopped = trainingBackend.stopJob(job_id, { caller: diagCaller, cellId: diagCellId, userInitiated: diagUserInitiated, stack: diagStack });
+  if (!stopped) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
+  return res.json({ job_id, status: stopped.status, message: 'Job stopped' });
 });
 
-// also support POST /api/train/stop/:job_id
-app.post('/api/train/stop/:job_id', (req, res) => {
+app.post('/api/train/stop/:job_id', requireAuth, (req, res) => {
   console.log(`[TRAIN-DIAG] POST /api/train/stop/:job_id job_id=${req.params.job_id} ts=${new Date().toISOString()} ip=${req.ip}`);
-  const job = trainingBackend.stopJob(req.params.job_id, { caller: 'stop/:job_id', userInitiated: false });
+  const job = trainingBackend.getJob(req.params.job_id);
   if (!job) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
-  return res.json({ job_id: job.job_id, status: job.status, message: 'Job stopped' });
+  if (!checkOwnershipOr404(job, req.session.userId, res)) return;
+  const stopped = trainingBackend.stopJob(req.params.job_id, { caller: 'stop/:job_id', userInitiated: false });
+  if (!stopped) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
+  return res.json({ job_id: stopped.job_id, status: stopped.status, message: 'Job stopped' });
 });
 
-// GET /api/train/artifacts/:job_id — inference-ready artifact metadata
-app.get('/api/train/artifacts/:job_id', (req, res) => {
+app.get('/api/train/artifacts/:job_id', requireAuth, (req, res) => {
+  // Need to check ownership before revealing metadata; getArtifactMetadata will throw if job not found,
+  // but we need to ensure 404 for non-owner. We can check via getJob first.
+  const job = trainingBackend.getJob(req.params.job_id);
+  // Also handle case where job is on disk but not in memory: need to check diskMeta ownership
+  // We try to get metadata and then check, but if not in memory we need to read disk job.json
+  // For simplicity, if job exists in memory, check ownership; if not, try to load disk and check.
+  if (job) {
+    if (!checkOwnershipOr404(job, req.session.userId, res)) return;
+  } else {
+    // Fallback: try to read disk job.json to check owner without leaking existence
+    try {
+      const dir = trainingBackend._safeArtifactDir(req.params.job_id);
+      const jobJsonPath = path.join(dir, 'job.json');
+      if (fs.existsSync(jobJsonPath)) {
+        const meta = JSON.parse(fs.readFileSync(jobJsonPath,'utf8'));
+        if (meta.user_id && meta.user_id !== req.session.userId) {
+          // Check admin
+          const user = findUserById(req.session.userId);
+          const adminEmails = (process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || '').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
+          const isAdmin = user && (user.role === 'admin' || adminEmails.includes(user.email.toLowerCase()));
+          if (!isAdmin) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
+        } else if (!meta.user_id) {
+          // Legacy job without owner: only admin may access
+          const user = findUserById(req.session.userId);
+          const adminEmails = (process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || '').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
+          const isAdmin = user && (user.role === 'admin' || adminEmails.includes(user.email.toLowerCase()));
+          if (!isAdmin) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
+        }
+      }
+    } catch {}
+  }
   try {
     const meta = trainingBackend.getArtifactMetadata(req.params.job_id);
     return res.json(meta);
@@ -441,12 +625,34 @@ app.get('/api/train/artifacts/:job_id', (req, res) => {
   }
 });
 
-// POST /api/inference/trained — run inference with a trained model (full or LoRA)
-// Supports text tasks via prompt and image tasks via image_base64 / image
-app.post('/api/inference/trained', async (req, res) => {
+app.post('/api/inference/trained', requireAuth, strictLimiter, async (req, res) => {
   const { job_id, prompt, max_new_tokens, task, image, image_base64, imageBase64 } = req.body || {};
   if (!job_id) return res.status(400).json({ error: 'job_id is required', code: 'bad_request' });
-  // Validate job and artifacts server-side (never trust client path)
+  // Ownership check before inference
+  const jobCheck = trainingBackend.getJob(String(job_id).trim());
+  if (jobCheck) {
+    if (!checkOwnershipOr404(jobCheck, req.session.userId, res)) return;
+  } else {
+    // Fallback disk check as in artifacts
+    try {
+      const dir = trainingBackend._safeArtifactDir(String(job_id).trim());
+      const jobJsonPath = path.join(dir, 'job.json');
+      if (fs.existsSync(jobJsonPath)) {
+        const meta = JSON.parse(fs.readFileSync(jobJsonPath,'utf8'));
+        if (meta.user_id && meta.user_id !== req.session.userId) {
+          const user = findUserById(req.session.userId);
+          const adminEmails = (process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || '').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
+          const isAdmin = user && (user.role === 'admin' || adminEmails.includes(user.email.toLowerCase()));
+          if (!isAdmin) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
+        } else if (!meta.user_id) {
+          const user = findUserById(req.session.userId);
+          const adminEmails = (process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || '').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
+          const isAdmin = user && (user.role === 'admin' || adminEmails.includes(user.email.toLowerCase()));
+          if (!isAdmin) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
+        }
+      }
+    } catch {}
+  }
   let meta;
   try {
     meta = trainingBackend.getArtifactMetadata(String(job_id).trim());
@@ -456,11 +662,9 @@ app.post('/api/inference/trained', async (req, res) => {
     return res.status(status).json({ error: err.message, code });
   }
 
-  // Use artifact metadata to derive paths — never use client-provided paths
   const jobId = meta.job_id;
   const taskType = String(task || meta.task_type || 'text-generation').toLowerCase();
   const maxTokens = Math.min(parseInt(max_new_tokens, 10) || 100, 2048);
-  // For image tasks, allow image payload; for text tasks, prompt required
   const isImageTask = taskType === 'image-classification';
   const imagePayload = image_base64 || image || imageBase64 || null;
   let promptStr = null;
@@ -468,15 +672,11 @@ app.post('/api/inference/trained', async (req, res) => {
     if (!prompt || typeof prompt !== 'string' || !prompt.trim()) return res.status(400).json({ error: 'prompt is required', code: 'bad_request' });
     promptStr = String(prompt).slice(0, 4000);
   } else {
-    // image task: need image, allow prompt to carry image if provided as data URL
     if (imagePayload) {
-      promptStr = String(prompt || '').slice(0, 4000); // not used but keep
+      promptStr = String(prompt || '').slice(0, 4000);
     } else if (prompt && typeof prompt === 'string' && prompt.startsWith('data:image')) {
-      // allow prompt to be data URL
-      promptStr = prompt.slice(0, 5000000); // allow large data URL (up to 5MB, limit enforced by json limit)
+      promptStr = prompt.slice(0, 5000000);
     } else if (prompt && typeof prompt === 'string' && prompt.trim()) {
-      // If image task but prompt looks like text, treat as error to guide UI
-      // But allow text prompt if user mistakenly sends text; we will handle as image path failure
       promptStr = String(prompt).slice(0, 4000);
     } else {
       return res.status(400).json({ error: 'image is required for image-classification (send image_base64)', code: 'bad_request' });
@@ -501,7 +701,6 @@ app.post('/api/inference/trained', async (req, res) => {
     } else if (promptStr && promptStr.startsWith('data:image')) {
       args.push('--image_base64', promptStr);
     } else if (promptStr) {
-      // fallback for text misuse
       args.push('--prompt', promptStr);
     }
   } else {
@@ -522,7 +721,7 @@ app.post('/api/inference/trained', async (req, res) => {
   const timer = setTimeout(() => {
     timedOut = true;
     try { proc.kill('SIGKILL'); } catch (_) {}
-  }, 60000); // 60s timeout for inference
+  }, 60000);
 
   proc.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8'); });
   proc.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
@@ -533,7 +732,6 @@ app.post('/api/inference/trained', async (req, res) => {
       return res.status(504).json({ error: 'Inference timed out', code: 'inference_timeout' });
     }
     if (code !== 0) {
-      // Try to parse JSON error from stdout
       try {
         const parsed = JSON.parse(stdout.trim().split('\n').pop());
         if (parsed && parsed.error) {
@@ -542,7 +740,6 @@ app.post('/api/inference/trained', async (req, res) => {
       } catch (_) {}
       return res.status(500).json({ error: `Inference failed (exit ${code}): ${stderr.slice(0, 1000) || stdout.slice(0, 1000)}`, code: 'inference_error' });
     }
-    // stdout should be a JSON line with {"output": ...} plus structured fields
     try {
       const lines = stdout.trim().split('\n');
       let data = null;
@@ -555,7 +752,6 @@ app.post('/api/inference/trained', async (req, res) => {
       if (!data || (data.output === undefined && data.label === undefined && data.scores === undefined)) {
         return res.status(500).json({ error: `No output from inference: ${stdout.slice(0, 1000)}`, code: 'inference_error', stderr: stderr.slice(0, 500) });
       }
-      // Forward full structured response (task, prediction, scores, tokens etc.) but ensure output exists
       return res.json({
         task: data.task || taskType,
         output: data.output !== undefined ? data.output : (data.label || JSON.stringify(data)),
@@ -579,8 +775,7 @@ app.post('/api/inference/trained', async (req, res) => {
 });
 
 // ── POST /api/train (legacy) ──────────────────────────────────────────────────
-// Kicks off a fine-tuning job (kept for programmatic use).
-app.post('/api/train', async (req, res) => {
+app.post('/api/train', requireAuth, strictLimiter, async (req, res) => {
   const { MODAL_URL } = process.env;
 
   if (!MODAL_URL) {
@@ -605,6 +800,17 @@ app.post('/api/train', async (req, res) => {
   }
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Claro.AI server listening on port ${PORT}`);
+// Fallback for client-side routing: serve index.html for unknown non-API routes
+app.get('/*splat', (req,res,next)=>{
+  if (req.path.startsWith('/api/')) return next();
+  // Let static handle if file exists, otherwise 404
+  return res.status(404).send('Not found');
 });
+
+if (require.main === module) {
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Claro.AI server listening on port ${PORT}`);
+  });
+}
+module.exports = app;
+

@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Claro.AI – Drag & Drop AI GUI</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: 'Segoe UI', sans-serif;
+      background: #050813;
+      color: #d6e0f0;
+      overflow-x: hidden;
+    }
+
+    canvas#bg {
+      position: fixed;
+      top: 0;
+      left: 0;
+      z-index: 0;
+    }
+
+    header {
+      padding: 20px 40px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: rgba(17, 25, 45, 0.9);
+      border-bottom: 1px solid #1f2a3d;
+      backdrop-filter: blur(10px);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+
+    .logo {
+      font-size: 22px;
+      font-weight: bold;
+      color: #87aade;
+      text-shadow: 0 0 6px #4780ff;
+    }
+
+    nav a {
+      margin-left: 20px;
+      color: #cbd8f0;
+      text-decoration: none;
+      font-size: 14px;
+    }
+
+    .hero {
+      position: relative;
+      text-align: center;
+      padding: 150px 20px 100px;
+      z-index: 1;
+    }
+
+    .hero h1 {
+      font-size: 44px;
+      color: #c7dcff;
+      height: 56px;
+    }
+
+    .hero p {
+      font-size: 18px;
+      max-width: 700px;
+      margin: 20px auto 40px;
+      color: #aebfd9;
+    }
+
+    .drop-box {
+      margin: 0 auto;
+      max-width: 520px;
+      border: 2px dashed #4c6faf;
+      border-radius: 20px;
+      padding: 50px;
+      background: linear-gradient(145deg, #0d1423, #101828);
+      color: #87aade;
+      font-size: 20px;
+      z-index: 1;
+      box-shadow: 0 8px 20px rgba(50, 100, 200, 0.2), 0 0 15px rgba(60, 120, 255, 0.15);
+      transition: 0.3s ease;
+    }
+
+    .drop-box:hover {
+      transform: scale(1.01);
+      box-shadow: 0 0 25px #4c6fafcc;
+    }
+
+    .file-label {
+      cursor: pointer;
+      display: inline-block;
+      font-size: 15px;
+      margin-top: 10px;
+      color: #87aade;
+      position: relative;
+    }
+
+    .file-label input[type="file"] {
+      display: none;
+    }
+
+    .browse-btn {
+      color: #a4c3ff;
+      text-decoration: underline;
+      cursor: pointer;
+    }
+
+    .cta-buttons {
+      margin-top: 40px;
+      display: flex;
+      justify-content: center;
+      gap: 20px;
+      z-index: 1;
+    }
+
+    .cta-buttons button {
+      padding: 14px 26px;
+      font-size: 15px;
+      border: none;
+      border-radius: 12px;
+      cursor: pointer;
+    }
+
+    .btn-primary {
+      background-color: #32b263;
+      color: white;
+      box-shadow: 0 0 10px #3ae67d66;
+    }
+
+    .btn-secondary {
+      background-color: rgba(76, 111, 175, 0.15);
+      color: #cbd8f0;
+      border: 1px solid #4c6faf;
+    }
+
+    .features {
+      padding: 80px 20px;
+      background-color: #0f1628;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 60px;
+    }
+
+    .feature {
+      max-width: 700px;
+      background-color: #121b30;
+      text-align: center;
+      padding: 30px 20px;
+      border-radius: 16px;
+      box-shadow: 0 6px 16px rgba(30, 60, 120, 0.2), 0 0 8px rgba(80, 140, 255, 0.08);
+      opacity: 0;
+      transform: translateY(50px);
+      transition: all 0.7s ease;
+    }
+
+    .feature:hover {
+      transform: translateY(-5px);
+      box-shadow: 0 12px 24px rgba(30, 60, 120, 0.25), 0 0 10px rgba(80, 140, 255, 0.12);
+    }
+
+    .feature h3 {
+      color: #a4c3ff;
+      font-size: 24px;
+      margin-bottom: 10px;
+    }
+
+    footer {
+      text-align: center;
+      font-size: 13px;
+      padding: 40px 0;
+      background-color: #11192d;
+      color: #6c7e99;
+      border-top: 1px solid #1f2a3d;
+    }
+
+    .show {
+      opacity: 1 !important;
+      transform: translateY(0) !important;
+    }
+
+    .typewriter::after {
+      content: '|';
+      animation: blink 1s infinite;
+      margin-left: 5px;
+    }
+
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0; }
+    }
+  </style>
+</head>
+<body>
+
+  <canvas id="bg"></canvas>
+
+  <header>
+    <div class="logo">Claro.AI</div>
+    <nav>
+      <a href="https://github.com/gochan562/Claro.AI/tree/Docs">Docs</a>
+      <a href="https://github.com/gochan562/Claro.AI">GitHub</a>
+      <a href="https://discord.gg/uTXDkfGy">Discord</a>
+    </nav>
+  </header>
+
+  <section class="hero">
+    <h1 id="typewriter" class="typewriter"></h1>
+    <p>A beautiful GUI for Hugging Face + Google Colab.<br>
+      Load your favorite model in seconds and start coding –  
+      perfect for students & curious devs.</p>
+
+    <div class="drop-box">
+      🔽 Drop your Hugging Face model here<br><br>
+      <label class="file-label">
+        or <span class="browse-btn">browse</span> from files
+        <input type="file" id="modelFile" accept=".bin,.pt,.pth,.safetensors,.onnx" />
+      </label>
+      <div id="fileName" style="margin-top:10px; font-size:14px; color:#9eb2dd;"></div>
+    </div>
+
+    <div class="cta-buttons">
+      <button class="btn-primary"onclick="location.href='Login.html'">🚀 Login</button>
+      <button class="btn-secondary"onclick="location.href='signup.html'">✅ Sign Up</button>
+    </div>
+  </section>
+
+  <section class="features">
+    <div class="feature">
+      <h3>🧠 Hugging Face Integration</h3>
+      <p>Instantly load models from Hugging Face. No config, no fuss. Just drag & go.</p>
+    </div>
+    <div class="feature">
+      <h3>📚 Built for Students</h3>
+      <p>Clean, friendly, and ready to teach. Use it in class or for self-learning.</p>
+    </div>
+    <div class="feature">
+      <h3>⚙️ Powered by Google Colab</h3>
+      <p>Free GPU access. Run models in the cloud, edit code visually, and learn fast.</p>
+    </div>
+    <div class="feature">
+      <h3>🎨 Customizable Workflow</h3>
+      <p>Import models, edit cells, monitor tokens, and control everything from one place.</p>
+    </div>
+    <div class="feature">
+      <h3>🌐 Works Anywhere</h3>
+      <p>Browser-only, no installs, runs great on various devices.</p>
+    </div>
+  </section>
+
+  <footer>
+    © 2025 Claro.AI — Built by ごちゃん & friends.
+  </footer>
+
+  <!-- Typewriter -->
+  <script>
+    const text = "Drag. Drop. Deploy.";
+    const target = document.getElementById("typewriter");
+    let i = 0;
+    const speed = 80;
+    function type() {
+      if (i < text.length) {
+        target.innerHTML += text.charAt(i);
+        i++;
+        setTimeout(type, speed);
+      }
+    }
+    type();
+  </script>
+
+  <!-- Scroll reveal -->
+  <script>
+    const features = document.querySelectorAll('.feature');
+    const observer = new IntersectionObserver(entries => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) entry.target.classList.add('show');
+      });
+    }, { threshold: 0.1 });
+    features.forEach(feature => observer.observe(feature));
+  </script>
+
+  <!-- File input listener -->
+  <script>
+    const fileInput = document.getElementById("modelFile");
+    const fileNameDisplay = document.getElementById("fileName");
+
+    fileInput.addEventListener("change", () => {
+      if (fileInput.files.length > 0) {
+        const file = fileInput.files[0];
+        fileNameDisplay.textContent = `Selected: ${file.name}`;
+      } else {
+        fileNameDisplay.textContent = "";
+      }
+    });
+  </script>
+
+  <!-- Three.js sphere particles -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+  <script>
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+    const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById("bg"), alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+
+    const geometry = new THREE.BufferGeometry();
+    const vertices = [];
+    const radius = 90;
+    const particleCount = 1500;
+
+    for (let i = 0; i < particleCount; i++) {
+      const theta = Math.random() * 2 * Math.PI;
+      const phi = Math.acos((Math.random() * 2) - 1);
+      const x = radius * Math.sin(phi) * Math.cos(theta);
+      const y = radius * Math.sin(phi) * Math.sin(theta);
+      const z = radius * Math.cos(phi);
+      vertices.push(x, y, z);
+    }
+
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+    const material = new THREE.PointsMaterial({ color: 0x4c6faf, size: 1.5 });
+    const points = new THREE.Points(geometry, material);
+    scene.add(points);
+    camera.position.z = 150;
+
+    function animate() {
+      requestAnimationFrame(animate);
+      points.rotation.y += 0.001;
+      points.rotation.x += 0.0005;
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+
+</body>
+</html>

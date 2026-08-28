@@ -202,12 +202,14 @@ function validateTrainingRequest(body) {
 }
 
 // ── Job lifecycle ──
-function createJob(config) {
+function createJob(config, ownerUserId = null) {
   const job_id = _genId();
   const job = {
     job_id,
     status: 'queued',
     config,
+    user_id: ownerUserId || null,
+    owner: ownerUserId || null,
     progress: {
       current_epoch: 0,
       current_step: 0,
@@ -239,6 +241,27 @@ function createJob(config) {
 }
 
 function getJob(job_id) { return jobs.get(job_id) || null; }
+
+function getJobsByUser(userId) {
+  if (!userId) return [];
+  return [...jobs.values()].filter(j => j.user_id === userId || j.owner === userId);
+}
+
+function getActiveJobCountForUser(userId) {
+  if (!userId) return 0;
+  let count = 0;
+  for (const j of jobs.values()) {
+    if ((j.user_id === userId || j.owner === userId) && ['queued','loading','training','evaluating'].includes(j.status)) count++;
+  }
+  return count;
+}
+
+function isOwner(job, userId) {
+  if (!job) return false;
+  // Jobs without owner (legacy) are considered owned by no one; deny unless admin
+  if (!job.user_id && !job.owner) return false;
+  return job.user_id === userId || job.owner === userId;
+}
 
 // ── Artifact registry — machine-readable metadata for inference ──
 function _isValidJobId(job_id) {
@@ -280,6 +303,8 @@ function getArtifactMetadata(job_id) {
           config: diskMeta.config,
           artifacts_dir: dir,
           progress: diskMeta.progress || {},
+          user_id: diskMeta.user_id || null,
+          owner: diskMeta.user_id || null,
         };
       } catch (_) {
         // fall through to unknown job
@@ -790,7 +815,7 @@ function _saveArtifacts(job) {
     fs.writeFileSync(path.join(dir, 'metrics.json'), JSON.stringify(job.metrics, null, 2));
     fs.writeFileSync(path.join(dir, 'training_logs.txt'), job.logs.join('\n'));
     // Save job config to job.json to avoid overwriting HF model config.json
-    fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({ job_id: job.job_id, status: job.status, config: job.config, progress: job.progress, error: job.error }, null, 2));
+    fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({ job_id: job.job_id, status: job.status, config: job.config, progress: job.progress, error: job.error, user_id: job.user_id || job.owner || null }, null, 2));
     // Also keep trainer_config.json if Python runner saved it; do not overwrite HF config.json
     if (job.status === 'failed' && job.error) {
       fs.writeFileSync(path.join(dir, 'error.json'), JSON.stringify({ error: job.error, logs_tail: job.logs.slice(-20).join('\n') }, null, 2));
@@ -835,6 +860,9 @@ module.exports = {
   createJob,
   getJob,
   listJobs,
+  getJobsByUser,
+  getActiveJobCountForUser,
+  isOwner,
   startJob,
   stopJob,
   attachSSE,

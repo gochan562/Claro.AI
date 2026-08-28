@@ -1,0 +1,4211 @@
+let notebookRegistry = {
+      notebooks: {},
+      notebookOrder: [],
+      activeNotebookId: null,
+      nextNotebookId: 1
+    };
+
+    let uiState = {
+      mode: 'list',
+      currentModelCellId: null
+    };
+
+    // GPU provider config populated from /api/gpu-config.  When provider is
+    // "zerogpu" the dashboard sends structured { model_id, task, inputs } to
+    // POST /api/zerogpu-run (the Space loads+runs the model); for "modal" it
+    // keeps the existing behaviour of forwarding the generated notebook cell
+    // Python to POST /api/run-cell.
+    let gpuProvider = { provider: 'zerogpu', zerogpu: { space: 'Gochan562/claro_ai_gpu' }, modal: { configured: false } };
+
+    let hfModels = [];
+    let filteredModels = [];
+    let gpuStatus   = { state: 'idle', gpuType: 'A10G' };
+    let gpuIdleTimer = null;
+    let gpuTerminal  = null;
+    let gpuFitAddon  = null;
+    let activeStream = null;
+    let cellEditors  = {};
+
+    function initGpuTerminal() {
+      if (gpuTerminal || typeof Terminal === 'undefined') return;
+
+      gpuTerminal = new Terminal({
+        convertEol: true,
+        fontFamily: "'Consolas', 'Monaco', monospace",
+        fontSize: 13,
+        cursorBlink: true,
+        theme: {
+          background: '#0b0f1a',
+          foreground: '#e2e8f0',
+          cursor: '#60a5fa',
+          selectionBackground: '#334155'
+        }
+      });
+
+      if (typeof FitAddon !== 'undefined') {
+        gpuFitAddon = new FitAddon.FitAddon();
+        gpuTerminal.loadAddon(gpuFitAddon);
+      }
+
+      gpuTerminal.open(document.getElementById('gpu-terminal'));
+      gpuFitAddon?.fit();
+      gpuTerminal.writeln('\x1b[90mGPU console ready — output appears here when you run a cell.\x1b[0m');
+
+      window.addEventListener('resize', () => gpuFitAddon?.fit());
+    }
+
+    function clearGpuTerminal() {
+      gpuTerminal?.clear();
+    }
+
+    function writeGpuLine(line, color) {
+      if (!gpuTerminal) return;
+      const codes = { red: '31', green: '32', yellow: '33', gray: '90' };
+      if (color && codes[color]) {
+        gpuTerminal.writeln(`\x1b[${codes[color]}m${line}\x1b[0m`);
+      } else {
+        gpuTerminal.writeln(line);
+      }
+    }
+
+    // Only pings Modal when a cell is actually executed — never on a timer,
+    // and never just from typing or viewing the notebook.
+    function setGpuState(state) {
+      if (gpuIdleTimer) {
+        clearTimeout(gpuIdleTimer);
+        gpuIdleTimer = null;
+      }
+      gpuStatus = { state, gpuType: gpuStatus.gpuType || 'A10G' };
+      renderGpuIndicator();
+
+      if (state === 'connected' || state === 'disconnected') {
+        gpuIdleTimer = setTimeout(() => {
+          gpuStatus = { state: 'idle', gpuType: gpuStatus.gpuType };
+          renderGpuIndicator();
+        }, 5000);
+      }
+    }
+
+    function renderGpuIndicator() {
+      const dot     = document.getElementById('gpu-dot');
+      const tooltip = document.getElementById('gpu-tooltip');
+      if (!dot || !tooltip) return;
+
+      dot.className = 'gpu-dot ' + gpuStatus.state;
+
+      const labels = {
+        'idle':          `⚪ GPU: ${gpuStatus.gpuType} · Idle (connects when you run a cell)`,
+        'checking':      '⏳ Connecting to GPU…',
+        'connected':     `🟢 GPU: ${gpuStatus.gpuType} · Connected`,
+        'disconnected':  `🔴 GPU: ${gpuStatus.gpuType} · Disconnected`,
+        'not-configured': '⚪ GPU not configured'
+      };
+      tooltip.textContent = labels[gpuStatus.state] || 'Unknown status';
+    }
+
+    function loadAllNotebooks() {
+      const saved = localStorage.getItem('claro-notebooks-registry');
+      if (saved) {
+        notebookRegistry = JSON.parse(saved);
+        // migrate training cells: ensure defaults
+        for (const id of Object.keys(notebookRegistry.notebooks || {})) {
+          const nb = notebookRegistry.notebooks[id];
+          for (const cell of (nb.cells || [])) {
+            if (cell.type === 'training' && !cell.training) {
+              try { cell.training = JSON.parse(cell.content || '{}'); } catch(_) { cell.training = {}; }
+              cell.training.model_id = cell.training.model_id || 'distilbert-base-uncased';
+              cell.training.dataset_id = cell.training.dataset_id || 'stanfordnlp/imdb';
+              cell.training.task_type = cell.training.task_type || 'text-classification';
+              cell.training.epochs = cell.training.epochs || 2;
+              cell.training.batch_size = cell.training.batch_size || 8;
+              cell.training.learning_rate = cell.training.learning_rate || 0.00002;
+              cell.training.validation_split = cell.training.validation_split ?? 10;
+              cell.training.status = cell.training.status || 'idle';
+              cell.training.progress = cell.training.progress || { current_epoch:0, current_step:0, train_loss:null, eval_loss:null, eta:null, gpu_status:'idle', training_method:'auto', trainable_params:null, total_params:null };
+              cell.training.metrics = cell.training.metrics || [];
+              cell.training.logs = cell.training.logs || [];
+            }
+            // ensure LoRA fields for existing training cells (created before LoRA)
+            if (cell.type === 'training' && cell.training) {
+              if (!('training_method' in cell.training)) cell.training.training_method = 'auto';
+              if (!('lora_r' in cell.training)) cell.training.lora_r = 8;
+              if (!('lora_alpha' in cell.training)) cell.training.lora_alpha = 16;
+              if (!('lora_dropout' in cell.training)) cell.training.lora_dropout = 0.05;
+              if (!('target_modules' in cell.training)) cell.training.target_modules = 'auto';
+              if (!cell.training.progress) cell.training.progress = {};
+              if (!('training_method' in cell.training.progress)) cell.training.progress.training_method = cell.training.training_method;
+              if (!('trainable_params' in cell.training.progress)) cell.training.progress.trainable_params = null;
+              if (!('total_params' in cell.training.progress)) cell.training.progress.total_params = null;
+              if (!('_uiCustomizeOpen' in cell.training)) cell.training._uiCustomizeOpen = false;
+              if (!('_uiAdvancedOpen' in cell.training)) cell.training._uiAdvancedOpen = false;
+              if (!('testInput' in cell.training)) cell.training.testInput = '';
+              if (!('testImageData' in cell.training)) cell.training.testImageData = null;
+              if (!('testMaxTokens' in cell.training)) cell.training.testMaxTokens = 64;
+              if (!('testResult' in cell.training)) cell.training.testResult = null;
+              if (!('testError' in cell.training)) cell.training.testError = null;
+            }
+          }
+        }
+      } else {
+        const legacyNotebook = localStorage.getItem('claro-notebook');
+        if (legacyNotebook) {
+          const nb = JSON.parse(legacyNotebook);
+          const id = 'notebook_' + notebookRegistry.nextNotebookId++;
+          notebookRegistry.notebooks[id] = {
+            id: id,
+            name: 'My Notebook',
+            cells: nb.cells || [],
+            nextCellId: nb.nextId || 1,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+          };
+          notebookRegistry.notebookOrder.push(id);
+        }
+      }
+    }
+
+    function saveAllNotebooks() {
+      localStorage.setItem('claro-notebooks-registry', JSON.stringify(notebookRegistry));
+    }
+
+    function createNotebook(name) {
+      const id = 'notebook_' + notebookRegistry.nextNotebookId++;
+      notebookRegistry.notebooks[id] = {
+        id: id,
+        name: name || 'Untitled Notebook',
+        cells: [{
+          id: 1,
+          type: 'code',
+          content: '# Welcome to your new notebook!\nprint("Hello, Python!")',
+          output: '',
+          status: 'idle',
+          outputFormat: 'text'
+        }],
+        nextCellId: 2,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+      notebookRegistry.notebookOrder.push(id);
+      saveAllNotebooks();
+      return id;
+    }
+
+    function deleteNotebook(id) {
+      if (confirm('Are you sure you want to delete this notebook?')) {
+        delete notebookRegistry.notebooks[id];
+        notebookRegistry.notebookOrder = notebookRegistry.notebookOrder.filter(nbId => nbId !== id);
+        if (notebookRegistry.activeNotebookId === id) {
+          notebookRegistry.activeNotebookId = null;
+        }
+        saveAllNotebooks();
+        renderUI();
+      }
+    }
+
+    function setActiveNotebook(id) {
+      notebookRegistry.activeNotebookId = id;
+      uiState.mode = 'edit';
+      saveAllNotebooks();
+      renderUI();
+    }
+
+    function getActiveNotebook() {
+      return notebookRegistry.notebooks[notebookRegistry.activeNotebookId];
+    }
+
+    function updateNotebook() {
+      const notebook = getActiveNotebook();
+      if (notebook) {
+        notebook.updatedAt = new Date().toISOString();
+        saveAllNotebooks();
+      }
+    }
+
+    function addCell(type) {
+      const notebook = getActiveNotebook();
+      if (!notebook) return;
+
+      const cell = {
+        id: notebook.nextCellId++,
+        type: type,
+        content: type === 'model' ? '# Click "Select Model" to choose a Hugging Face model' : '',
+        output: '',
+        status: 'idle',
+        outputFormat: 'text',
+        modelInfo: null
+      };
+
+      if (type === 'parameter') {
+        cell.params = {
+          modelType: 'generative',
+          temperature: 0.7,
+          top_p: 0.9,
+          top_k: 50,
+          max_tokens: 512,
+          confidence_threshold: 0.5
+        };
+        cell.paramView = 'gui';
+        cell.content = paramsToCode(cell);
+      }
+      if (type === 'training') {
+        cell.training = {
+          model_id: 'distilbert-base-uncased',
+          dataset_id: 'stanfordnlp/imdb',
+          task_type: 'text-classification',
+          epochs: 2,
+          batch_size: 8,
+          learning_rate: 0.00002,
+          max_steps: '',
+          validation_split: 10,
+          training_method: 'auto',
+          lora_r: 8,
+          lora_alpha: 16,
+          lora_dropout: 0.05,
+          target_modules: 'auto',
+          job_id: null,
+          status: 'idle',
+          progress: { current_epoch: 0, current_step: 0, train_loss: null, eval_loss: null, eta: null, gpu_status: 'idle', training_method: 'auto', trainable_params: null, total_params: null },
+          metrics: [],
+          logs: [],
+          _uiCustomizeOpen: false,
+          _uiAdvancedOpen: false,
+          testInput: '',
+          testImageData: null,
+          testMaxTokens: 64,
+          testResult: null,
+          testError: null,
+        };
+        // training cells store config in cell.training, not cell.content
+        cell.content = JSON.stringify(cell.training, null, 2);
+      }
+
+      notebook.cells.push(cell);
+      updateNotebook();
+      renderNotebookEditor();
+    }
+
+    function deleteCell(cellId) {
+      const notebook = getActiveNotebook();
+      if (!notebook) return;
+      const cell = notebook.cells.find(c => c.id === cellId);
+      if (cell && cell.type === 'training' && cell.training && cell.training.job_id) {
+        // stop running job when cell deleted
+        const t = cell.training;
+        if (['queued','loading','training','evaluating'].includes(t.status)) {
+          console.log(`[TRAIN-DIAG] deleteCell auto-stop cellId=${cellId} job_id=${t.job_id} status=${t.status}`);
+          stopTrainingCell(cellId, { caller: 'deleteCell', userInitiated: true });
+        }
+        if (trainingCharts[cellId]) {
+          try { trainingCharts[cellId].destroy(); } catch(_) {}
+          delete trainingCharts[cellId];
+        }
+        if (trainingStreams[cellId]) {
+          try { trainingStreams[cellId].close(); } catch(_) {}
+          delete trainingStreams[cellId];
+        }
+      }
+      
+      notebook.cells = notebook.cells.filter(c => c.id !== cellId);
+      updateNotebook();
+      renderNotebookEditor();
+    }
+
+    function updateCellContent(cellId, content) {
+      const notebook = getActiveNotebook();
+      if (!notebook) return;
+      
+      const cell = notebook.cells.find(c => c.id === cellId);
+      if (cell) {
+        cell.content = content;
+        updateNotebook();
+      }
+    }
+
+    function renderUI() {
+      if (uiState.mode === 'list') {
+        renderNotebookList();
+      } else if (uiState.mode === 'edit') {
+        renderNotebookEditor();
+      }
+    }
+
+    function renderNotebookList() {
+      const container = document.getElementById('notebook-cells');
+      const toolbar = document.querySelector('.notebook-toolbar');
+      
+      toolbar.innerHTML = `
+        <h2 style="flex: 1; margin: 0;">My Notebooks</h2>
+        <button class="toolbar-btn run-btn" onclick="createNewNotebook()">+ New Notebook</button>
+      `;
+
+      const notebooks = notebookRegistry.notebookOrder.map(id => notebookRegistry.notebooks[id]);
+      
+      if (notebooks.length === 0) {
+        container.innerHTML = `
+          <div style="text-align: center; padding: 60px 20px; color: #94a3b8;">
+            <p style="font-size: 18px; margin-bottom: 20px;">No notebooks yet</p>
+            <button class="toolbar-btn run-btn" onclick="createNewNotebook()">Create Your First Notebook</button>
+          </div>
+        `;
+        return;
+      }
+
+      container.innerHTML = `
+        <div class="notebook-list">
+          ${notebooks.map(nb => `
+            <div class="card notebook-card" ondblclick="setActiveNotebook('${nb.id}')">
+              <h3>${nb.name}</h3>
+              <p>${nb.cells.length} cells • Updated ${new Date(nb.updatedAt).toLocaleDateString()}</p>
+              <div style="margin-top: 10px; display: flex; gap: 8px;">
+                <button class="cell-btn" onclick="event.stopPropagation(); renameNotebook('${nb.id}')">Rename</button>
+                <button class="cell-btn delete" onclick="event.stopPropagation(); deleteNotebook('${nb.id}')">Delete</button>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      `;
+    }
+
+    function renderNotebookEditor() {
+      const notebook = getActiveNotebook();
+      if (!notebook) {
+        uiState.mode = 'list';
+        renderUI();
+        return;
+      }
+
+      const toolbar = document.querySelector('.notebook-toolbar');
+      toolbar.innerHTML = `
+        <button class="toolbar-btn" onclick="backToList()">← Back</button>
+        <h2 style="flex: 1; margin: 0; margin-left: 10px;">${notebook.name}</h2>
+        <div class="add-cell-dropdown" id="add-cell-dropdown-edit">
+          <button class="toolbar-btn" onclick="toggleAddCellMenu('edit')">+ Add Cell ▾</button>
+          <div class="add-cell-menu" id="add-cell-menu-edit">
+            <div class="add-cell-menu-item" onclick="addCell('code');closeAddCellMenu()"><span class="menu-icon">💻</span><div><div>Code Cell</div><div class="menu-desc">Python executed locally (browser)</div></div></div>
+            <div class="add-cell-menu-item" onclick="addCell('markdown');closeAddCellMenu()"><span class="menu-icon">📝</span><div><div>Markdown Cell</div><div class="menu-desc">Formatted text &amp; notes</div></div></div>
+            <div class="add-cell-menu-sep"></div>
+            <div class="add-cell-menu-item" onclick="addCell('model');closeAddCellMenu()"><span class="menu-icon">🤖</span><div><div>Model Cell</div><div class="menu-desc">Load a Hugging Face model</div></div></div>
+            <div class="add-cell-menu-item" onclick="addCell('parameter');closeAddCellMenu()"><span class="menu-icon">🎛️</span><div><div>Parameter Cell</div><div class="menu-desc">Sliders for model config</div></div></div>
+            <div class="add-cell-menu-sep"></div>
+            <div class="add-cell-menu-item" onclick="addCell('training');closeAddCellMenu()"><span class="menu-icon">🏋️</span><div><div>Training Cell</div><div class="menu-desc">Fine-tune a model on a dataset</div></div></div>
+          </div>
+        </div>
+        <button class="toolbar-btn run-btn" onclick="runAllCells()">▶ Run All</button>
+        <button class="toolbar-btn" onclick="runMarkdownCells()">▶ Run Markdown</button>
+        <div class="gpu-indicator" id="gpu-indicator">
+          <span class="gpu-dot idle" id="gpu-dot"></span>
+          <div class="gpu-tooltip" id="gpu-tooltip">⚪ GPU: A10G · Idle (connects when you run a cell)</div>
+        </div>
+      `;
+      renderGpuIndicator();
+
+      const container = document.getElementById('notebook-cells');
+      container.innerHTML = '';
+      cellEditors = {};
+
+      notebook.cells.forEach(cell => {
+        const cellElement = createCellElement(cell);
+        container.appendChild(cellElement);
+        initCellEditor(cell);
+      });
+    }
+
+    function setMarkdownRendered(cellId, html) {
+      const cellEl = document.getElementById(`cell-${cellId}`);
+      if (!cellEl) return;
+      const cmHost    = cellEl.querySelector('.cm-host');
+      const renderDiv = cellEl.querySelector('.markdown-render');
+      const hint      = cellEl.querySelector('.markdown-edit-hint');
+      if (!renderDiv) return;
+
+      renderDiv.innerHTML = html;
+      renderDiv.style.display = 'block';
+      if (hint) hint.style.display = 'block';
+      if (cmHost) cmHost.style.display = 'none';
+
+      const existing = cellEl.querySelector('.cell-output.markdown-output');
+      if (existing) existing.remove();
+    }
+
+    function setMarkdownEditing(cellId) {
+      const cellEl = document.getElementById(`cell-${cellId}`);
+      if (!cellEl) return;
+      const cmHost    = cellEl.querySelector('.cm-host');
+      const renderDiv = cellEl.querySelector('.markdown-render');
+      const hint      = cellEl.querySelector('.markdown-edit-hint');
+
+      if (renderDiv) renderDiv.style.display = 'none';
+      if (hint) hint.style.display = 'none';
+      if (cmHost) cmHost.style.display = '';
+
+      const cm = cellEditors[cellId];
+      if (cm) { cm.refresh(); cm.focus(); }
+    }
+
+    // ── Dropdown helpers ─────────────────────────────────────────────────────
+    let _openMenuId = null;
+    function toggleAddCellMenu(which) {
+      const menuId = `add-cell-menu-${which}`;
+      const isOpen = _openMenuId === menuId;
+      closeAddCellMenu();
+      if (!isOpen) {
+        document.getElementById(menuId)?.classList.add('open');
+        _openMenuId = menuId;
+      }
+    }
+    function closeAddCellMenu() {
+      if (_openMenuId) {
+        document.getElementById(_openMenuId)?.classList.remove('open');
+        _openMenuId = null;
+      }
+    }
+    document.addEventListener('click', (e) => {
+      if (_openMenuId && !e.target.closest('.add-cell-dropdown')) closeAddCellMenu();
+    });
+
+    // ── Parameter cell helpers ────────────────────────────────────────────────
+    const PARAM_DEFS = {
+      generative: [
+        { key: 'temperature',  label: 'Temperature',  min: 0,    max: 2,    step: 0.01, decimals: 2 },
+        { key: 'top_p',        label: 'Top P',         min: 0,    max: 1,    step: 0.01, decimals: 2 },
+        { key: 'top_k',        label: 'Top K',         min: 1,    max: 200,  step: 1,    decimals: 0 },
+        { key: 'max_tokens',   label: 'Max Tokens',    min: 16,   max: 4096, step: 16,   decimals: 0 },
+      ],
+      classifier: [
+        { key: 'confidence_threshold', label: 'Confidence Threshold', min: 0, max: 1, step: 0.01, decimals: 2 },
+      ]
+    };
+
+    function paramsToCode(cell) {
+      const p = cell.params;
+      if (p.modelType === 'generative') {
+        return [
+          '# ── Model Parameters ──────────────────────────',
+          `temperature = ${p.temperature}`,
+          `top_p       = ${p.top_p}`,
+          `top_k       = ${p.top_k}`,
+          `max_tokens  = ${p.max_tokens}`,
+        ].join('\n');
+      } else {
+        return [
+          '# ── Classifier Parameters ─────────────────────',
+          `confidence_threshold = ${p.confidence_threshold}`,
+        ].join('\n');
+      }
+    }
+
+    function buildParamCellBody(cell) {
+      const body = document.createElement('div');
+      body.className = 'param-cell-body';
+      body.id = `param-body-${cell.id}`;
+
+      // View toggle (GUI / Code)
+      const viewBar = document.createElement('div');
+      viewBar.className = 'param-view-bar';
+      viewBar.innerHTML = `
+        <div class="param-view-toggle">
+          <div class="param-view-tab ${cell.paramView !== 'code' ? 'active' : ''}"
+               onclick="setParamView(${cell.id},'gui')">🎛 GUI</div>
+          <div class="param-view-tab ${cell.paramView === 'code' ? 'active' : ''}"
+               onclick="setParamView(${cell.id},'code')">{ } Code</div>
+        </div>`;
+      body.appendChild(viewBar);
+
+      // GUI pane
+      const guiPane = document.createElement('div');
+      guiPane.id = `param-gui-${cell.id}`;
+      guiPane.style.display = cell.paramView === 'code' ? 'none' : '';
+      guiPane.innerHTML = buildParamGuiHTML(cell);
+      body.appendChild(guiPane);
+
+      // Code pane (CodeMirror host)
+      const codePane = document.createElement('div');
+      codePane.className = 'param-code-host';
+      codePane.id = `param-code-${cell.id}`;
+      codePane.style.display = cell.paramView === 'code' ? '' : 'none';
+      body.appendChild(codePane);
+
+      return body;
+    }
+
+    function buildParamGuiHTML(cell) {
+      const p = cell.params;
+      const defs = PARAM_DEFS[p.modelType] || PARAM_DEFS.generative;
+      const typeButtons = ['generative','classifier'].map(t =>
+        `<button class="param-type-btn ${p.modelType === t ? 'active' : ''}"
+                 onclick="setParamModelType(${cell.id},'${t}')">${t === 'generative' ? '✨ Generative' : '🔍 Classifier'}</button>`
+      ).join('');
+
+      const sliders = defs.map(d => {
+        const val = p[d.key] !== undefined ? p[d.key] : 0;
+        return `
+          <div class="param-group">
+            <div class="param-row">
+              <span class="param-name">${d.label}</span>
+              <span class="param-value-badge" id="pval-${cell.id}-${d.key}">${Number(val).toFixed(d.decimals)}</span>
+            </div>
+            <input type="range" class="param-slider"
+              min="${d.min}" max="${d.max}" step="${d.step}" value="${val}"
+              oninput="updateParam(${cell.id},'${d.key}',this.value,${d.decimals})" />
+            <div class="param-range-labels"><span>${d.min}</span><span>${d.max}</span></div>
+          </div>`;
+      }).join('');
+
+      return `
+        <div class="param-model-type">
+          <label>Model Type:</label>${typeButtons}
+        </div>
+        ${sliders}`;
+    }
+
+    function setParamView(cellId, view) {
+      const notebook = getActiveNotebook();
+      if (!notebook) return;
+      const cell = notebook.cells.find(c => c.id === cellId);
+      if (!cell) return;
+
+      cell.paramView = view;
+      updateNotebook();
+
+      const guiPane  = document.getElementById(`param-gui-${cellId}`);
+      const codePane = document.getElementById(`param-code-${cellId}`);
+      const body     = document.getElementById(`param-body-${cellId}`);
+      if (!body) return;
+
+      // Sync code content from current params when switching to code view
+      if (view === 'code') {
+        cell.content = paramsToCode(cell);
+        guiPane.style.display  = 'none';
+        codePane.style.display = '';
+        if (!cellEditors[`p-${cellId}`] && typeof CodeMirror !== 'undefined') {
+          const cm = CodeMirror(codePane, {
+            value: cell.content,
+            mode: 'python', theme: 'material-darker',
+            lineNumbers: true, indentUnit: 4, tabSize: 4,
+            lineWrapping: true,
+            extraKeys: { Tab: cm => cm.replaceSelection('    ') }
+          });
+          cm.on('change', () => {
+            const nb = getActiveNotebook();
+            const c  = nb?.cells.find(c => c.id === cellId);
+            if (c) { c.content = cm.getValue(); updateNotebook(); }
+          });
+          cellEditors[`p-${cellId}`] = cm;
+        } else {
+          cellEditors[`p-${cellId}`]?.setValue(cell.content);
+        }
+        cellEditors[`p-${cellId}`]?.refresh();
+      } else {
+        guiPane.style.display  = '';
+        codePane.style.display = 'none';
+      }
+
+      // Update tab highlight
+      body.querySelectorAll('.param-view-tab').forEach((t, i) => {
+        t.classList.toggle('active', (i === 0 && view === 'gui') || (i === 1 && view === 'code'));
+      });
+    }
+
+    function updateParam(cellId, key, value, decimals) {
+      const notebook = getActiveNotebook();
+      if (!notebook) return;
+      const cell = notebook.cells.find(c => c.id === cellId);
+      if (!cell?.params) return;
+      cell.params[key] = decimals > 0 ? parseFloat(value) : parseInt(value);
+      cell.content = paramsToCode(cell);
+      updateNotebook();
+      const badge = document.getElementById(`pval-${cellId}-${key}`);
+      if (badge) badge.textContent = Number(cell.params[key]).toFixed(decimals);
+    }
+
+    function setParamModelType(cellId, type) {
+      const notebook = getActiveNotebook();
+      if (!notebook) return;
+      const cell = notebook.cells.find(c => c.id === cellId);
+      if (!cell?.params) return;
+      cell.params.modelType = type;
+      cell.content = paramsToCode(cell);
+      updateNotebook();
+      const guiPane = document.getElementById(`param-gui-${cellId}`);
+      if (guiPane) guiPane.innerHTML = buildParamGuiHTML(cell);
+    }
+
+    // ── Training Cell helpers ─────────────────────────────────────────────────
+    const trainingCharts = {};
+    const trainingStreams = {};
+    const trainingPollTimers = {};
+
+    function formatETA(sec) {
+      if (sec === null || sec === undefined || isNaN(sec)) return '—';
+      if (sec < 60) return sec + 's';
+      const m = Math.floor(sec/60);
+      const s = sec % 60;
+      return m + 'm ' + s + 's';
+    }
+
+    function isLargeModelFrontend(modelId) {
+      if (typeof TrainingUI !== 'undefined' && TrainingUI.isLargeModelFrontend) return TrainingUI.isLargeModelFrontend(modelId);
+      const m = String(modelId||'').toLowerCase();
+      const mm = m.match(/(\d+(?:\.\d+)?)\s*b\b/);
+      if (mm) {
+        const num = parseFloat(mm[1]);
+        if (!isNaN(num) && num >= 1) return true;
+      }
+      if (/(?:^|[-_\/\s])(?:1b|1\.5b|3b|7b|8b|13b|30b|70b)(?:$|[-_\/\s])/i.test(m)) return true;
+      return false;
+    }
+
+    function getEffectiveMethod(t) {
+      if (typeof TrainingUI !== 'undefined' && TrainingUI.getEffectiveTrainingMethod) return TrainingUI.getEffectiveTrainingMethod(t);
+      const m = String(t.training_method||'auto').toLowerCase();
+      if (m === 'auto') return isLargeModelFrontend(t.model_id) ? 'lora' : 'full';
+      return m;
+    }
+
+    function buildTrainingCellBody(cell) {
+      if (!cell.training) {
+        cell.training = {
+          model_id: 'distilbert-base-uncased',
+          dataset_id: 'stanfordnlp/imdb',
+          task_type: 'text-classification',
+          epochs: 2,
+          batch_size: 8,
+          learning_rate: 0.00002,
+          max_steps: '',
+          validation_split: 10,
+          training_method: 'auto',
+          lora_r: 8,
+          lora_alpha: 16,
+          lora_dropout: 0.05,
+          target_modules: 'auto',
+          job_id: null,
+          status: 'idle',
+          progress: { current_epoch: 0, current_step: 0, train_loss: null, eval_loss: null, eta: null, gpu_status: 'idle', training_method: 'auto', trainable_params: null, total_params: null },
+          metrics: [],
+          logs: [],
+          _uiCustomizeOpen: false,
+          _uiAdvancedOpen: false,
+          testInput: '',
+          testImageData: null,
+          testMaxTokens: 64,
+          testResult: null,
+          testError: null,
+        };
+      }
+      // ensure UI flags exist (migration)
+      if (cell.training._uiCustomizeOpen === undefined) cell.training._uiCustomizeOpen = false;
+      if (cell.training._uiAdvancedOpen === undefined) cell.training._uiAdvancedOpen = false;
+      const t = cell.training;
+      const wrap = document.createElement('div');
+      wrap.className = 'training-cell-body';
+      wrap.id = `training-body-${cell.id}`;
+
+      const isRunning = ['queued','loading','training','evaluating'].includes(t.status);
+      const locked = isRunning ? 'disabled' : '';
+
+      const effMethod = getEffectiveMethod(t);
+      const isLoraEffective = effMethod === 'lora';
+      const customizeOpen = !!t._uiCustomizeOpen;
+      const advancedOpen = !!t._uiAdvancedOpen;
+      // summary text
+      const summaryText = (typeof TrainingUI !== 'undefined' && TrainingUI.getTrainingSummary) ? TrainingUI.getTrainingSummary(t) : `${t.epochs} epochs \u00b7 batch ${t.batch_size} \u00b7 ${t.validation_split}% validation`;
+      const effLabel = isLoraEffective ? 'LoRA' : (t.training_method === 'auto' ? (isLargeModelFrontend(t.model_id) ? 'LoRA' : 'Full fine-tuning') : (t.training_method === 'lora' ? 'LoRA' : 'Full fine-tuning'));
+      // task explanation
+      const taskExplain = (typeof TrainingUI !== 'undefined' && TrainingUI.getTaskExplanation) ? TrainingUI.getTaskExplanation(t.task_type) : '';
+      // validation & compat will be computed after DOM attached, but initial render
+      const valInfo = (typeof TrainingUI !== 'undefined' && TrainingUI.validateTrainingConfigFrontend) ? TrainingUI.validateTrainingConfigFrontend(t) : {valid:true, errors:{}};
+      const compatInfo = (typeof TrainingUI !== 'undefined' && TrainingUI.getCompatibilityInfo) ? TrainingUI.getCompatibilityInfo(t) : {status:'unknown', message:'Compatibility will be checked when training starts.'};
+      const preview = (typeof TrainingUI !== 'undefined' && TrainingUI.getPreviewData) ? TrainingUI.getPreviewData(t) : {task:t.task_type, model:t.model_id, dataset:t.dataset_id, method:effLabel, epochs:t.epochs, batch_size:t.batch_size, validation:t.validation_split+'%', estimatedSteps:'Estimate unavailable', estimatedTime:'Estimate unavailable', resourceUsage:'Estimate unavailable'};
+
+      // friendly labels for task
+      const taskOptions = [
+        {v:'text-classification', label:'Text classification'},
+        {v:'text-generation', label:'Text generation'},
+        {v:'image-classification', label:'Image classification'},
+        {v:'token-classification', label:'Token classification'},
+      ];
+
+      wrap.innerHTML = `
+        <div class="train-beginner-grid">
+          <div>
+            <div class="train-header-title"><span class="icon">\uD83E\uDDE0</span> Train Model</div>
+            <div class="train-subtitle">Fine-tune a model on your dataset — start with the basics, then customize.</div>
+          </div>
+
+          <div>
+            <div class="train-section-label">What should it learn? <span class="train-help-tooltip" data-tooltip="Choose the kind of task you want the model to learn. You can change this later.">?</span></div>
+            <div class="training-field">
+              <select id="tr-${cell.id}-task" ${locked} onchange="updateTrainingField(${cell.id},'task_type',this.value)">
+                ${taskOptions.map(o=>`<option value="${o.v}" ${t.task_type===o.v?'selected':''}>${o.label}</option>`).join('')}
+              </select>
+              <div class="train-task-explanation" id="tr-${cell.id}-task-explain">${taskExplain}</div>
+              <div class="train-field-error" id="tr-${cell.id}-err-task"></div>
+            </div>
+          </div>
+
+          <div>
+            <div class="train-section-label">Model <span class="train-help-tooltip" data-tooltip="The AI model you\u2019ll train. For example: distilbert-base-uncased">?</span></div>
+            <div class="training-field">
+              <input type="text" id="tr-${cell.id}-model" class="train-input" value="${String(t.model_id).replace(/"/g,'&quot;')}" placeholder="distilbert-base-uncased or owner/model-name" ${locked} oninput="updateTrainingField(${cell.id},'model_id',this.value)" />
+              <div class="train-field-hint">The AI model you\u2019ll train.</div>
+              <div class="train-field-error" id="tr-${cell.id}-err-model"></div>
+            </div>
+          </div>
+
+          <div>
+            <div class="train-section-label">Dataset <span class="train-help-tooltip" data-tooltip="The examples the model will learn from. For example: stanfordnlp/imdb">?</span></div>
+            <div class="training-field">
+              <input type="text" id="tr-${cell.id}-dataset" class="train-input" value="${String(t.dataset_id).replace(/"/g,'&quot;')}" placeholder="stanfordnlp/imdb or owner/dataset-name" ${locked} oninput="updateTrainingField(${cell.id},'dataset_id',this.value)" />
+              <div class="train-field-hint">The examples the model will learn from.</div>
+              <div class="train-field-error" id="tr-${cell.id}-err-dataset"></div>
+            </div>
+          </div>
+
+          <div class="train-divider"></div>
+
+          <div class="train-summary-strip" id="tr-${cell.id}-summary-strip">
+            <span>Training: <strong id="tr-${cell.id}-summary-text">${summaryText}</strong></span>
+            <span style="font-size:10px;background:#1e293b;border:1px solid #334155;border-radius:20px;padding:3px 8px;color:#94a3b8;" id="tr-${cell.id}-summary-method">${effLabel}</span>
+          </div>
+
+          <button class="train-customize-toggle ${customizeOpen?'open':''}" id="tr-${cell.id}-customize-toggle" onclick="toggleCustomizeSettings(${cell.id})">${customizeOpen?'▾ Customize settings':'▸ Customize settings'}</button>
+
+          <div class="train-customize-panel ${customizeOpen?'open':''}" id="tr-${cell.id}-customize-panel">
+            <div class="train-customize-grid">
+              <div class="training-field">
+                <label>Epochs <span class="train-help-tooltip" data-tooltip="How many times the model sees the training dataset.">?</span></label>
+                <input type="number" id="tr-${cell.id}-epochs" class="train-input" min="1" max="5" step="1" value="${t.epochs}" ${locked} oninput="updateTrainingField(${cell.id},'epochs',this.value)" />
+                <div class="train-field-hint">How many times the model sees the training dataset.</div>
+                <div class="train-field-error" id="tr-${cell.id}-err-epochs"></div>
+              </div>
+              <div class="training-field">
+                <label>Batch size <span class="train-help-tooltip" data-tooltip="How many examples the model processes at once. Larger batches usually need more memory.">?</span></label>
+                <input type="number" id="tr-${cell.id}-batch" class="train-input" min="1" max="32" step="1" value="${t.batch_size}" ${locked} oninput="updateTrainingField(${cell.id},'batch_size',this.value)" />
+                <div class="train-field-hint">How many examples the model processes at once.</div>
+                <div class="train-field-error" id="tr-${cell.id}-err-batch_size"></div>
+              </div>
+              <div class="training-field">
+                <label>Learning rate <span class="train-help-tooltip" data-tooltip="How strongly the model changes its parameters during training.">?</span></label>
+                <input type="number" id="tr-${cell.id}-lr" class="train-input" step="0.000001" value="${t.learning_rate}" ${locked} oninput="updateTrainingField(${cell.id},'learning_rate',this.value)" />
+                <div class="train-field-hint">How strongly the model changes its parameters during training.</div>
+                <div class="train-field-error" id="tr-${cell.id}-err-learning_rate"></div>
+              </div>
+              <div class="training-field">
+                <label>Validation split (%) <span class="train-help-tooltip" data-tooltip="The percentage of examples kept aside to check whether the model generalizes to data it wasn\u2019t trained on.">?</span></label>
+                <input type="number" id="tr-${cell.id}-vs" class="train-input" min="0" max="50" step="1" value="${t.validation_split}" ${locked} oninput="updateTrainingField(${cell.id},'validation_split',this.value)" />
+                <div class="train-field-hint">The percentage of examples kept aside to check generalization.</div>
+                <div class="train-field-error" id="tr-${cell.id}-err-validation_split"></div>
+              </div>
+              <div class="training-field" style="grid-column:1 / -1;">
+                <label>Training method <span class="train-help-tooltip" data-tooltip="Claro.AI can automatically pick the best method. LoRA trains a small set of additional parameters for large models.">?</span></label>
+                <select id="tr-${cell.id}-method" ${locked} onchange="updateTrainingMethod(${cell.id},this.value)">
+                  <option value="auto" ${t.training_method==='auto'?'selected':''}>Recommended</option>
+                  <option value="full" ${t.training_method==='full'?'selected':''}>Full fine-tuning</option>
+                  <option value="lora" ${t.training_method==='lora'?'selected':''}>LoRA</option>
+                </select>
+                <div class="train-field-hint" id="tr-${cell.id}-method-hint">${t.training_method==='auto' ? 'Claro.AI automatically chooses the best training method for the model.' : (t.training_method==='full' ? 'Updates the model\u2019s existing parameters. Best for smaller models.' : 'Trains a small set of additional parameters. Usually much more efficient for large models.')}</div>
+                <div class="train-field-error" id="tr-${cell.id}-err-training_method"></div>
+              </div>
+            </div>
+
+            <button class="train-advanced-toggle ${advancedOpen?'open':''}" id="tr-${cell.id}-advanced-toggle" style="${isLoraEffective ? '' : 'display:none;'}" onclick="toggleAdvancedSettings(${cell.id})">${advancedOpen?'▾ Advanced (LoRA)':'▸ Advanced (LoRA)'}</button>
+            <div class="train-advanced-panel ${advancedOpen && isLoraEffective?'open':''}" id="tr-${cell.id}-advanced-panel" style="${isLoraEffective ? '' : 'display:none;'}">
+              <div style="font-size:11px;color:#64748b;margin-bottom:8px;font-style:italic;">LoRA lets large models learn by updating a much smaller set of parameters.</div>
+              <div class="lora-grid">
+                <div class="training-field">
+                  <label>LoRA rank (r)</label>
+                  <input type="number" id="tr-${cell.id}-lora_r" class="train-input" min="1" max="64" step="1" value="${t.lora_r}" ${locked} oninput="updateTrainingField(${cell.id},'lora_r',this.value)" />
+                  <div class="train-field-error" id="tr-${cell.id}-err-lora_r"></div>
+                </div>
+                <div class="training-field">
+                  <label>LoRA alpha</label>
+                  <input type="number" id="tr-${cell.id}-lora_alpha" class="train-input" min="1" max="128" step="1" value="${t.lora_alpha}" ${locked} oninput="updateTrainingField(${cell.id},'lora_alpha',this.value)" />
+                  <div class="train-field-error" id="tr-${cell.id}-err-lora_alpha"></div>
+                </div>
+                <div class="training-field">
+                  <label>LoRA dropout</label>
+                  <input type="number" id="tr-${cell.id}-lora_dropout" class="train-input" min="0" max="0.5" step="0.01" value="${t.lora_dropout}" ${locked} oninput="updateTrainingField(${cell.id},'lora_dropout',this.value)" />
+                  <div class="train-field-error" id="tr-${cell.id}-err-lora_dropout"></div>
+                </div>
+                <div class="training-field">
+                  <label>target_modules</label>
+                  <input type="text" id="tr-${cell.id}-target" class="train-input" placeholder="auto" value="${String(t.target_modules).replace(/"/g,'&quot;')}" ${locked} oninput="updateTrainingField(${cell.id},'target_modules',this.value)" />
+                  <div class="train-field-hint">auto = infer from architecture. Comma-separated to override.</div>
+                  <div class="train-field-error" id="tr-${cell.id}-err-target_modules"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="train-compat-box ${compatInfo.status}" id="tr-${cell.id}-compat" style="${compatInfo.status==='ok' || compatInfo.status==='error' || compatInfo.status==='unknown' ? '' : 'display:none;'}">
+            <div id="tr-${cell.id}-compat-text">${compatInfo.message || ''}</div>
+            ${compatInfo.status==='error' && compatInfo.fix ? `<button class="train-compat-fix" id="tr-${cell.id}-compat-fix" onclick="fixCompatibility(${cell.id})">Fix automatically</button><div style="font-size:11px;color:#64748b;margin-top:4px;">${compatInfo.fix}</div>` : ''}
+          </div>
+
+          <div class="train-preview-box" id="tr-${cell.id}-preview">
+            <h4>Training preview</h4>
+            <div class="train-preview-grid">
+              <span class="train-preview-label">Task</span><span class="train-preview-value" id="tr-${cell.id}-pv-task">${preview.task}</span>
+              <span class="train-preview-label">Model</span><span class="train-preview-value" id="tr-${cell.id}-pv-model">${String(preview.model).slice(0,64)}</span>
+              <span class="train-preview-label">Dataset</span><span class="train-preview-value" id="tr-${cell.id}-pv-dataset">${String(preview.dataset).slice(0,64)}</span>
+              <span class="train-preview-label">Method</span><span class="train-preview-value" id="tr-${cell.id}-pv-method">${preview.method}</span>
+              <span class="train-preview-label">Epochs</span><span class="train-preview-value" id="tr-${cell.id}-pv-epochs">${preview.epochs}</span>
+              <span class="train-preview-label">Batch size</span><span class="train-preview-value" id="tr-${cell.id}-pv-batch">${preview.batch_size}</span>
+              <span class="train-preview-label">Validation</span><span class="train-preview-value" id="tr-${cell.id}-pv-val">${preview.validation}</span>
+            </div>
+            <div class="train-preview-divider"></div>
+            <div class="train-preview-grid">
+              <span class="train-preview-label">Estimated steps</span><span class="train-preview-value" id="tr-${cell.id}-pv-steps">${preview.estimatedSteps}</span>
+              <span class="train-preview-label">Estimated time</span><span class="train-preview-value" id="tr-${cell.id}-pv-time">${preview.estimatedTime}</span>
+              <span class="train-preview-label">Resource usage</span><span class="train-preview-value" id="tr-${cell.id}-pv-resource">${preview.resourceUsage}</span>
+            </div>
+          </div>
+
+          <div class="train-validation-box ${valInfo.valid ? 'good' : 'error'}" id="tr-${cell.id}-validation">
+            <span id="tr-${cell.id}-validation-icon">${valInfo.valid ? '\u2713' : '\u274C'}</span>
+            <span id="tr-${cell.id}-validation-text">${valInfo.valid ? 'Configuration looks good' : Object.values(valInfo.errors)[0] || 'Check the highlighted fields.'}</span>
+          </div>
+
+          <div class="train-start-wrap">
+            <button class="training-btn primary" id="tr-${cell.id}-start" onclick="startTrainingCell(${cell.id})" ${isRunning ? 'disabled' : (valInfo.valid ? '' : 'disabled')}>🚀 Start Training</button>
+          </div>
+          <div style="display:flex;gap:8px;justify-content:center;">
+            <button class="training-btn stop" id="tr-${cell.id}-stop" onclick="showStopConfirm(${cell.id})" ${!isRunning ? 'disabled style="opacity:0.5;cursor:not-allowed;"' : ''}>⏹ Stop</button>
+          </div>
+          <div class="train-stop-confirm" id="tr-${cell.id}-stop-confirm">
+            <p><strong>Stop this training run?</strong><br>The current run will be stopped. The resulting model may be incomplete.</p>
+            <div class="train-stop-confirm-actions">
+              <button class="training-btn secondary" onclick="cancelStopTraining(${cell.id})">Cancel</button>
+              <button class="training-btn stop" onclick="confirmStopTraining(${cell.id})">Stop Training</button>
+            </div>
+          </div>
+
+          <div class="training-status-row" id="tr-${cell.id}-statusrow" style="justify-content:center;">
+            <span class="training-status-badge ${t.status}" id="tr-${cell.id}-badge">${t.status}</span>
+            <span class="training-gpu-badge"><span class="training-gpu-dot ${t.status}" id="tr-${cell.id}-gpudot"></span><span id="tr-${cell.id}-gputext">${t.progress?.gpu_status || 'idle'}</span></span>
+            ${t.job_id ? `<span style="font-size:11px;color:#64748b;font-family:monospace;">${t.job_id}</span>` : ''}
+          </div>
+          ${t.status==='failed' && t.error ? `<div id="tr-${cell.id}-errorbox" style="background:rgba(239,68,68,0.12);border:1px solid #dc2626;border-radius:8px;padding:10px 12px;color:#fecaca;font-size:12px;font-family:Consolas,monospace;white-space:pre-wrap;word-break:break-word;">${(typeof TrainingUI!=='undefined'&&TrainingUI.translateBackendError) ? TrainingUI.translateBackendError(t.error) : t.error}<br><span style="color:#fca5a5;font-size:11px;">${(t.logs||[]).slice(-2).join('<br>').slice(0,600)}</span><div style="margin-top:8px;"><a href="#" onclick="event.preventDefault(); toggleTrainingLogs(${cell.id})" style="color:#60a5fa;font-size:11px;">Training Logs</a></div></div>` : `<div id="tr-${cell.id}-errorbox" style="display:none;"></div>`}
+
+          <div class="training-metrics-grid" id="tr-${cell.id}-metrics">
+            <div class="training-metric-card"><div class="training-metric-label">Epoch</div><div class="training-metric-value" id="tr-${cell.id}-epoch">${t.progress?.current_epoch ?? 0}</div></div>
+            <div class="training-metric-card"><div class="training-metric-label">Step</div><div class="training-metric-value" id="tr-${cell.id}-step">${t.progress?.current_step ?? 0}</div></div>
+            <div class="training-metric-card"><div class="training-metric-label">Train Loss</div><div class="training-metric-value" id="tr-${cell.id}-train">${t.progress?.train_loss != null ? Number(t.progress.train_loss).toFixed(4) : '—'}</div></div>
+            <div class="training-metric-card"><div class="training-metric-label">Val Loss</div><div class="training-metric-value" id="tr-${cell.id}-eval">${t.progress?.eval_loss != null ? Number(t.progress.eval_loss).toFixed(4) : '—'}</div></div>
+            <div class="training-metric-card"><div class="training-metric-label">ETA</div><div class="training-metric-value small" id="tr-${cell.id}-eta">${formatETA(t.progress?.eta)}</div></div>
+            <div class="training-metric-card"><div class="training-metric-label">GPU</div><div class="training-metric-value small" id="tr-${cell.id}-gpu">${t.progress?.gpu_status || 'idle'}</div></div>
+            <div class="training-metric-card"><div class="training-metric-label">Trainable</div><div class="training-metric-value small" id="tr-${cell.id}-trainable">${t.progress?.trainable_params ? `${(t.progress.trainable_params/1000).toFixed(1)}k / ${(t.progress.total_params/1000000).toFixed(2)}M (${(t.progress.trainable_params/t.progress.total_params*100).toFixed(2)}%)` : (t.progress?.training_method==='lora' || effMethod==='lora' ? 'LoRA' : 'Full')}</div></div>
+          </div>
+
+          <div id="tr-${cell.id}-complete" style="${t.status==='finished' ? '' : 'display:none;'}">
+            ${t.status==='finished' ? `<div class="training-complete" id="tr-${cell.id}-complete-inner"><h4>✅ Training complete</h4><div style="font-size:12px;color:#94a3b8;">Loading artifacts...</div></div>` : ''}
+          </div>
+
+          <div class="test-model-box" id="tr-${cell.id}-test-box" style="${t.status==='finished' ? '' : 'display:none;'}">
+            <h4>🧪 Test your trained model</h4>
+            <div class="test-model-identity" id="tr-${cell.id}-test-identity">
+              Using your trained model<br>
+              <strong>${String(t.model_id).slice(0,48)} · ${isLoraEffective ? 'LoRA' : 'Full'}${isLoraEffective ? ' <span style="font-weight:normal;color:#94a3b8;">(Base: '+String(t.model_id).slice(0,32)+')</span>' : ''}</strong><br>
+              <span style="font-size:11px;color:#64748b;">Task: ${t.task_type}</span>
+            </div>
+            <div id="tr-${cell.id}-test-input-area"></div>
+            <div style="margin-top:10px; display:flex; gap:8px; align-items:center;">
+              <button class="test-run-btn" id="tr-${cell.id}-run-test" onclick="runTestModel(${cell.id})">Run Test</button>
+              <button class="test-clear-btn" id="tr-${cell.id}-clear-test" onclick="clearTestModel(${cell.id})" style="display:none;">Clear</button>
+              <span id="tr-${cell.id}-test-loading" style="font-size:12px;color:#f59e0b;display:none;">Testing trained model…</span>
+            </div>
+            <div class="test-error-box" id="tr-${cell.id}-test-error" style="display:none;"></div>
+            <div class="test-result-box" id="tr-${cell.id}-test-result" style="display:none;"></div>
+          </div>
+
+          <div class="training-chart-wrap">
+            <h4>📈 Loss — training vs validation</h4>
+            <canvas id="tr-${cell.id}-chart" height="180"></canvas>
+          </div>
+
+          <div class="training-logs" id="tr-${cell.id}-logs" style="${t.logs && t.logs.length ? '' : 'display:none;'}">${(t.logs || []).slice(-40).join('\n')}</div>
+          <div style="font-size:11px;color:#475569;margin-top:-8px;display:${t.logs && t.logs.length ? 'block' : 'none'};" id="tr-${cell.id}-logs-toggle"><a href="#" onclick="event.preventDefault(); toggleTrainingLogs(${cell.id})" style="color:#64748b;">Training Logs</a> — click to expand/collapse</div>
+        </div>
+      `;
+
+      // init chart after DOM attach
+      setTimeout(() => initTrainingChart(cell.id), 50);
+      // if job is running, re-attach SSE
+      if (t.job_id && isRunning) {
+        setTimeout(() => attachTrainingSSE(cell.id, t.job_id), 300);
+      }
+      // initial validation UI and test model input
+      setTimeout(() => updateTrainingValidationUI(cell.id), 10);
+      if (t.status === 'finished') {
+        setTimeout(() => renderTestModelInput(cell.id), 20);
+      }
+      return wrap;
+    }
+
+    const MAX_TRAIN_EPOCHS = 5;
+
+    function toggleCustomizeSettings(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training) return;
+      cell.training._uiCustomizeOpen = !cell.training._uiCustomizeOpen;
+      // if closing, also close advanced
+      if (!cell.training._uiCustomizeOpen) cell.training._uiAdvancedOpen = false;
+      updateNotebook();
+      const panel = document.getElementById(`tr-${cellId}-customize-panel`);
+      const toggle = document.getElementById(`tr-${cellId}-customize-toggle`);
+      if (panel && toggle) {
+        if (cell.training._uiCustomizeOpen) {
+          panel.classList.add('open');
+          panel.style.display = '';
+          toggle.classList.add('open');
+          toggle.textContent = '\u25BE Customize settings';
+        } else {
+          panel.classList.remove('open');
+          panel.style.display = 'none';
+          toggle.classList.remove('open');
+          toggle.textContent = '\u25B8 Customize settings';
+        }
+      }
+      // also sync advanced visibility based on effective method
+      syncAdvancedVisibility(cellId);
+    }
+
+    function toggleAdvancedSettings(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training) return;
+      cell.training._uiAdvancedOpen = !cell.training._uiAdvancedOpen;
+      updateNotebook();
+      const panel = document.getElementById(`tr-${cellId}-advanced-panel`);
+      const toggle = document.getElementById(`tr-${cellId}-advanced-toggle`);
+      if (panel && toggle) {
+        if (cell.training._uiAdvancedOpen) {
+          panel.classList.add('open');
+          panel.style.display = '';
+          toggle.classList.add('open');
+          toggle.textContent = '\u25BE Advanced (LoRA)';
+        } else {
+          panel.classList.remove('open');
+          panel.style.display = 'none';
+          toggle.classList.remove('open');
+          toggle.textContent = '\u25B8 Advanced (LoRA)';
+        }
+      }
+    }
+
+    function syncAdvancedVisibility(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training) return;
+      const eff = getEffectiveMethod(cell.training);
+      const isLora = eff === 'lora';
+      const advToggle = document.getElementById(`tr-${cellId}-advanced-toggle`);
+      const advPanel = document.getElementById(`tr-${cellId}-advanced-panel`);
+      if (advToggle) advToggle.style.display = isLora ? '' : 'none';
+      if (advPanel) {
+        if (!isLora) {
+          advPanel.style.display = 'none';
+          advPanel.classList.remove('open');
+        } else if (cell.training._uiAdvancedOpen) {
+          advPanel.style.display = '';
+          advPanel.classList.add('open');
+        }
+      }
+      // also update method hint
+      const hint = document.getElementById(`tr-${cellId}-method-hint`);
+      if (hint) {
+        const m = cell.training.training_method;
+        if (m === 'auto') hint.textContent = 'Claro.AI automatically chooses the best training method for the model.';
+        else if (m === 'full') hint.textContent = 'Updates the model\u2019s existing parameters. Best for smaller models.';
+        else hint.textContent = 'Trains a small set of additional parameters. Usually much more efficient for large models.';
+      }
+    }
+
+    function updateTrainingValidationUI(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training) return;
+      const t = cell.training;
+      const ui = (typeof TrainingUI !== 'undefined') ? TrainingUI : null;
+      const validation = ui ? ui.validateTrainingConfigFrontend(t) : {valid:true, errors:{}};
+      const compat = ui ? ui.getCompatibilityInfo(t) : {status:'unknown', message:'Compatibility will be checked when training starts.'};
+      const preview = ui ? ui.getPreviewData(t) : null;
+
+      // Update field errors
+      const fieldMap = {
+        'model_id': 'model',
+        'dataset_id': 'dataset',
+        'task_type': 'task',
+        'epochs': 'epochs',
+        'batch_size': 'batch_size',
+        'learning_rate': 'learning_rate',
+        'validation_split': 'validation_split',
+        'training_method': 'training_method',
+        'lora_r': 'lora_r',
+        'lora_alpha': 'lora_alpha',
+        'lora_dropout': 'lora_dropout',
+        'target_modules': 'target_modules',
+        'max_steps': 'max_steps'
+      };
+      for (const [key, suffix] of Object.entries(fieldMap)) {
+        const errEl = document.getElementById(`tr-${cellId}-err-${suffix}`);
+        const inputEl = document.getElementById(`tr-${cellId}-${suffix === 'model' ? 'model' : suffix === 'dataset' ? 'dataset' : suffix === 'task' ? 'task' : suffix === 'batch_size' ? 'batch' : suffix === 'validation_split' ? 'vs' : suffix === 'learning_rate' ? 'lr' : suffix === 'lora_r' ? 'lora_r' : suffix === 'lora_alpha' ? 'lora_alpha' : suffix === 'lora_dropout' ? 'lora_dropout' : suffix === 'target_modules' ? 'target' : suffix}`);
+        // fallback for ids: we have specific ids for some
+        let actualInput = inputEl;
+        if (!actualInput) {
+          // try alternative ids
+          actualInput = document.getElementById(`tr-${cellId}-${suffix}`);
+        }
+        const msg = validation.errors[key];
+        if (errEl) {
+          if (msg) {
+            errEl.textContent = msg;
+            errEl.classList.add('visible');
+          } else {
+            errEl.textContent = '';
+            errEl.classList.remove('visible');
+          }
+        }
+        if (actualInput) {
+          if (msg) actualInput.classList.add('invalid');
+          else actualInput.classList.remove('invalid');
+        }
+      }
+      // special for model/dataset generic target id
+      const modelErr = validation.errors['model_id'];
+      const modelInput = document.getElementById(`tr-${cellId}-model`);
+      const modelErrEl = document.getElementById(`tr-${cellId}-err-model`);
+      if (modelErrEl) { if (modelErr) { modelErrEl.textContent = modelErr; modelErrEl.classList.add('visible'); } else { modelErrEl.textContent=''; modelErrEl.classList.remove('visible'); } }
+      if (modelInput) { if (modelErr) modelInput.classList.add('invalid'); else modelInput.classList.remove('invalid'); }
+      const datasetErr = validation.errors['dataset_id'];
+      const datasetInput = document.getElementById(`tr-${cellId}-dataset`);
+      const datasetErrEl = document.getElementById(`tr-${cellId}-err-dataset`);
+      if (datasetErrEl) { if (datasetErr) { datasetErrEl.textContent = datasetErr; datasetErrEl.classList.add('visible'); } else { datasetErrEl.textContent=''; datasetErrEl.classList.remove('visible'); } }
+      if (datasetInput) { if (datasetErr) datasetInput.classList.add('invalid'); else datasetInput.classList.remove('invalid'); }
+
+      // Update validation box
+      const valBox = document.getElementById(`tr-${cellId}-validation`);
+      const valText = document.getElementById(`tr-${cellId}-validation-text`);
+      const valIcon = document.getElementById(`tr-${cellId}-validation-icon`);
+      if (valBox && valText && valIcon) {
+        if (validation.valid && compat.status !== 'error') {
+          valBox.className = 'train-validation-box good';
+          valIcon.textContent = '\u2713';
+          valText.textContent = compat.status === 'unknown' ? 'Configuration looks good' : (compat.message || 'Configuration looks good');
+        } else if (compat.status === 'error') {
+          valBox.className = 'train-validation-box error';
+          valIcon.textContent = '\u274C';
+          valText.textContent = compat.message;
+        } else {
+          valBox.className = 'train-validation-box error';
+          valIcon.textContent = '\u274C';
+          const firstErr = Object.values(validation.errors)[0];
+          valText.textContent = firstErr || 'Check the highlighted fields.';
+        }
+      }
+
+      // Update compat box
+      const compatBox = document.getElementById(`tr-${cellId}-compat`);
+      const compatText = document.getElementById(`tr-${cellId}-compat-text`);
+      if (compatBox && compatText) {
+        if (compat.status === 'error') {
+          compatBox.className = 'train-compat-box error';
+          compatBox.style.display = '';
+          compatText.textContent = compat.message;
+          // update fix button if exists
+          const fixBtn = document.getElementById(`tr-${cellId}-compat-fix`);
+          if (fixBtn) fixBtn.style.display = '';
+        } else if (compat.status === 'ok') {
+          compatBox.className = 'train-compat-box ok';
+          compatBox.style.display = '';
+          compatText.textContent = compat.message;
+          const fixBtn = document.getElementById(`tr-${cellId}-compat-fix`);
+          if (fixBtn) fixBtn.style.display = 'none';
+        } else if (compat.status === 'unknown') {
+          compatBox.className = 'train-compat-box unknown';
+          compatBox.style.display = '';
+          compatText.textContent = compat.message;
+          const fixBtn = document.getElementById(`tr-${cellId}-compat-fix`);
+          if (fixBtn) fixBtn.style.display = 'none';
+        } else {
+          compatBox.style.display = 'none';
+        }
+      }
+
+      // Update preview
+      if (preview) {
+        const setIf = (id, val) => {
+          const el = document.getElementById(id);
+          if (el) el.textContent = val;
+        };
+        setIf(`tr-${cellId}-pv-task`, preview.task);
+        setIf(`tr-${cellId}-pv-model`, String(preview.model).slice(0,64));
+        setIf(`tr-${cellId}-pv-dataset`, String(preview.dataset).slice(0,64));
+        setIf(`tr-${cellId}-pv-method`, preview.method);
+        setIf(`tr-${cellId}-pv-epochs`, preview.epochs);
+        setIf(`tr-${cellId}-pv-batch`, preview.batch_size);
+        setIf(`tr-${cellId}-pv-val`, preview.validation);
+        setIf(`tr-${cellId}-pv-steps`, preview.estimatedSteps);
+        setIf(`tr-${cellId}-pv-time`, preview.estimatedTime);
+        setIf(`tr-${cellId}-pv-resource`, preview.resourceUsage);
+      }
+
+      // Update summary strip
+      const summaryEl = document.getElementById(`tr-${cellId}-summary-text`);
+      const summaryMethodEl = document.getElementById(`tr-${cellId}-summary-method`);
+      if (summaryEl) {
+        const s = ui ? ui.getTrainingSummary(t) : `${t.epochs} epochs \u00b7 batch ${t.batch_size} \u00b7 ${t.validation_split}% validation`;
+        summaryEl.textContent = s;
+      }
+      if (summaryMethodEl) {
+        const eff = getEffectiveMethod(t);
+        summaryMethodEl.textContent = eff === 'lora' ? 'LoRA' : 'Full fine-tuning';
+      }
+
+      // Update task explanation
+      const taskExplainEl = document.getElementById(`tr-${cellId}-task-explain`);
+      if (taskExplainEl && ui) {
+        taskExplainEl.textContent = ui.getTaskExplanation(t.task_type) || '';
+      }
+
+      // Disable start if invalid or running or compat error
+      const isRunning = ['queued','loading','training','evaluating'].includes(t.status);
+      const startBtn = document.getElementById(`tr-${cellId}-start`);
+      if (startBtn) {
+        const shouldDisable = isRunning || !validation.valid || compat.status === 'error';
+        startBtn.disabled = shouldDisable;
+        startBtn.title = !validation.valid ? 'Fix the highlighted fields before starting' : (compat.status==='error' ? 'Fix compatibility issue before starting' : '');
+      }
+
+      // Sync advanced visibility
+      syncAdvancedVisibility(cellId);
+    }
+
+    function fixCompatibility(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training || typeof TrainingUI === 'undefined') return;
+      const info = TrainingUI.getCompatibilityInfo(cell.training);
+      if (info.status !== 'error') return;
+      // Simple safe fixes
+      if (info.code === 'dataset_task_mismatch') {
+        // If image dataset but text task => switch to image task
+        // If text dataset but image task => switch to text
+        const dataset = String(cell.training.dataset_id).toLowerCase();
+        const isImageDataset = ['cifar','imagenet','mnist','coco','fashion','flowers','food101','celeba','voc','cityscapes'].some(k=>dataset.includes(k));
+        if (isImageDataset && cell.training.task_type !== 'image-classification') {
+          cell.training.task_type = 'image-classification';
+        } else if (!isImageDataset && cell.training.task_type === 'image-classification') {
+          cell.training.task_type = 'text-classification';
+        }
+      } else if (info.code === 'model_task_mismatch') {
+        const task = cell.training.task_type;
+        if (task === 'image-classification') {
+          // suggest text task? easier to switch task to match model
+          // if model is texty, switch task to text
+          cell.training.task_type = 'text-classification';
+        } else {
+          cell.training.task_type = 'image-classification';
+        }
+      }
+      updateNotebook();
+      // Rebuild UI or at least update fields
+      const taskSel = document.getElementById(`tr-${cellId}-task`);
+      if (taskSel) taskSel.value = cell.training.task_type;
+      updateTrainingValidationUI(cellId);
+    }
+
+    function showStopConfirm(cellId) {
+      const el = document.getElementById(`tr-${cellId}-stop-confirm`);
+      if (el) el.classList.add('visible');
+    }
+    function cancelStopTraining(cellId) {
+      const el = document.getElementById(`tr-${cellId}-stop-confirm`);
+      if (el) el.classList.remove('visible');
+    }
+    async function confirmStopTraining(cellId) {
+      const el = document.getElementById(`tr-${cellId}-stop-confirm`);
+      if (el) el.classList.remove('visible');
+      await stopTrainingCell(cellId, {caller:'user Stop confirm', userInitiated:true});
+    }
+    function toggleTrainingLogs(cellId) {
+      const el = document.getElementById(`tr-${cellId}-logs`);
+      if (!el) return;
+      el.style.display = el.style.display === 'none' ? '' : 'none';
+    }
+
+    // ── Test Model playground ─────────────────────────────────────────────
+    function getTestPlaceholder(task) {
+      if (task === 'text-classification') return 'This movie was absolutely fantastic!';
+      if (task === 'text-generation') return 'Once upon a time,';
+      if (task === 'token-classification') return 'John lives in Tokyo';
+      if (task === 'image-classification') return '';
+      return 'Hello, world!';
+    }
+    function getTestHint(task) {
+      if (task === 'text-classification') return 'Try something like: \u201CThis movie was surprisingly good.\u201D';
+      if (task === 'text-generation') return 'Try something like: \u201COnce upon a time there was a brave knight...\u201D';
+      if (task === 'token-classification') return 'Try something like: \u201CHugging Face was founded in New York.\u201D';
+      if (task === 'image-classification') return 'Upload an image to test your trained model.';
+      return '';
+    }
+
+    function renderTestModelInput(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(cc => cc.id === cellId);
+      if (!cell || !cell.training) return;
+      const t = cell.training;
+      const area = document.getElementById(`tr-${cellId}-test-input-area`);
+      if (!area) return;
+      const task = t.task_type;
+      // persist testInput if not present
+      if (t.testInput === undefined) t.testInput = '';
+      if (t.testMaxTokens === undefined) t.testMaxTokens = 64;
+      if (t.testImageData === undefined) t.testImageData = null;
+
+      let html = '';
+      if (task === 'text-classification') {
+        html = `
+          <div class="test-input-label">Your input</div>
+          <div class="test-input-hint">${getTestHint(task)}</div>
+          <textarea class="test-textarea" id="tr-${cellId}-test-input" rows="3" placeholder="${getTestPlaceholder(task)}" oninput="updateTestInput(${cellId}, this.value)">${(t.testInput || '').replace(/</g,'&lt;')}</textarea>
+        `;
+      } else if (task === 'text-generation') {
+        html = `
+          <div class="test-input-label">Prompt</div>
+          <div class="test-input-hint">${getTestHint(task)}</div>
+          <textarea class="test-textarea" id="tr-${cellId}-test-input" rows="3" placeholder="${getTestPlaceholder(task)}" oninput="updateTestInput(${cellId}, this.value)">${(t.testInput || '').replace(/</g,'&lt;')}</textarea>
+          <div style="margin-top:8px; display:flex; align-items:center; gap:8px;">
+            <span class="test-input-label" style="margin:0;">Max new tokens</span>
+            <input type="number" min="1" max="512" value="${t.testMaxTokens}" style="width:80px; padding:6px; background:#0a101f; border:1px solid #334155; border-radius:6px; color:#e2e8f0;" oninput="updateTestMaxTokens(${cellId}, this.value)" />
+          </div>
+        `;
+      } else if (task === 'token-classification') {
+        html = `
+          <div class="test-input-label">Your input</div>
+          <div class="test-input-hint">${getTestHint(task)}</div>
+          <input type="text" class="test-input-text" id="tr-${cellId}-test-input" placeholder="${getTestPlaceholder(task)}" value="${(t.testInput || '').replace(/"/g,'&quot;')}" oninput="updateTestInput(${cellId}, this.value)" />
+        `;
+      } else if (task === 'image-classification') {
+        const hasImg = !!t.testImageData;
+        html = `
+          <div class="test-input-label">Image input</div>
+          <div class="test-input-hint">${getTestHint(task)}</div>
+          <div class="test-image-drop" id="tr-${cellId}-image-drop" onclick="document.getElementById('tr-${cellId}-image-file').click()" ondragover="handleImageDragOver(event, ${cellId})" ondragleave="handleImageDragLeave(event, ${cellId})" ondrop="handleImageDrop(event, ${cellId})">
+            ${hasImg ? `<img src="${t.testImageData}" class="test-image-preview" id="tr-${cellId}-image-preview" />` : `<div>Drop an image here<br>or<br><strong>Choose Image</strong></div>`}
+            <input type="file" id="tr-${cellId}-image-file" accept="image/*" style="display:none;" onchange="handleImageFileSelect(event, ${cellId})" />
+          </div>
+          ${hasImg ? `<div style="text-align:center; margin-top:8px;"><button class="test-clear-btn" onclick="clearTestImage(${cellId})">Remove image</button></div>` : ''}
+        `;
+      } else {
+        html = `
+          <div class="test-input-label">Your input</div>
+          <textarea class="test-textarea" id="tr-${cellId}-test-input" rows="3" placeholder="${getTestPlaceholder(task)}" oninput="updateTestInput(${cellId}, this.value)">${(t.testInput || '').replace(/</g,'&lt;')}</textarea>
+        `;
+      }
+      area.innerHTML = html;
+      // restore result if exists
+      if (t.testResult) {
+        renderTestResult(cellId, t.testResult);
+      }
+      // restore error if exists
+      if (t.testError) {
+        showTestError(cellId, t.testError);
+      }
+    }
+
+    function updateTestInput(cellId, val) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(cc => cc.id === cellId);
+      if (!cell || !cell.training) return;
+      cell.training.testInput = val;
+      // clear previous error/result when user edits
+      // keep result visible until next run? spec says keep latest visible, so don't clear
+      updateNotebook();
+    }
+    function updateTestMaxTokens(cellId, val) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(cc => cc.id === cellId);
+      if (!cell || !cell.training) return;
+      cell.training.testMaxTokens = Math.min(512, Math.max(1, parseInt(val,10) || 64));
+      updateNotebook();
+    }
+    function handleImageFileSelect(event, cellId) {
+      const file = event.target.files && event.target.files[0];
+      if (!file) return;
+      handleTestImageFile(cellId, file);
+    }
+    function handleImageDragOver(event, cellId) {
+      event.preventDefault();
+      const el = document.getElementById(`tr-${cellId}-image-drop`);
+      if (el) el.classList.add('dragover');
+    }
+    function handleImageDragLeave(event, cellId) {
+      const el = document.getElementById(`tr-${cellId}-image-drop`);
+      if (el) el.classList.remove('dragover');
+    }
+    function handleImageDrop(event, cellId) {
+      event.preventDefault();
+      const el = document.getElementById(`tr-${cellId}-image-drop`);
+      if (el) el.classList.remove('dragover');
+      const file = event.dataTransfer.files && event.dataTransfer.files[0];
+      if (file) handleTestImageFile(cellId, file);
+    }
+    function handleTestImageFile(cellId, file) {
+      if (!file.type.startsWith('image/')) {
+        showTestError(cellId, '\u274C Please select an image file.');
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        const nb = getActiveNotebook();
+        const cell = nb?.cells.find(cc => cc.id === cellId);
+        if (!cell || !cell.training) return;
+        cell.training.testImageData = e.target.result;
+        // persist file name hint (not weights)
+        cell.training.testInput = file.name;
+        updateNotebook();
+        renderTestModelInput(cellId);
+      };
+      reader.readAsDataURL(file);
+    }
+    function clearTestImage(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(cc => cc.id === cellId);
+      if (!cell || !cell.training) return;
+      cell.training.testImageData = null;
+      cell.training.testInput = '';
+      updateNotebook();
+      renderTestModelInput(cellId);
+      clearTestError(cellId);
+      const resEl = document.getElementById(`tr-${cellId}-test-result`);
+      if (resEl) { resEl.style.display='none'; resEl.innerHTML=''; }
+    }
+    function showTestError(cellId, msg) {
+      const el = document.getElementById(`tr-${cellId}-test-error`);
+      if (!el) return;
+      el.textContent = msg;
+      el.style.display = '';
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(cc => cc.id === cellId);
+      if (cell && cell.training) { cell.training.testError = msg; updateNotebook(); }
+    }
+    function clearTestError(cellId) {
+      const el = document.getElementById(`tr-${cellId}-test-error`);
+      if (el) { el.style.display='none'; el.textContent=''; }
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(cc => cc.id === cellId);
+      if (cell && cell.training) { cell.training.testError = null; }
+    }
+    function renderTestResult(cellId, data) {
+      const el = document.getElementById(`tr-${cellId}-test-result`);
+      const clearBtn = document.getElementById(`tr-${cellId}-clear-test`);
+      if (!el) return;
+      const task = data.task || (getActiveNotebook()?.cells.find(cc=>cc.id===cellId)?.training?.task_type) || '';
+      let html = '<div class="test-result-label">Result</div>';
+      if (task === 'text-classification' && data.scores) {
+        const pred = data.prediction || data.scores[0];
+        html += `<div class="test-result-main">${pred.label} <span style="font-size:12px;color:#94a3b8;">${(pred.score*100).toFixed(1)}%</span></div>`;
+        html += '<div class="test-result-scores">';
+        for (const s of data.scores.slice(0,5)) {
+          const isBest = s.label === pred.label;
+          html += `<div class="test-score-row ${isBest?'best':''}"><span>${s.label}</span><span>${(s.score*100).toFixed(1)}%</span></div>`;
+        }
+        html += '</div>';
+      } else if (task === 'image-classification' && data.scores) {
+        const pred = data.prediction || data.scores[0];
+        html += `<div class="test-result-main">${pred.label} <span style="font-size:12px;color:#94a3b8;">${(pred.score*100).toFixed(1)}%</span></div>`;
+        html += '<div class="test-result-scores">';
+        for (const s of data.scores.slice(0,5)) {
+          const isBest = s.label === pred.label;
+          html += `<div class="test-score-row ${isBest?'best':''}"><span>${s.label}</span><span>${(s.score*100).toFixed(1)}%</span></div>`;
+        }
+        html += '</div>';
+      } else if (task === 'token-classification' && data.tokens) {
+        html += '<table class="test-token-table"><tr><th>Token</th><th>Label</th></tr>';
+        for (const tok of data.tokens) {
+          const cls = tok.label === 'O' ? 'O' : '';
+          html += `<tr><td>${tok.token}</td><td><span class="test-token-tag ${cls}">${tok.label}</span></td></tr>`;
+        }
+        html += '</table>';
+        if (data.entities && data.entities.length) {
+          html += '<div style="margin-top:8px; font-size:11px; color:#64748b;">Entities: ' + data.entities.map(e=>e.token+':'+e.label).join(', ') + '</div>';
+        }
+      } else if (task === 'text-generation' || data.output !== undefined) {
+        html += `<div class="test-result-main" style="font-size:13px; font-weight:500; white-space:pre-wrap; background:#0a101f; border:1px solid #1e293b; border-radius:8px; padding:10px;">${String(data.output).replace(/</g,'&lt;')}</div>`;
+      } else {
+        html += `<div class="test-result-main" style="font-size:13px; white-space:pre-wrap;">${String(data.output || JSON.stringify(data)).replace(/</g,'&lt;')}</div>`;
+      }
+      el.innerHTML = html;
+      el.style.display = '';
+      if (clearBtn) clearBtn.style.display = '';
+      // persist
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(cc => cc.id === cellId);
+      if (cell && cell.training) { cell.training.testResult = data; cell.training.testError = null; updateNotebook(); }
+    }
+    function clearTestModel(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(cc => cc.id === cellId);
+      if (!cell || !cell.training) return;
+      cell.training.testInput = '';
+      cell.training.testImageData = null;
+      cell.training.testResult = null;
+      cell.training.testError = null;
+      updateNotebook();
+      renderTestModelInput(cellId);
+      const resEl = document.getElementById(`tr-${cellId}-test-result`);
+      if (resEl) { resEl.style.display='none'; resEl.innerHTML=''; }
+      clearTestError(cellId);
+      const clearBtn = document.getElementById(`tr-${cellId}-clear-test`);
+      if (clearBtn) clearBtn.style.display='none';
+    }
+    async function runTestModel(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(cc => cc.id === cellId);
+      if (!cell || !cell.training) return;
+      const t = cell.training;
+      if (t.status !== 'finished' || !t.job_id) {
+        showTestError(cellId, '\u274C Training not finished yet.');
+        return;
+      }
+      if (!t.task_type) {
+        showTestError(cellId, '\u274C Unknown task type.');
+        return;
+      }
+      const runBtn = document.getElementById(`tr-${cellId}-run-test`);
+      const loading = document.getElementById(`tr-${cellId}-test-loading`);
+      const errorEl = document.getElementById(`tr-${cellId}-test-error`);
+      const resultEl = document.getElementById(`tr-${cellId}-test-result`);
+      // Prevent duplicate clicks
+      if (runBtn && runBtn.disabled) return;
+      // Validate input per task
+      let prompt = null;
+      let imageB64 = null;
+      if (t.task_type === 'image-classification') {
+        if (!t.testImageData) {
+          showTestError(cellId, '\u274C Please select an image first.');
+          return;
+        }
+        imageB64 = t.testImageData;
+      } else {
+        // text tasks
+        const inputEl = document.getElementById(`tr-${cellId}-test-input`);
+        const val = inputEl ? inputEl.value.trim() : (t.testInput || '').trim();
+        if (!val) {
+          showTestError(cellId, '\u274C Please enter some input.');
+          return;
+        }
+        prompt = val;
+        t.testInput = val;
+        updateNotebook();
+      }
+
+      // Loading state
+      if (runBtn) runBtn.disabled = true;
+      if (loading) loading.style.display = '';
+      if (errorEl) { errorEl.style.display='none'; errorEl.textContent=''; }
+      if (resultEl) { resultEl.style.display='none'; resultEl.innerHTML=''; }
+      clearTestError(cellId);
+
+      try {
+        const body = { job_id: t.job_id, task: t.task_type };
+        if (t.task_type === 'text-generation') {
+          body.prompt = prompt;
+          body.max_new_tokens = t.testMaxTokens || 64;
+        } else if (t.task_type === 'image-classification') {
+          body.image_base64 = imageB64;
+          // also send task explicitly
+        } else {
+          body.prompt = prompt;
+        }
+        // SECURITY: only job_id, never artifact_path
+        console.log(`[TEST-MODEL] POST /api/inference/trained job_id=${t.job_id} task=${t.task_type} prompt=${(prompt||'').slice(0,50)} hasImage=${!!imageB64}`);
+
+        const url = new URL('/api/inference/trained', window.location.href).toString();
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        const data = await res.json().catch(()=>({}));
+        if (!res.ok) {
+          const msg = data.error || `HTTP ${res.status}`;
+          // translate friendly
+          let friendly = msg;
+          const low = String(msg).toLowerCase();
+          if (low.includes('artifact') || low.includes('job not finished') || low.includes('missing')) {
+            friendly = '\u274C Could not load the trained model.\nThe saved training artifact may be missing.';
+          } else if (low.includes('task') || low.includes('cannot perform')) {
+            friendly = '\u274C This trained model cannot perform this task.';
+          } else if (low.includes('not found') || low.includes('invalid job')) {
+            friendly = '\u274C Could not find the trained model. Try retraining.';
+          } else {
+            friendly = '\u274C Inference failed.\nCheck the training logs for more information.\n' + String(msg).slice(0,400);
+          }
+          throw new Error(friendly);
+        }
+        // Ensure response is from trained artifact, not base fallback (check that raw contains no fallback error)
+        // Server guarantees trained model only; if we get here, it's real
+        const resultData = data.raw || data;
+        // Normalize for rendering: ensure task field present
+        resultData.task = resultData.task || t.task_type;
+        renderTestResult(cellId, resultData);
+      } catch (err) {
+        const msg = err.message || String(err);
+        // Do not expose raw traceback in main UI; show friendly
+        if (msg.includes('Traceback') || msg.includes('File \"')) {
+          showTestError(cellId, '\u274C Inference failed.\nCheck the training logs for more information.');
+          console.error('[TEST-MODEL] raw error', err);
+        } else {
+          showTestError(cellId, msg);
+        }
+      } finally {
+        if (runBtn) runBtn.disabled = false;
+        if (loading) loading.style.display = 'none';
+      }
+    }
+
+    function updateTrainingField(cellId, key, value) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training) return;
+      if (['epochs','batch_size','validation_split','max_steps','lora_r','lora_alpha'].includes(key)) {
+        if (value === '' && key === 'max_steps') cell.training[key] = '';
+        else cell.training[key] = value === '' ? '' : Number(value);
+      } else if (['learning_rate','lora_dropout'].includes(key)) {
+        cell.training[key] = Number(value);
+      } else if (key === 'target_modules') {
+        cell.training[key] = String(value).trim() || 'auto';
+      } else {
+        cell.training[key] = value;
+      }
+      updateNotebook();
+      updateTrainingValidationUI(cellId);
+    }
+
+    function updateTrainingMethod(cellId, value) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training) return;
+      cell.training.training_method = value;
+      updateNotebook();
+      updateTrainingValidationUI(cellId);
+    }
+
+    function initTrainingChart(cellId) {
+      const canvas = document.getElementById(`tr-${cellId}-chart`);
+      if (!canvas || typeof Chart === 'undefined') return;
+      if (trainingCharts[cellId]) {
+        try { trainingCharts[cellId].destroy(); } catch(_) {}
+      }
+      const ctx = canvas.getContext('2d');
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      const metrics = cell?.training?.metrics || [];
+      const labels = metrics.map(m => m.step);
+      const trainData = metrics.map(m => m.train_loss);
+      const evalData = metrics.map(m => m.eval_loss ?? null);
+
+      trainingCharts[cellId] = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: labels,
+          datasets: [
+            {
+              label: 'Training Loss',
+              data: trainData,
+              borderColor: '#22c55e',
+              backgroundColor: 'rgba(34,197,94,0.08)',
+              tension: 0.3,
+              pointRadius: 0,
+              borderWidth: 2,
+              spanGaps: true,
+            },
+            {
+              label: 'Validation Loss',
+              data: evalData,
+              borderColor: '#60a5fa',
+              backgroundColor: 'rgba(96,165,250,0.08)',
+              tension: 0.3,
+              pointRadius: 2,
+              pointBackgroundColor: '#60a5fa',
+              borderWidth: 2,
+              spanGaps: true,
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: false,
+          interaction: { intersect: false, mode: 'index' },
+          plugins: {
+            legend: { labels: { color: '#94a3b8', font: { size: 11 }, boxWidth: 14 } },
+          },
+          scales: {
+            x: {
+              title: { display: true, text: 'Steps', color: '#64748b', font: { size: 11 } },
+              ticks: { color: '#64748b', maxTicksLimit: 8 },
+              grid: { color: 'rgba(51,65,85,0.4)' },
+            },
+            y: {
+              title: { display: true, text: 'Loss', color: '#64748b', font: { size: 11 } },
+              ticks: { color: '#64748b' },
+              grid: { color: 'rgba(51,65,85,0.4)' },
+            }
+          }
+        }
+      });
+      // fix container height
+      canvas.parentElement.style.height = '220px';
+    }
+
+    function updateTrainingChart(cellId, metric) {
+      const chart = trainingCharts[cellId];
+      if (!chart) return;
+      chart.data.labels.push(metric.step);
+      chart.data.datasets[0].data.push(metric.train_loss);
+      chart.data.datasets[1].data.push(metric.eval_loss ?? null);
+      // keep last 80 points visible, but store all
+      if (chart.data.labels.length > 80) {
+        // shift window — but keep full data for later? just shift
+        // we keep all; chart will handle scroll via maxTicksLimit
+      }
+      chart.update('none');
+    }
+
+    function renderTrainingStatus(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training) return;
+      const t = cell.training;
+      const badge = document.getElementById(`tr-${cellId}-badge`);
+      const gdot = document.getElementById(`tr-${cellId}-gpudot`);
+      const gtxt = document.getElementById(`tr-${cellId}-gputext`);
+      const epochEl = document.getElementById(`tr-${cellId}-epoch`);
+      const stepEl = document.getElementById(`tr-${cellId}-step`);
+      const trainEl = document.getElementById(`tr-${cellId}-train`);
+      const evalEl = document.getElementById(`tr-${cellId}-eval`);
+      const etaEl = document.getElementById(`tr-${cellId}-eta`);
+      const gpuEl = document.getElementById(`tr-${cellId}-gpu`);
+      if (badge) { badge.textContent = t.status; badge.className = 'training-status-badge ' + t.status; }
+      if (gdot) gdot.className = 'training-gpu-dot ' + t.status;
+      if (gtxt) gtxt.textContent = t.progress?.gpu_status || t.status;
+      if (epochEl) epochEl.textContent = t.progress?.current_epoch ?? 0;
+      if (stepEl) stepEl.textContent = t.progress?.current_step ?? 0;
+      if (trainEl) trainEl.textContent = t.progress?.train_loss != null ? Number(t.progress.train_loss).toFixed(4) : '—';
+      if (evalEl) evalEl.textContent = t.progress?.eval_loss != null ? Number(t.progress.eval_loss).toFixed(4) : '—';
+      if (etaEl) etaEl.textContent = formatETA(t.progress?.eta);
+      if (gpuEl) gpuEl.textContent = t.progress?.gpu_status || 'idle';
+      const trEl = document.getElementById(`tr-${cellId}-trainable`);
+      if (trEl) {
+        if (t.progress?.trainable_params && t.progress?.total_params) {
+          const pct = (t.progress.trainable_params / t.progress.total_params * 100).toFixed(2);
+          trEl.textContent = `${(t.progress.trainable_params/1000).toFixed(1)}k / ${(t.progress.total_params/1000000).toFixed(2)}M (${pct}%)`;
+        } else if (t.progress?.training_method === 'lora' || t.training_method === 'lora' || (t.training_method === 'auto' && isLargeModelFrontend(t.model_id))) {
+          trEl.textContent = 'LoRA';
+        } else {
+          trEl.textContent = 'Full';
+        }
+      }
+      // keep LoRA/Advanced visibility in sync with effective method
+      try { syncAdvancedVisibility(cellId); } catch(_) {}
+
+      // locks
+      const formInputs = document.querySelectorAll(`#training-body-${cellId} input, #training-body-${cellId} select`);
+      const isRunning = ['queued','loading','training','evaluating'].includes(t.status);
+      formInputs.forEach(el => el.disabled = isRunning);
+      const startBtn = document.getElementById(`tr-${cellId}-start`);
+      const stopBtn = document.getElementById(`tr-${cellId}-stop`);
+      // start button also respects validation errors (updateTrainingValidationUI will re-evaluate)
+      if (startBtn) {
+        if (isRunning) startBtn.disabled = true;
+        else {
+          // let validation decide, but at least ensure not running
+          if (typeof TrainingUI !== 'undefined' && TrainingUI.validateTrainingConfigFrontend) {
+            const v = TrainingUI.validateTrainingConfigFrontend(t);
+            const c = TrainingUI.getCompatibilityInfo(t);
+            startBtn.disabled = !v.valid || c.status === 'error';
+          } else {
+            startBtn.disabled = false;
+          }
+        }
+      }
+      if (stopBtn) stopBtn.disabled = !isRunning;
+      // also update validation UI for live status changes (e.g., after start)
+      try { updateTrainingValidationUI(cellId); } catch(_) {}
+      // Test Model box: only for finished, hide otherwise
+      try {
+        const testBox = document.getElementById(`tr-${cellId}-test-box`);
+        if (testBox) {
+          if (t.status === 'finished' && t.job_id) {
+            testBox.style.display = '';
+            // ensure inputs rendered (after first time)
+            if (!testBox.dataset.rendered) {
+              testBox.dataset.rendered = '1';
+              setTimeout(() => renderTestModelInput(cellId), 10);
+            } else {
+              // update identity line when model/method changes (rare after finish)
+              const ident = document.getElementById(`tr-${cellId}-test-identity`);
+              if (ident) {
+                const eff = getEffectiveMethod(t);
+                ident.innerHTML = `Using your trained model<br><strong>${String(t.model_id).slice(0,48)} \u00b7 ${eff==='lora'?'LoRA':'Full'}${eff==='lora' ? ' <span style="font-weight:normal;color:#94a3b8;">(Base: '+String(t.model_id).slice(0,32)+')</span>' : ''}</strong><br><span style="font-size:11px;color:#64748b;">Task: ${t.task_type}</span>`;
+              }
+            }
+          } else {
+            testBox.style.display = 'none';
+          }
+        }
+      } catch(_) {}
+
+      // header buttons too
+      const cellEl = document.getElementById(`cell-${cellId}`);
+      if (cellEl) {
+        const hStart = cellEl.querySelector('.cell-controls .run');
+        const hStop = cellEl.querySelectorAll('.cell-controls button')[1];
+        if (hStart) hStart.disabled = isRunning;
+        if (hStop) hStop.disabled = !isRunning;
+      }
+
+      // error box — show training_error clearly
+      const errBox = document.getElementById(`tr-${cellId}-errorbox`);
+      if (errBox) {
+        if (t.status === 'failed' && t.error) {
+          errBox.style.display = '';
+          const tail = (t.logs || []).slice(-2).join('<br>').slice(0,600);
+          errBox.innerHTML = `❌ training_error: ${String(t.error).slice(0,600)}${t.error === 'training_error' && tail ? '<br><span style="color:#fca5a5;font-size:11px;">' + tail + '</span>' : ''}`;
+        } else {
+          errBox.style.display = 'none';
+          errBox.innerHTML = '';
+        }
+      }
+
+      // training complete section — fetch artifacts if finished
+      if (t.status === 'finished' && t.job_id) {
+        const comp = document.getElementById(`tr-${cellId}-complete`);
+        if (comp && !comp.dataset.loaded) {
+          comp.dataset.loaded = '1';
+          setTimeout(() => renderTrainingComplete(cellId), 100);
+        }
+      }
+    }
+
+    function formatFileSize(bytes) {
+      if (bytes == null || isNaN(bytes)) return '—';
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
+      return (bytes/1024/1024).toFixed(2) + ' MB';
+    }
+
+    async function renderTrainingComplete(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training || !cell.training.job_id) return;
+      const jobId = cell.training.job_id;
+      const container = document.getElementById(`tr-${cellId}-complete`);
+      if (!container) return;
+      container.style.display = '';
+      const inner = document.getElementById(`tr-${cellId}-complete-inner`);
+      if (inner) inner.innerHTML = `<h4>✅ Training complete</h4><div style="font-size:12px;color:#94a3b8;">Loading artifacts for ${jobId}...</div>`;
+      else container.innerHTML = `<div class="training-complete"><h4>✅ Training complete</h4><div style="font-size:12px;color:#94a3b8;">Loading artifacts...</div></div>`;
+
+      try {
+        const artUrl = new URL(`/api/train/artifacts/${encodeURIComponent(jobId)}`, window.location.href).toString();
+        console.log(`[TRAIN-DIAG] fetch artifacts ${artUrl} href=${window.location.href}`);
+        const res = await fetch(artUrl);
+        console.log(`[TRAIN-DIAG] artifacts response status=${res.status} content-type=${res.headers.get('content-type')}`);
+        const data = await res.json();
+        console.log(`[TRAIN-DIAG] artifacts data`, data);
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        // data: {ready, training_method, base_model_id, task_type, artifact_dir, adapter_dir, model_dir, files, ...}
+        const isLora = data.training_method === 'lora';
+        const trainable = cell.training.progress?.trainable_params;
+        const total = cell.training.progress?.total_params;
+        const pct = trainable && total ? (trainable/total*100).toFixed(2) : null;
+        const finalTrain = cell.training.progress?.train_loss != null ? Number(cell.training.progress.train_loss).toFixed(4) : '—';
+        const finalEval = cell.training.progress?.eval_loss != null ? Number(cell.training.progress.eval_loss).toFixed(4) : '—';
+        let filesHtml = '';
+        try {
+          const sizes = [];
+          for (const f of (data.files||[]).slice(0,6)) {
+            sizes.push(f);
+          }
+          filesHtml = sizes.join(', ');
+        } catch(_) {}
+
+        let html = `<div class="training-complete" id="tr-${cellId}-complete-inner">`;
+        html += `<h4>✅ Training complete — ${isLora ? 'LoRA' : 'Full'} </h4>`;
+        html += `<div class="training-complete-row"><span>Model</span><strong>${data.base_model_id || cell.training.model_id}</strong></div>`;
+        html += `<div class="training-complete-row"><span>Method</span><strong>${isLora ? 'LoRA' : 'Full Fine-tuning'}</strong></div>`;
+        if (isLora && trainable) {
+          html += `<div class="training-complete-row"><span>Trainable</span><strong>${(trainable/1000).toFixed(1)}k / ${(total/1000000).toFixed(2)}M (${pct}%)</strong></div>`;
+          html += `<div class="training-complete-row"><span>Base model</span><strong>${data.base_model_id}</strong></div>`;
+          html += `<div class="training-complete-row"><span>Adapter</span><strong style="font-size:11px;word-break:break-all;">${data.adapter_dir}</strong></div>`;
+          // try to get adapter size
+          try {
+            const adapterSize = data.files.includes('adapter_model.safetensors') ? 'adapter present' : '';
+            html += `<div class="training-complete-row"><span>Adapter files</span><strong>${filesHtml}</strong></div>`;
+          } catch(_) {}
+        } else if (!isLora) {
+          html += `<div class="training-complete-row"><span>Trained model</span><strong style="font-size:11px;word-break:break-all;">${data.model_dir}</strong></div>`;
+          html += `<div class="training-complete-row"><span>Model files</span><strong>${filesHtml}</strong></div>`;
+        }
+        html += `<div class="training-complete-row"><span>Final train loss</span><strong>${finalTrain}</strong></div>`;
+        html += `<div class="training-complete-row"><span>Final eval loss</span><strong>${finalEval}</strong></div>`;
+        html += `<button class="training-complete-btn" onclick="useTrainedInInference(${cellId}, '${jobId}')">Use in Inference Cell →</button>`;
+        html += `</div>`;
+        container.innerHTML = html;
+        container.style.display = '';
+      } catch (err) {
+        container.innerHTML = `<div class="training-complete" style="border-color:#dc2626;background:rgba(239,68,68,0.08);"><h4 style="color:#fecaca;">⚠️ Not inference-ready</h4><div style="font-size:12px;color:#fca5a5;white-space:pre-wrap;">${String(err.message).slice(0,600)}</div></div>`;
+        container.style.display = '';
+      }
+    }
+
+    async function useTrainedInInference(cellId, jobId) {
+      // Fetch artifact metadata server-side (never trust client path)
+      let data;
+      try {
+        const artUrl2 = new URL(`/api/train/artifacts/${encodeURIComponent(jobId)}`, window.location.href).toString();
+        console.log(`[TRAIN-DIAG] useTrained fetch ${artUrl2}`);
+        const res = await fetch(artUrl2);
+        console.log(`[TRAIN-DIAG] useTrained response status=${res.status}`);
+        data = await res.json();
+        console.log(`[TRAIN-DIAG] useTrained data`, data);
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      } catch (err) {
+        alert(`Cannot use training: ${err.message}`);
+        return;
+      }
+
+      const nb = getActiveNotebook();
+      if (!nb) return;
+
+      // Do not silently overwrite — always create a new inference cell pair
+      const isLora = data.training_method === 'lora';
+      const baseModelId = data.base_model_id;
+      const task = data.task_type || 'text-classification';
+      const adapterPath = data.adapter_dir; // for LoRA
+      const modelPath = data.model_dir; // for full
+
+      // Build a new model cell + inference cell for the trained artifact
+      const modelCellId = nb.nextCellId++;
+      const inferenceCellId = nb.nextCellId++;
+
+      const modelCell = {
+        id: modelCellId,
+        type: 'model',
+        content: '', // will be filled with trained loader code
+        output: '',
+        status: 'idle',
+        outputFormat: 'text',
+        modelInfo: {
+          id: isLora ? baseModelId : modelPath,
+          task: task,
+          isTrained: true,
+          job_id: jobId,
+          training_method: data.training_method,
+          base_model_id: baseModelId,
+          adapter_path: isLora ? adapterPath : null,
+          model_dir: modelPath,
+          artifact_dir: data.artifact_dir,
+        }
+      };
+
+      // Build trained loader code that uses existing loader architecture + PEFT for LoRA
+      let loaderCode = '';
+      if (isLora) {
+        loaderCode = `# --- Trained LoRA Loader (from ${jobId}) ---
+# Base: ${baseModelId}
+# Adapter: ${adapterPath}
+from transformers import AutoTokenizer, AutoConfig
+from peft import PeftModel
+import torch
+
+BASE_MODEL_ID = ${JSON.stringify(baseModelId)}
+ADAPTER_DIR = ${JSON.stringify(adapterPath)}
+
+# Reuse existing loader logic for base model
+from transformers import AutoModelForSequenceClassification, AutoModelForCausalLM, AutoModelForTokenClassification, AutoModelForImageClassification
+from hf_loader.model_inspector import inspect
+from hf_loader.loader_strategies import resolve_loader
+import importlib
+
+ctx = inspect(BASE_MODEL_ID)
+plan = resolve_loader(ctx)
+print(f"Base loader: {plan.auto_model_class} trust_remote_code={plan.trust_remote_code}")
+
+# Load base model + tokenizer via existing HF logic (auto-detect)
+# For LoRA inference, we load the base as the same task head used in training
+_task = ${JSON.stringify(task)}
+if _task == "text-classification":
+    from transformers import AutoModelForSequenceClassification
+    base_model = AutoModelForSequenceClassification.from_pretrained(BASE_MODEL_ID, trust_remote_code=plan.trust_remote_code)
+elif _task == "token-classification":
+    from transformers import AutoModelForTokenClassification
+    base_model = AutoModelForTokenClassification.from_pretrained(BASE_MODEL_ID, trust_remote_code=plan.trust_remote_code)
+elif _task == "image-classification":
+    from transformers import AutoModelForImageClassification
+    base_model = AutoModelForImageClassification.from_pretrained(BASE_MODEL_ID, trust_remote_code=plan.trust_remote_code)
+else:
+    from transformers import AutoModelForCausalLM
+    base_model = AutoModelForCausalLM.from_pretrained(BASE_MODEL_ID, trust_remote_code=plan.trust_remote_code)
+
+# Load tokenizer from adapter (saved) or base
+try:
+    tokenizer = AutoTokenizer.from_pretrained(ADAPTER_DIR, trust_remote_code=plan.trust_remote_code)
+except Exception:
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID, trust_remote_code=plan.trust_remote_code)
+if tokenizer.pad_token is None and tokenizer.eos_token:
+    tokenizer.pad_token = tokenizer.eos_token
+
+# Load adapter
+model = PeftModel.from_pretrained(base_model, ADAPTER_DIR)
+model.eval()
+preprocessor = tokenizer
+processor = None
+feature_extractor = None
+loaded_class = plan.auto_model_class + " + LoRA"
+print(f"Loaded LoRA adapter from {ADAPTER_DIR}")
+print(f"Trainable: {model.get_nb_trainable_parameters() if hasattr(model, 'get_nb_trainable_parameters') else 'unknown'}")
+`;
+      } else {
+        loaderCode = `# --- Trained Full Model Loader (from ${jobId}) ---
+# Model: ${modelPath}
+from transformers import AutoTokenizer, AutoConfig
+import torch
+
+MODEL_DIR = ${JSON.stringify(modelPath)}
+# Use existing loader to inspect, but load from local path
+from hf_loader.model_inspector import inspect
+from hf_loader.loader_strategies import resolve_loader
+
+ctx = inspect(MODEL_DIR)
+plan = resolve_loader(ctx)
+print(f"Loader: {plan.auto_model_class} from {MODEL_DIR}")
+
+# Load model + tokenizer from trained output (local)
+from transformers import AutoModel
+# Try task-specific class first
+_task = ${JSON.stringify(task)}
+model = None
+tokenizer = None
+try:
+    if _task == "text-classification":
+        from transformers import AutoModelForSequenceClassification
+        model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR)
+    elif _task == "token-classification":
+        from transformers import AutoModelForTokenClassification
+        model = AutoModelForTokenClassification.from_pretrained(MODEL_DIR)
+    elif _task == "image-classification":
+        from transformers import AutoModelForImageClassification
+        model = AutoModelForImageClassification.from_pretrained(MODEL_DIR)
+    else:
+        from transformers import AutoModelForCausalLM
+        model = AutoModelForCausalLM.from_pretrained(MODEL_DIR)
+except Exception as e:
+    print(f"task-specific load failed: {e}, trying AutoModel")
+    from transformers import AutoModel
+    model = AutoModel.from_pretrained(MODEL_DIR)
+
+from transformers import AutoTokenizer
+try:
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+except Exception:
+    tokenizer = AutoTokenizer.from_pretrained(${JSON.stringify(baseModelId)})
+
+if tokenizer.pad_token is None and tokenizer.eos_token:
+    tokenizer.pad_token = tokenizer.eos_token
+
+preprocessor = tokenizer
+processor = None
+feature_extractor = None
+loaded_class = plan.auto_model_class + " (trained)"
+model.eval()
+print(f"Loaded trained model from {MODEL_DIR}")
+`;
+      }
+
+      modelCell.content = loaderCode;
+      modelCell.modelInfo.inferenceCellId = inferenceCellId;
+
+      // Use existing task template for inference, but ensure it uses preprocessor/model from loader
+      const inferenceCode = generateTaskTemplate(task);
+      const inferenceCell = {
+        id: inferenceCellId,
+        type: 'code',
+        content: inferenceCode,
+        output: '',
+        status: 'idle',
+        outputFormat: 'text',
+        modelInfo: {
+          role: 'inference',
+          loaderCellId: modelCellId,
+          modelId: isLora ? baseModelId : modelPath,
+          adapter_path: isLora ? adapterPath : null,
+          task: task,
+          job_id: jobId,
+          isTrained: true,
+          training_method: data.training_method,
+        }
+      };
+
+      // Insert after the training cell (safer than overwriting)
+      const idx = nb.cells.findIndex(c => c.id === cellId);
+      const insertAt = idx >= 0 ? idx + 1 : nb.cells.length;
+      nb.cells.splice(insertAt, 0, modelCell, inferenceCell);
+
+      // Persist job_id reference for reload
+      updateNotebook();
+      renderNotebookEditor();
+
+      // Scroll to new cells
+      setTimeout(() => {
+        const el = document.getElementById(`cell-${modelCellId}`);
+        if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }, 100);
+    }
+
+    async function startTrainingCell(cellId) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training) return;
+      const t = cell.training;
+
+      // --- Frontend guardrails: validate before sending ---
+      if (typeof TrainingUI !== 'undefined' && TrainingUI.validateTrainingConfigFrontend) {
+        const v = TrainingUI.validateTrainingConfigFrontend(t);
+        const compat = TrainingUI.getCompatibilityInfo(t);
+        updateTrainingValidationUI(cellId);
+        if (!v.valid) {
+          const first = Object.values(v.errors)[0];
+          // show inline already via updateTrainingValidationUI, also ensure customization open to reveal errors if hidden
+          if (!cell.training._uiCustomizeOpen) {
+            cell.training._uiCustomizeOpen = true;
+            updateNotebook();
+            renderNotebookEditor();
+          }
+          return;
+        }
+        if (compat.status === 'error') {
+          if (!cell.training._uiCustomizeOpen) {
+            cell.training._uiCustomizeOpen = true;
+            updateNotebook();
+            renderNotebookEditor();
+          }
+          return;
+        }
+      } else {
+        if (!t.model_id || !t.dataset_id) {
+          alert('Model ID and Dataset ID are required');
+          return;
+        }
+      }
+
+      // reset previous state if finished/failed
+      if (['finished','failed','idle'].includes(t.status)) {
+        t.metrics = [];
+        t.logs = [];
+        t.progress = { current_epoch: 0, current_step: 0, train_loss: null, eval_loss: null, eta: null, gpu_status: 'idle', training_method: t.training_method, trainable_params: null, total_params: null };
+        if (trainingCharts[cellId]) {
+          try { trainingCharts[cellId].destroy(); } catch(_) {}
+          delete trainingCharts[cellId];
+          setTimeout(() => initTrainingChart(cellId), 100);
+        }
+      }
+
+      t.status = 'queued';
+      renderTrainingStatus(cellId);
+      updateNotebook();
+
+      // close old stream
+      if (trainingStreams[cellId]) {
+        try { trainingStreams[cellId].close(); } catch(_) {}
+        delete trainingStreams[cellId];
+      }
+      if (trainingPollTimers[cellId]) {
+        clearInterval(trainingPollTimers[cellId]);
+        delete trainingPollTimers[cellId];
+      }
+
+      try {
+        const startUrl = new URL('/api/train/start', window.location.href).toString();
+        const startBody = {
+          model_id: t.model_id,
+          dataset_id: t.dataset_id,
+          task_type: t.task_type,
+          epochs: Number(t.epochs),
+          batch_size: Number(t.batch_size),
+          learning_rate: Number(t.learning_rate),
+          max_steps: t.max_steps === '' || t.max_steps == null ? null : Number(t.max_steps),
+          validation_split: Number(t.validation_split),
+          training_method: t.training_method,
+          lora_r: Number(t.lora_r),
+          lora_alpha: Number(t.lora_alpha),
+          lora_dropout: Number(t.lora_dropout),
+          target_modules: t.target_modules,
+        };
+        console.log(`[TRAIN-DIAG] POST ${startUrl} body=`, startBody, ` href=${window.location.href}`);
+        const res = await fetch(startUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(startBody)
+        });
+        console.log(`[TRAIN-DIAG] POST response status=${res.status} content-type=${res.headers.get('content-type')}`);
+        const data = await res.json();
+        console.log(`[TRAIN-DIAG] POST response data=`, data);
+        if (!res.ok) throw new Error(data.error || 'Failed to start training');
+
+        t.job_id = data.job_id;
+        t.status = data.status || 'queued';
+        updateNotebook();
+        renderTrainingStatus(cellId);
+        // persist job_id in header
+        const statusRow = document.getElementById(`tr-${cellId}-statusrow`);
+        if (statusRow && data.job_id) {
+          const existing = statusRow.querySelector('span:last-child');
+          if (existing && existing.textContent.includes('train_')) existing.textContent = data.job_id;
+          else {
+            const span = document.createElement('span');
+            span.style.cssText = 'font-size:11px;color:#64748b;font-family:monospace;';
+            span.textContent = data.job_id;
+            statusRow.appendChild(span);
+          }
+        }
+        attachTrainingSSE(cellId, data.job_id);
+      } catch (err) {
+        t.status = 'failed';
+        t.logs.push('❌ ' + err.message);
+        renderTrainingStatus(cellId);
+        const logsEl = document.getElementById(`tr-${cellId}-logs`);
+        if (logsEl) { logsEl.style.display = ''; logsEl.textContent = t.logs.slice(-40).join('\n'); logsEl.scrollTop = logsEl.scrollHeight; }
+        updateNotebook();
+      }
+    }
+
+    async function stopTrainingCell(cellId, opts = {}) {
+      const isUserInitiated = opts.userInitiated !== false; // default true when called from button
+      const caller = opts.caller || (isUserInitiated ? 'user-click Stop button' : 'automatic');
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training || !cell.training.job_id) {
+        console.warn(`[TRAIN-DIAG] stopTrainingCell called but no job_id cellId=${cellId} caller=${caller}`);
+        return;
+      }
+      const jobId = cell.training.job_id;
+      const ts = new Date().toISOString();
+      const stack = (new Error().stack || '').split('\n').slice(1,5).join(' | ');
+      console.log(`[TRAIN-DIAG] stopTrainingCell cellId=${cellId} job_id=${jobId} caller=${caller} userInitiated=${isUserInitiated} status=${cell.training.status} step=${cell.training.progress?.current_step}/${cell.training.progress?.total_steps} ts=${ts} href=${window.location.href} stack=${stack}`);
+      try {
+        const stopUrl = new URL('/api/train/stop', window.location.href).toString();
+        console.log(`[TRAIN-DIAG] POST ${stopUrl} job_id=${jobId} caller=${caller}`);
+        const res = await fetch(stopUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ job_id: jobId, _diag_caller: caller, _diag_cellId: cellId, _diag_userInitiated: isUserInitiated, _diag_stack: stack })
+        });
+        console.log(`[TRAIN-DIAG] stop response status=${res.status} for ${jobId} caller=${caller}`);
+        const data = await res.json();
+        console.log(`[TRAIN-DIAG] stop data`, data);
+        if (!res.ok) throw new Error(data.error || 'Stop failed');
+        cell.training.status = 'failed';
+        cell.training.logs.push('⏹ Stopped by user');
+        renderTrainingStatus(cellId);
+        updateNotebook();
+        if (trainingStreams[cellId]) {
+          try { trainingStreams[cellId].close(); } catch(_) {}
+          delete trainingStreams[cellId];
+        }
+        if (trainingPollTimers[cellId]) {
+          clearInterval(trainingPollTimers[cellId]);
+          delete trainingPollTimers[cellId];
+        }
+      } catch (err) {
+        alert('Stop failed: ' + err.message);
+      }
+    }
+
+    function attachTrainingSSE(cellId, jobId) {
+      // close old
+      if (trainingStreams[cellId]) {
+        try { trainingStreams[cellId].close(); } catch(_) {}
+      }
+      if (trainingPollTimers[cellId]) {
+        clearInterval(trainingPollTimers[cellId]);
+      }
+
+      let es;
+      try {
+        // Diagnostics for URL construction
+        console.log(`[TRAIN-DIAG] attachTrainingSSE cellId=${cellId} jobId=${jobId} href=${window.location.href}`);
+        const urlStr = `/api/train/metrics/${encodeURIComponent(jobId)}?stream=1`;
+        console.log(`[TRAIN-DIAG] EventSource URL string: ${urlStr}`);
+        const url = new URL(urlStr, window.location.href);
+        console.log(`[TRAIN-DIAG] EventSource URL resolved: ${url.toString()}`);
+        try {
+          es = new EventSource(url.toString());
+          console.log(`[TRAIN-DIAG] EventSource created for ${jobId}`);
+        } catch (e) {
+          console.error(`[TRAIN-DIAG] EventSource constructor threw for ${url.toString()}:`, e);
+          throw e;
+        }
+      } catch (e) {
+        console.error(`[TRAIN-DIAG] EventSource construction failed for jobId=${jobId}`, e);
+        // Also try to surface the real error in the UI instead of generic
+        const nb = getActiveNotebook();
+        const cell = nb?.cells.find(c => c.id === cellId);
+        if (cell && cell.training) {
+          cell.training.logs.push(`❌ EventSource failed: ${e.message} (jobId=${jobId}, href=${window.location.href})`);
+          const logsEl = document.getElementById(`tr-${cellId}-logs`);
+          if (logsEl) { logsEl.style.display = ''; logsEl.textContent = cell.training.logs.slice(-40).join('\n'); }
+        }
+        // fallback to polling
+        startTrainingPolling(cellId, jobId);
+        return;
+      }
+      trainingStreams[cellId] = es;
+
+      es.addEventListener('metrics', (e) => {
+        try {
+          const m = JSON.parse(e.data);
+          handleTrainingMetric(cellId, m);
+        } catch(_) {}
+      });
+      es.addEventListener('progress', (e) => {
+        try {
+          const p = JSON.parse(e.data);
+          const nb = getActiveNotebook();
+          const cell = nb?.cells.find(c => c.id === cellId);
+          if (cell && cell.training) {
+            cell.training.progress = p;
+            cell.training.status = cell.training.status; // keep
+            renderTrainingStatus(cellId);
+            updateNotebook();
+          }
+        } catch(_) {}
+      });
+      es.addEventListener('status', (e) => {
+        try {
+          const s = JSON.parse(e.data);
+          const nb = getActiveNotebook();
+          const cell = nb?.cells.find(c => c.id === cellId);
+          if (cell && cell.training) {
+            cell.training.status = s.status;
+            renderTrainingStatus(cellId);
+            updateNotebook();
+          }
+        } catch(_) {}
+      });
+      es.addEventListener('log', (e) => {
+        try {
+          const l = JSON.parse(e.data);
+          const nb = getActiveNotebook();
+          const cell = nb?.cells.find(c => c.id === cellId);
+          if (cell && cell.training) {
+            cell.training.logs.push(l.line);
+            if (cell.training.logs.length > 200) cell.training.logs.shift();
+            const logsEl = document.getElementById(`tr-${cellId}-logs`);
+            if (logsEl) { logsEl.style.display = ''; logsEl.textContent = cell.training.logs.slice(-40).join('\n'); logsEl.scrollTop = logsEl.scrollHeight; }
+            updateNotebook();
+          }
+        } catch(_) {}
+      });
+      es.addEventListener('done', (e) => {
+        try {
+          const d = JSON.parse(e.data);
+          const nb = getActiveNotebook();
+          const cell = nb?.cells.find(c => c.id === cellId);
+          if (cell && cell.training) {
+            cell.training.status = d.status || cell.training.status;
+            renderTrainingStatus(cellId);
+            updateNotebook();
+            if (d.status === 'finished') {
+              setTimeout(() => renderTrainingComplete(cellId), 500);
+            }
+          }
+        } catch(_) {}
+        try { es.close(); } catch(_) {}
+        delete trainingStreams[cellId];
+      });
+      es.onerror = () => {
+        // SSE failed, fallback to polling
+        try { es.close(); } catch(_) {}
+        delete trainingStreams[cellId];
+        // only fallback if still running
+        const nb = getActiveNotebook();
+        const cell = nb?.cells.find(c => c.id === cellId);
+        if (cell && cell.training && ['queued','loading','training','evaluating'].includes(cell.training.status)) {
+          startTrainingPolling(cellId, jobId);
+        }
+      };
+    }
+
+    function handleTrainingMetric(cellId, m) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training) return;
+      cell.training.metrics.push(m);
+      if (cell.training.metrics.length > 300) cell.training.metrics.shift();
+      // update progress shortcuts
+      cell.training.progress.current_step = m.step;
+      cell.training.progress.current_epoch = m.epoch;
+      if (m.train_loss !== undefined) cell.training.progress.train_loss = m.train_loss;
+      if (m.eval_loss !== undefined) cell.training.progress.eval_loss = m.eval_loss;
+      if (m.learning_rate !== undefined) cell.training.progress.learning_rate = m.learning_rate;
+      if (m.elapsed_time !== undefined) cell.training.progress.elapsed_time = m.elapsed_time;
+      renderTrainingStatus(cellId);
+      updateTrainingChart(cellId, m);
+      updateNotebook();
+    }
+
+    function startTrainingPolling(cellId, jobId) {
+      if (trainingPollTimers[cellId]) clearInterval(trainingPollTimers[cellId]);
+      trainingPollTimers[cellId] = setInterval(async () => {
+        const nb = getActiveNotebook();
+        const cell = nb?.cells.find(c => c.id === cellId);
+        if (!cell || !cell.training) { clearInterval(trainingPollTimers[cellId]); return; }
+        if (['finished','failed'].includes(cell.training.status)) { clearInterval(trainingPollTimers[cellId]); return; }
+        try {
+          const statusUrl = new URL(`/api/train/status/${encodeURIComponent(jobId)}`, window.location.href).toString();
+          console.log(`[TRAIN-DIAG] polling status ${statusUrl}`);
+          const res = await fetch(statusUrl);
+          if (!res.ok) {
+            console.warn(`[TRAIN-DIAG] status fetch failed ${res.status} for ${jobId}`);
+            return;
+          }
+          const data = await res.json();
+          cell.training.status = data.status;
+          cell.training.progress = data.progress;
+          cell.training.logs = cell.training.logs || [];
+          renderTrainingStatus(cellId);
+          // fetch new metrics
+          const metricsUrl = new URL(`/api/train/metrics/${encodeURIComponent(jobId)}?limit=20`, window.location.href).toString();
+          const mRes = await fetch(metricsUrl);
+          if (mRes.ok) {
+            const mData = await mRes.json();
+            const existingSteps = new Set(cell.training.metrics.map(mm => mm.step));
+            for (const mm of (mData.metrics || [])) {
+              if (!existingSteps.has(mm.step)) {
+                handleTrainingMetric(cellId, mm);
+              }
+            }
+          }
+          if (['finished','failed'].includes(data.status)) {
+            clearInterval(trainingPollTimers[cellId]);
+            delete trainingPollTimers[cellId];
+            // final chart refresh
+            initTrainingChart(cellId);
+            // re-populate chart with all metrics
+            if (cell.training.metrics.length) {
+              const chart = trainingCharts[cellId];
+              if (chart) {
+                chart.data.labels = cell.training.metrics.map(mm => mm.step);
+                chart.data.datasets[0].data = cell.training.metrics.map(mm => mm.train_loss);
+                chart.data.datasets[1].data = cell.training.metrics.map(mm => mm.eval_loss ?? null);
+                chart.update();
+              }
+            }
+            if (data.status === 'finished') {
+              setTimeout(() => renderTrainingComplete(cellId), 500);
+            }
+          }
+          updateNotebook();
+        } catch(_) {}
+      }, 1500);
+    }
+
+    // expose for inline handlers
+    window.startTrainingCell = startTrainingCell;
+    window.stopTrainingCell = stopTrainingCell;
+    window.updateTrainingField = updateTrainingField;
+    window.updateTrainingMethod = updateTrainingMethod;
+    window.attachTrainingSSE = attachTrainingSSE;
+    window.toggleCustomizeSettings = toggleCustomizeSettings;
+    window.toggleAdvancedSettings = toggleAdvancedSettings;
+    window.updateTrainingValidationUI = updateTrainingValidationUI;
+    window.fixCompatibility = fixCompatibility;
+    window.showStopConfirm = showStopConfirm;
+    window.cancelStopTraining = cancelStopTraining;
+    window.confirmStopTraining = confirmStopTraining;
+    window.toggleTrainingLogs = toggleTrainingLogs;
+    window.renderTestModelInput = renderTestModelInput;
+    window.updateTestInput = updateTestInput;
+    window.updateTestMaxTokens = updateTestMaxTokens;
+    window.handleImageFileSelect = handleImageFileSelect;
+    window.handleImageDragOver = handleImageDragOver;
+    window.handleImageDragLeave = handleImageDragLeave;
+    window.handleImageDrop = handleImageDrop;
+    window.clearTestImage = clearTestImage;
+    window.runTestModel = runTestModel;
+    window.clearTestModel = clearTestModel;
+    window.isLargeModelFrontend = isLargeModelFrontend;
+    window.getEffectiveMethod = getEffectiveMethod;
+
+
+    function initCellEditor(cell) {
+      if (cell.type === 'parameter' || cell.type === 'training') return; // these manage their own UI
+      if (typeof CodeMirror === 'undefined') return;
+      const host = document.querySelector(`#cell-${cell.id} .cm-host`);
+      if (!host) return;
+
+      const mode = cell.type === 'markdown' ? 'markdown' : 'python';
+
+      const cm = CodeMirror(host, {
+        value: cell.content || '',
+        mode: mode,
+        theme: 'material-darker',
+        lineNumbers: true,
+        indentUnit: 4,
+        tabSize: 4,
+        indentWithTabs: false,
+        lineWrapping: true,
+        autofocus: false,
+        extraKeys: {
+          Tab: (cm) => cm.replaceSelection('    '),
+          'Shift-Enter': () => runCell(cell.id)
+        }
+      });
+
+      cm.on('change', () => {
+        const notebook = getActiveNotebook();
+        if (!notebook) return;
+        const c = notebook.cells.find(c => c.id === cell.id);
+        if (c) { c.content = cm.getValue(); updateNotebook(); }
+      });
+
+      cellEditors[cell.id] = cm;
+
+      if (cell.type === 'markdown' && cell.output && cell.outputFormat === 'markdown') {
+        setMarkdownRendered(cell.id, cell.output);
+      }
+
+      if (cell.type === 'model') {
+        const wrapper = cm.getWrapperElement();
+        wrapper.addEventListener('dragover', (e) => {
+          e.preventDefault();
+          document.getElementById(`cell-${cell.id}`).style.borderColor = '#60a5fa';
+        });
+        wrapper.addEventListener('dragleave', () => {
+          document.getElementById(`cell-${cell.id}`).style.borderColor = '';
+        });
+        wrapper.addEventListener('drop', (e) => {
+          e.preventDefault();
+          document.getElementById(`cell-${cell.id}`).style.borderColor = '';
+          const modelData = e.dataTransfer.getData('text/plain');
+          if (modelData) {
+            try { insertModelCode(cell.id, JSON.parse(modelData)); }
+            catch (err) { console.error('Invalid model data'); }
+          }
+        });
+      }
+    }
+
+    function createNewNotebook() {
+      const name = prompt('Enter notebook name:', 'Untitled Notebook');
+      if (name) {
+        const id = createNotebook(name);
+        setActiveNotebook(id);
+      }
+    }
+
+    function renameNotebook(id) {
+      const notebook = notebookRegistry.notebooks[id];
+      if (!notebook) return;
+      
+      const newName = prompt('Enter new name:', notebook.name);
+      if (newName) {
+        notebook.name = newName;
+        notebook.updatedAt = new Date().toISOString();
+        saveAllNotebooks();
+        renderUI();
+      }
+    }
+
+    function backToList() {
+      uiState.mode = 'list';
+      notebookRegistry.activeNotebookId = null;
+      renderUI();
+    }
+
+    function createCellElement(cell) {
+      const div = document.createElement('div');
+      div.className = 'notebook-cell';
+      div.id = `cell-${cell.id}`;
+
+      const typeLabel = cell.type === 'model'     ? '🤖 Model Cell' :
+                       cell.type === 'markdown'  ? '📝 Markdown'   :
+                       cell.type === 'parameter' ? '🎛️ Parameters' :
+                       cell.type === 'training'  ? '🏋️ Training Cell' : '💻 Code';
+
+      const header = document.createElement('div');
+      header.className = 'cell-header';
+      if (cell.type === 'training') {
+        const isRunning = cell.training && ['queued','loading','training','evaluating'].includes(cell.training.status);
+        header.innerHTML = `
+          <span class="cell-type">${typeLabel}</span>
+          <div class="cell-controls">
+            <button class="cell-btn run" onclick="startTrainingCell(${cell.id})" ${isRunning ? 'disabled style="opacity:0.5;cursor:not-allowed;"' : ''}>▶ Start Training</button>
+            <button class="cell-btn" style="background:#dc2626;color:white;" onclick="showStopConfirm(${cell.id})" ${!isRunning ? 'disabled style="opacity:0.5;cursor:not-allowed;"' : ''}>⏹ Stop</button>
+            <button class="cell-btn delete" onclick="deleteCell(${cell.id})">Delete</button>
+          </div>
+        `;
+      } else {
+        header.innerHTML = `
+          <span class="cell-type">${typeLabel}</span>
+          <div class="cell-controls">
+            ${cell.type === 'model' ? '<button class="cell-btn" onclick="openModelPicker(' + cell.id + ')">Select Model</button>' : ''}
+            ${cell.type !== 'parameter' ? `<button class="cell-btn run" onclick="runCell(${cell.id})">▶ Run</button>` : ''}
+            <button class="cell-btn delete" onclick="deleteCell(${cell.id})">Delete</button>
+          </div>
+        `;
+      }
+
+      div.appendChild(header);
+
+      if (cell.type === 'parameter') {
+        div.appendChild(buildParamCellBody(cell));
+      } else if (cell.type === 'training') {
+        div.appendChild(buildTrainingCellBody(cell));
+      } else {
+        const inputContainer = document.createElement('div');
+        inputContainer.className = 'cell-input';
+
+        const cmHost = document.createElement('div');
+        cmHost.className = 'cm-host';
+        inputContainer.appendChild(cmHost);
+
+        if (cell.type === 'markdown') {
+          const renderDiv = document.createElement('div');
+          renderDiv.className = 'markdown-render';
+          renderDiv.title = 'Click to edit';
+          renderDiv.addEventListener('click', () => setMarkdownEditing(cell.id));
+          inputContainer.appendChild(renderDiv);
+
+          const hint = document.createElement('div');
+          hint.className = 'markdown-edit-hint';
+          hint.textContent = 'click to edit';
+          inputContainer.appendChild(hint);
+        }
+
+        div.appendChild(inputContainer);
+
+        if (cell.output && cell.type !== 'markdown') {
+          const outputDiv = document.createElement('div');
+          outputDiv.className = 'cell-output' + (cell.outputFormat === 'error' ? ' error' : '');
+          const pre = document.createElement('pre');
+          pre.textContent = cell.output;
+          outputDiv.appendChild(pre);
+          div.appendChild(outputDiv);
+        }
+      }
+
+      return div;
+    }
+
+    async function runCell(cellId) {
+      const notebook = getActiveNotebook();
+      if (!notebook) return;
+      
+      const cell = notebook.cells.find(c => c.id === cellId);
+      if (!cell) return;
+      if (cell.type === 'training') {
+        return startTrainingCell(cellId);
+      }
+      if (cell.status === 'running') return;
+
+      // Modal starts a fresh Python namespace for each request.  When an
+      // inference cell belongs to a model cell, execute the linked loader and
+      // inference together so loader exports remain available without
+      // downloading the model twice.
+      const loaderCell = cell.modelInfo?.role === 'inference'
+        ? notebook.cells.find(c =>
+            c.id === cell.modelInfo.loaderCellId && c.type === 'model'
+          )
+        : null;
+      const executionCode = loaderCell
+        ? `${loaderCell.content}\n\n${cell.content}`
+        : cell.content;
+
+      const cellElement = document.getElementById(`cell-${cellId}`);
+      if (!cellElement) return;
+      cellElement.classList.add('running');
+      cell.status = 'running';
+
+      let output = '';
+      let hasError = false;
+      let isHtml = false;
+
+      try {
+        if (cell.type === 'parameter') {
+          // Parameter cells just export their values as Python code — no GPU needed
+          cell.content = paramsToCode(cell);
+          cell.output  = cell.content;
+          cell.outputFormat = 'text';
+          cell.status  = 'idle';
+          cellElement.classList.remove('running');
+          const existingOut = cellElement.querySelector('.cell-output');
+          if (existingOut) existingOut.remove();
+          const outDiv = document.createElement('div');
+          outDiv.className = 'cell-output';
+          const pre = document.createElement('pre');
+          pre.textContent = `✅ Parameters ready:\n\n${cell.content}`;
+          outDiv.appendChild(pre);
+          cellElement.appendChild(outDiv);
+          updateNotebook();
+          return;
+        } else if (cell.type === 'markdown') {
+          const html = DOMPurify.sanitize(marked.parse(cell.content || ''));
+          cell.output = html;
+          cell.outputFormat = 'markdown';
+          cell.status = 'idle';
+          cellElement.classList.remove('running');
+          setMarkdownRendered(cellId, html);
+          updateNotebook();
+          return;
+        } else if (cell.type === 'code' && !cell.modelInfo) {
+          // Ordinary Python cell: run locally in the browser via Pyodide.
+          // These cells must NEVER be sent to Modal, ZeroGPU, or any other
+          // remote GPU provider — only AI/model cells use a remote backend.
+          const interimDiv = document.createElement('div');
+          interimDiv.className = 'cell-output';
+          interimDiv.innerHTML = '<pre>🐍 Running Python locally…</pre>';
+          const existingLocal = cellElement.querySelector('.cell-output');
+          if (existingLocal) existingLocal.remove();
+          cellElement.appendChild(interimDiv);
+          try {
+            const result = await window.PyodideLocal.run(cell.content || '');
+            output = result.ok
+              ? ((result.stdout || '') + (result.stderr ? '\n' + result.stderr : '')).trimEnd() || '✅ Executed successfully (no output)'
+              : (result.stdout || '') + (result.stderr ? '\n' + result.stderr : '') + result.error;
+            hasError = !result.ok;
+            cell.outputFormat = hasError ? 'error' : 'text';
+          } catch (err) {
+            output = `Local Python error: ${err.message}`;
+            hasError = true;
+            cell.outputFormat = 'error';
+          }
+        } else if (cell.type === 'code' || cell.type === 'model') {
+          // Trained model inference: use dedicated local endpoint that handles LoRA/full from training_outputs
+          const _isTrained = cell.modelInfo?.isTrained || loaderCell?.modelInfo?.isTrained;
+          const _trainedJobId = cell.modelInfo?.job_id || loaderCell?.modelInfo?.job_id || cell.modelInfo?.jobId || loaderCell?.modelInfo?.jobId;
+          if (_isTrained && _trainedJobId) {
+            // For trained models, try the trained inference endpoint first (handles LoRA correctly)
+            // Extract a prompt from the inference cell's code or use a default
+            let _prompt = "Hello, world!";
+            try {
+              const m = (cell.content || '').match(/prompt\s*=\s*["']([^"']+)["']/);
+              if (m && m[1]) _prompt = m[1];
+              else if (cell.content && cell.content.includes('prompt')) {
+                // fallback: use first 100 chars of content as prompt
+                _prompt = cell.content.slice(0, 200).replace(/\n/g, ' ').slice(0, 100);
+              }
+            } catch(_) {}
+            const _task = cell.modelInfo?.task || loaderCell?.modelInfo?.task || 'text-generation';
+            // Show interim
+            const _interim = document.createElement('div');
+            _interim.className = 'cell-output';
+            _interim.innerHTML = `<pre>⏳ Running trained inference (job ${_trainedJobId})...</pre>`;
+            const _existing = cellElement.querySelector('.cell-output');
+            if (_existing) _existing.remove();
+            cellElement.appendChild(_interim);
+            try {
+              const _inferUrl = new URL('/api/inference/trained', window.location.href).toString();
+              console.log(`[TRAIN-DIAG] POST ${_inferUrl} job_id=${_trainedJobId} prompt=${_prompt.slice(0,50)} task=${_task}`);
+              const _res = await fetch(_inferUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ job_id: _trainedJobId, prompt: _prompt, max_new_tokens: 64, task: _task })
+              });
+              console.log(`[TRAIN-DIAG] inference response status=${_res.status} content-type=${_res.headers.get('content-type')}`);
+              const _data = await _res.json();
+              console.log(`[TRAIN-DIAG] inference data`, _data);
+              if (!_res.ok) throw new Error(_data.error || `HTTP ${_res.status}`);
+              output = _data.output || _data.text || JSON.stringify(_data);
+              hasError = false;
+              cell.outputFormat = 'text';
+            } catch (err) {
+              console.error(`[TRAIN-DIAG] trained inference failed for ${_trainedJobId}:`, err);
+              // Fallback to normal ZeroGPU/Modal path if trained endpoint fails
+              console.warn('Trained inference endpoint failed, falling back to normal:', err);
+              if (gpuProvider.provider === 'zerogpu' &&
+                  (cell.type === 'model' || cell.modelInfo?.role === 'inference') &&
+                  (gpuProvider.zerogpu?.enabled ?? true)) {
+                output = await runCellViaZeroGPU(notebook, cell);
+                hasError = output === null;
+                cell.outputFormat = hasError ? 'error' : 'text';
+              } else {
+                throw err;
+              }
+            }
+          } else if (gpuProvider.provider === 'zerogpu' &&
+              (cell.type === 'model' || cell.modelInfo?.role === 'inference') &&
+              (gpuProvider.zerogpu?.enabled ?? true)) {
+            output = await runCellViaZeroGPU(notebook, cell);
+            hasError = output === null;
+            cell.outputFormat = hasError ? 'error' : 'text';
+          } else {
+            // Modal provider (unchanged): stream the generated notebook-cell
+            // Python through /api/stream-logs (SSE) or fall back to /api/run-cell
+            // for very long cells.
+            const interimDiv = document.createElement('div');
+            interimDiv.className = 'cell-output';
+            interimDiv.innerHTML = '<pre>⏳ Streaming from Modal GPU…  (cold start may take ~20 s) — watch the GPU Console below</pre>';
+            const existing = cellElement.querySelector('.cell-output');
+            if (existing) existing.remove();
+            cellElement.appendChild(interimDiv);
+
+            try {
+              const result = await streamCellToTerminal(executionCode);
+              output   = result.text || (result.ok ? '✅ Executed successfully (no output)' : 'No output captured.');
+              hasError = !result.ok;
+              cell.outputFormat = result.ok ? 'text' : 'error';
+            } catch (err) {
+              setGpuState('disconnected');
+              output   = `Network error: ${err.message}`;
+              hasError = true;
+              cell.outputFormat = 'error';
+            }
+          }
+        }
+      } catch (err) {
+        output = `Error: ${err.message}`;
+        hasError = true;
+        cell.outputFormat = 'error';
+      }
+
+      cell.output = output;
+      cell.status = 'idle';
+      cellElement.classList.remove('running');
+
+      const existingOutput = cellElement.querySelector('.cell-output');
+      if (existingOutput) {
+        existingOutput.remove();
+      }
+
+      const outputDiv = document.createElement('div');
+      const outputClass = 'cell-output' + 
+        (cell.type === 'markdown' ? ' markdown-output' : '') + 
+        (hasError || cell.outputFormat === 'error' ? ' error' : '');
+      outputDiv.className = outputClass;
+      
+      if (isHtml) {
+        outputDiv.innerHTML = output;
+      } else {
+        const pre = document.createElement('pre');
+        pre.textContent = output;
+        outputDiv.appendChild(pre);
+      }
+      
+      cellElement.appendChild(outputDiv);
+
+      updateNotebook();
+    }
+
+    async function runAllCells() {
+      const notebook = getActiveNotebook();
+      if (!notebook) return;
+      
+      const executed = new Set();
+      for (const cell of [...notebook.cells]) {
+        if (executed.has(cell.id)) continue;
+
+        // A model cell and its linked inference cell form one notebook run.
+        // Skip the standalone model execution and let runCell(inference)
+        // execute both cells once in the same Python namespace.
+        if (cell.type === 'model') {
+          const inferenceId = cell.modelInfo?.inferenceCellId;
+          const inferenceCell = inferenceId
+            ? notebook.cells.find(c => c.id === inferenceId)
+            : null;
+          if (
+            inferenceCell &&
+            inferenceCell.modelInfo?.role === 'inference' &&
+            inferenceCell.modelInfo.loaderCellId === cell.id
+          ) {
+            await runCell(inferenceCell.id);
+            executed.add(cell.id);
+            executed.add(inferenceCell.id);
+            await new Promise(resolve => setTimeout(resolve, 100));
+            continue;
+          }
+        }
+
+        await runCell(cell.id);
+        executed.add(cell.id);
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+
+    async function runMarkdownCells() {
+      const notebook = getActiveNotebook();
+      if (!notebook) return;
+      
+      for (const cell of notebook.cells) {
+        if (cell.type === 'markdown') {
+          await runCell(cell.id);
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+      }
+    }
+
+    function openModelPicker(cellId) {
+      uiState.currentModelCellId = cellId;
+      const modal = document.getElementById('model-picker-modal');
+      modal.classList.add('active');
+
+      if (hfModels.length === 0) {
+        loadHFModels(true);
+      } else {
+        renderModelList();
+      }
+
+      setTimeout(() => {
+        const searchInput = document.getElementById('model-search');
+        if (searchInput) {
+          searchInput.onkeydown = (e) => { if (e.key === 'Enter') loadHFModels(true); };
+        }
+      }, 0);
+    }
+
+    function closeModelPicker() {
+      const modal = document.getElementById('model-picker-modal');
+      modal.classList.remove('active');
+      uiState.currentModelCellId = null;
+    }
+
+    let hfNextCursor = null;
+
+    async function loadHFModels(reset = false) {
+      const modelListDiv = document.getElementById('model-list');
+
+      if (reset) {
+        hfModels = [];
+        filteredModels = [];
+        hfNextCursor = null;
+        modelListDiv.innerHTML = '<p style="color: #94a3b8;">Loading models...</p>';
+      } else {
+        const loadMoreBtn = document.getElementById('hf-load-more');
+        if (loadMoreBtn) loadMoreBtn.textContent = 'Loading...';
+      }
+
+      const task    = document.getElementById('task-filter').value;
+      const sort    = document.getElementById('sort-filter').value;
+      const search  = document.getElementById('model-search').value.trim();
+
+      const params = new URLSearchParams({ limit: '30', full: 'false' });
+      if (sort && sort !== 'trending') {
+        params.set('sort', sort);
+        params.set('direction', '-1');
+      }
+      if (task)           params.set('filter', task);
+      if (search)         params.set('search', search);
+      if (hfNextCursor)   params.set('cursor', hfNextCursor);
+
+      try {
+        const response = await fetch(`https://huggingface.co/api/models?${params}`);
+        if (!response.ok) throw new Error(`HF API returned ${response.status}`);
+
+        const data = await response.json();
+        const newModels = Array.isArray(data) ? data : (data.models || []);
+
+        hfNextCursor = response.headers.get('X-Next-Cursor') || null;
+
+        hfModels = reset ? newModels : [...hfModels, ...newModels];
+        filteredModels = hfModels;
+        renderModelList();
+      } catch (error) {
+        if (reset) {
+          modelListDiv.innerHTML = `<p style="color: #f87171;">Failed to load models: ${error.message}. <button class="cell-btn" onclick="loadHFModels(true)">Retry</button></p>`;
+        }
+        console.error('HF API error:', error);
+      }
+    }
+
+    function renderModelList() {
+      const modelListDiv = document.getElementById('model-list');
+
+      if (filteredModels.length === 0) {
+        modelListDiv.innerHTML = '<p style="color: #94a3b8;">No models found.</p>';
+        return;
+      }
+
+      const cards = filteredModels.map(model => {
+        const tags = (model.tags || [])
+          .filter(t => !['transformers','pytorch','safetensors'].includes(t))
+          .slice(0, 3);
+        const tagsHtml = tags.map(t => `<span class="model-tag">${t}</span>`).join('');
+        const updated  = model.lastModified
+          ? `Updated ${new Date(model.lastModified).toLocaleDateString()}`
+          : '';
+        const safeModel = JSON.stringify(model).replace(/'/g, '&apos;');
+
+        return `
+          <div class="model-item" draggable="true" ondragstart="handleModelDragStart(event, '${model.id}')">
+            <h4>${model.id}</h4>
+            <p style="color:#64748b;font-size:12px;margin:2px 0 4px;">
+              ${model.pipeline_tag || 'General'} &nbsp;•&nbsp;
+              ⬇️ ${(model.downloads || 0).toLocaleString()} &nbsp;•&nbsp;
+              👍 ${(model.likes || 0).toLocaleString()}
+              ${updated ? `&nbsp;•&nbsp; 🕒 ${updated}` : ''}
+            </p>
+            <div style="margin-bottom:6px;">${tagsHtml}</div>
+            <button class="select-model-btn" onclick='selectModel(${safeModel})'>Select</button>
+          </div>`;
+      }).join('');
+
+      const loadMoreHtml = hfNextCursor
+        ? `<div style="text-align:center;padding:12px;">
+            <button id="hf-load-more" class="toolbar-btn" onclick="loadHFModels(false)">Load more</button>
+           </div>`
+        : '';
+
+      modelListDiv.innerHTML = cards + loadMoreHtml;
+    }
+
+    function handleModelDragStart(event, modelId) {
+      const model = filteredModels.find(m => m.id === modelId);
+      if (model) {
+        event.dataTransfer.setData('text/plain', JSON.stringify(model));
+      }
+    }
+
+    function selectModel(model) {
+      if (uiState.currentModelCellId) {
+        insertModelCode(uiState.currentModelCellId, model);
+        closeModelPicker();
+      }
+    }
+
+    // ── System 2: Task-specific inference templates (no imports, no loading) ──
+    function generateTaskTemplate(task) {
+
+      // ── TEXT GENERATION ──────────────────────────────────────────────────────
+      if (task === 'text-generation') return `\
+# ── Text Generation ──────────────────────────────────────────────────────────
+prompt = "Once upon a time"
+inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+with torch.no_grad():
+    output_ids = model.generate(
+        **inputs,
+        max_new_tokens=200,
+        do_sample=True,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=50,
+        repetition_penalty=1.1,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+
+print(tokenizer.decode(output_ids[0], skip_special_tokens=True))
+`;
+
+      // ── CHAT / CONVERSATIONAL ────────────────────────────────────────────────
+      if (['conversational', 'chat'].includes(task)) return `\
+# ── Chat Inference ────────────────────────────────────────────────────────────
+messages = [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user",   "content": "Explain transformers in one paragraph."},
+]
+
+text   = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+inputs = tokenizer([text], return_tensors="pt").to(model.device)
+
+with torch.no_grad():
+    output_ids = model.generate(
+        **inputs,
+        max_new_tokens=512,
+        do_sample=True,
+        temperature=0.7,
+        top_p=0.9,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+
+response = tokenizer.decode(
+    output_ids[0][inputs["input_ids"].shape[-1]:], skip_special_tokens=True
+)
+print(response)
+`;
+
+      // ── TEXT-TO-TEXT / SUMMARIZATION / TRANSLATION ───────────────────────────
+      if (['text2text-generation', 'summarization', 'translation'].includes(task) ||
+          task.startsWith('translation_')) return `\
+# ── Seq2Seq Inference ─────────────────────────────────────────────────────────
+input_text = "The transformer architecture revolutionized NLP by enabling parallel sequence processing via self-attention mechanisms."
+
+inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=1024).to(model.device)
+
+with torch.no_grad():
+    output_ids = model.generate(
+        **inputs,
+        max_new_tokens=256,
+        num_beams=4,
+        early_stopping=True,
+        no_repeat_ngram_size=3,
+    )
+
+print(tokenizer.decode(output_ids[0], skip_special_tokens=True))
+`;
+
+      // ── TEXT CLASSIFICATION / SENTIMENT ──────────────────────────────────────
+      if (['text-classification', 'sentiment-analysis'].includes(task)) return `\
+# ── Text Classification ───────────────────────────────────────────────────────
+import torch.nn.functional as F
+
+texts = [
+    "This product is absolutely amazing, I love it!",
+    "Terrible experience, would not recommend.",
+    "It was okay, nothing special.",
+]
+
+inputs = tokenizer(texts, padding=True, truncation=True, return_tensors="pt").to(model.device)
+
+with torch.no_grad():
+    logits = model(**inputs).logits
+
+probs  = F.softmax(logits, dim=-1)
+labels = [model.config.id2label[i] for i in probs.argmax(dim=-1).tolist()]
+scores = probs.max(dim=-1).values.tolist()
+
+for text, label, score in zip(texts, labels, scores):
+    print(f"[{label}] ({score:.2%})  {text[:60]}")
+`;
+
+      // ── TOKEN CLASSIFICATION / NER ───────────────────────────────────────────
+      if (['token-classification', 'ner'].includes(task)) return `\
+# ── Token Classification (NER) ────────────────────────────────────────────────
+text   = "Hugging Face was founded in New York and is led by Clément Delangue."
+inputs = tokenizer(text, return_tensors="pt").to(model.device)
+tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
+
+with torch.no_grad():
+    logits = model(**inputs).logits
+
+pred_ids = logits.argmax(dim=-1)[0].tolist()
+
+for token, pred_id in zip(tokens, pred_ids):
+    label = model.config.id2label[pred_id]
+    if label != "O" and not token.startswith("##"):
+        print(f"  {token:<20} {label}")
+`;
+
+      // ── QUESTION ANSWERING ────────────────────────────────────────────────────
+      if (['question-answering'].includes(task)) return `\
+# ── Question Answering ────────────────────────────────────────────────────────
+# Works with extractive QA (BERT-squad) AND generative models (Llama, T5).
+# The loader above selected the right class; inference adapts automatically.
+context  = "The Eiffel Tower is located in Paris, France, and was built in 1889."
+question = "Where is the Eiffel Tower?"
+preprocessor = processor if processor is not None else tokenizer
+
+# Extractive path: BERT / RoBERTa / DeBERTa SQuAD-style
+if hasattr(model, "config") and "QuestionAnswering" in model.__class__.__name__:
+    inputs    = preprocessor(question, context, return_tensors="pt").to(model.device)
+    input_ids = inputs["input_ids"][0]
+    with torch.no_grad():
+        outputs   = model(**inputs)
+        start_idx = outputs.start_logits.argmax()
+        end_idx   = outputs.end_logits.argmax() + 1
+    answer = preprocessor.decode(input_ids[start_idx:end_idx], skip_special_tokens=True)
+
+# Generative path: CausalLM (Llama, Gemma, Qwen) or Seq2SeqLM (T5, FLAN)
+else:
+    prompt = f"Context: {context}\\n\\nQuestion: {question}\\n\\nAnswer:"
+    inputs = preprocessor(prompt, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        out_ids = model.generate(
+            **inputs, max_new_tokens=128,
+            do_sample=False, pad_token_id=getattr(preprocessor, "eos_token_id", None),
+        )
+    if getattr(model.config, "is_encoder_decoder", False):
+        answer_ids = out_ids[0]
+    else:
+        answer_ids = out_ids[0][inputs["input_ids"].shape[-1]:]
+    answer = preprocessor.decode(answer_ids, skip_special_tokens=True).strip()
+
+print(f"Q: {question}")
+print(f"A: {answer}")
+`;
+
+      // ── FILL MASK ─────────────────────────────────────────────────────────────
+      if (['fill-mask'].includes(task)) return `\
+# ── Fill Mask ─────────────────────────────────────────────────────────────────
+import torch.nn.functional as F
+
+mask  = tokenizer.mask_token
+text  = f"The capital of France is {mask}."
+
+inputs   = tokenizer(text, return_tensors="pt").to(model.device)
+mask_pos = (inputs["input_ids"] == tokenizer.mask_token_id).nonzero(as_tuple=True)[1]
+
+with torch.no_grad():
+    logits = model(**inputs).logits
+
+top_k   = 5
+probs   = F.softmax(logits[0, mask_pos[0]], dim=-1)
+top_ids = probs.topk(top_k).indices.tolist()
+
+print(f"Input: {text}")
+for token_id in top_ids:
+    token = tokenizer.decode([token_id]).strip()
+    print(f"  {token:<20} {probs[token_id].item():.2%}")
+`;
+
+      // ── ZERO-SHOT CLASSIFICATION ──────────────────────────────────────────────
+      if (['zero-shot-classification'].includes(task)) return `\
+# ── Zero-Shot Classification ──────────────────────────────────────────────────
+import torch.nn.functional as F
+
+hypothesis_template = "This text is about {}."
+text             = "SpaceX successfully launched its Starship rocket into orbit."
+candidate_labels = ["space", "technology", "politics", "sports", "finance"]
+
+# Detect entailment index (NLI models differ: 0 or 2)
+entailment_id = model.config.label2id.get(
+    "entailment", model.config.label2id.get("ENTAILMENT", 2)
+)
+
+scores = []
+for label in candidate_labels:
+    hyp = hypothesis_template.format(label)
+    inp = tokenizer(text, hyp, return_tensors="pt", truncation=True, padding=True).to(model.device)
+    with torch.no_grad():
+        probs = F.softmax(model(**inp).logits[0], dim=-1)
+    scores.append(probs[entailment_id].item())
+
+total  = sum(scores)
+ranked = sorted(zip(candidate_labels, [s / total for s in scores]), key=lambda x: -x[1])
+
+print(f"Text: {text}\\n")
+for lbl, score in ranked:
+    print(f"  {lbl:<15} {score:.2%}  {'█' * int(score * 30)}")
+`;
+
+      // ── FEATURE EXTRACTION / SENTENCE SIMILARITY ──────────────────────────────
+      if (['feature-extraction', 'sentence-similarity', 'sentence-embeddings'].includes(task)) return `\
+# ── Sentence Embeddings & Similarity ─────────────────────────────────────────
+import torch.nn.functional as F
+
+def mean_pooling(model_output, attention_mask):
+    tok_emb = model_output.last_hidden_state
+    mask    = attention_mask.unsqueeze(-1).expand(tok_emb.size()).float()
+    return (tok_emb * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+
+sentences = [
+    "The quick brown fox jumps over the lazy dog.",
+    "A fast auburn fox leaps above a sleepy canine.",
+    "Machine learning is transforming the world.",
+]
+
+inputs = tokenizer(sentences, padding=True, truncation=True, return_tensors="pt").to(model.device)
+
+with torch.no_grad():
+    outputs = model(**inputs)
+
+embeddings = F.normalize(mean_pooling(outputs, inputs["attention_mask"]), dim=-1)
+print(f"Embedding shape: {embeddings.shape}")
+
+for i in range(len(sentences)):
+    for j in range(i + 1, len(sentences)):
+        sim = (embeddings[i] * embeddings[j]).sum().item()
+        print(f"  sim({i},{j}): {sim:.4f}  '{sentences[i][:35]}' vs '{sentences[j][:35]}'")
+`;
+
+      // ── IMAGE CLASSIFICATION ───────────────────────────────────────────────────
+      if (['image-classification'].includes(task)) return `\
+# ── Image Classification ─────────────────────────────────────────────────────
+import torch.nn.functional as F
+from PIL import Image
+import requests
+
+IMAGE_URL = "https://upload.wikimedia.org/wikipedia/commons/thumb/4/43/Cute_dog.jpg/320px-Cute_dog.jpg"
+image = Image.open(requests.get(IMAGE_URL, stream=True).raw).convert("RGB")
+
+inputs = processor(images=image, return_tensors="pt").to(model.device)
+
+with torch.no_grad():
+    logits = model(**inputs).logits
+
+probs = F.softmax(logits[0], dim=-1)
+top5  = probs.topk(5)
+
+print("Top-5 predictions:")
+for score, idx in zip(top5.values.tolist(), top5.indices.tolist()):
+    print(f"  {model.config.id2label[idx]:<40} {score:.2%}")
+`;
+
+      // ── IMAGE SEGMENTATION ─────────────────────────────────────────────────────
+      if (['image-segmentation'].includes(task)) return `\
+# ── Semantic Segmentation ─────────────────────────────────────────────────────
+from PIL import Image
+import requests
+
+IMAGE_URL = "http://images.cocodataset.org/val2017/000000039769.jpg"
+image = Image.open(requests.get(IMAGE_URL, stream=True).raw).convert("RGB")
+
+inputs = processor(images=image, return_tensors="pt").to(model.device)
+
+with torch.no_grad():
+    outputs = model(**inputs)
+
+seg_map = processor.post_process_semantic_segmentation(
+    outputs, target_sizes=[image.size[::-1]]
+)[0]
+
+for label_id in seg_map.unique().tolist():
+    name   = model.config.id2label.get(label_id, str(label_id))
+    pixels = (seg_map == label_id).sum().item()
+    print(f"  {name:<25} {pixels:>8} px")
+`;
+
+      // ── OBJECT DETECTION ───────────────────────────────────────────────────────
+      if (['object-detection'].includes(task)) return `\
+# ── Object Detection ──────────────────────────────────────────────────────────
+from PIL import Image
+import requests
+
+IMAGE_URL = "http://images.cocodataset.org/val2017/000000039769.jpg"
+image = Image.open(requests.get(IMAGE_URL, stream=True).raw).convert("RGB")
+
+inputs = processor(images=image, return_tensors="pt").to(model.device)
+
+with torch.no_grad():
+    outputs = model(**inputs)
+
+results = processor.post_process_object_detection(
+    outputs,
+    target_sizes=torch.tensor([image.size[::-1]]),
+    threshold=0.5,
+)[0]
+
+print(f"Detected {len(results['boxes'])} objects:")
+for score, label, box in zip(results["scores"], results["labels"], results["boxes"]):
+    cls = model.config.id2label[label.item()]
+    print(f"  {cls:<20} {score:.2%}  {[round(x) for x in box.tolist()]}")
+`;
+
+      // ── IMAGE TO TEXT / CAPTIONING ─────────────────────────────────────────────
+      if (['image-to-text', 'image-captioning'].includes(task)) return `\
+# ── Image Captioning ──────────────────────────────────────────────────────────
+from PIL import Image
+import requests
+
+IMAGE_URL = "https://upload.wikimedia.org/wikipedia/commons/thumb/4/43/Cute_dog.jpg/320px-Cute_dog.jpg"
+image = Image.open(requests.get(IMAGE_URL, stream=True).raw).convert("RGB")
+
+inputs = processor(images=image, return_tensors="pt").to(model.device)
+if "pixel_values" in inputs:
+    inputs["pixel_values"] = inputs["pixel_values"].to(torch.float16)
+
+with torch.no_grad():
+    output_ids = model.generate(**inputs, max_new_tokens=100)
+
+caption = processor.decode(output_ids[0], skip_special_tokens=True)
+print(f"Caption: {caption}")
+`;
+
+      // ── VISUAL QUESTION ANSWERING ──────────────────────────────────────────────
+      if (['visual-question-answering', 'vqa'].includes(task)) return `\
+# ── Visual Question Answering ────────────────────────────────────────────────
+from PIL import Image
+import requests
+
+IMAGE_URL = "https://upload.wikimedia.org/wikipedia/commons/thumb/4/43/Cute_dog.jpg/320px-Cute_dog.jpg"
+image    = Image.open(requests.get(IMAGE_URL, stream=True).raw).convert("RGB")
+question = "What animal is in the image?"
+
+inputs = processor(images=image, text=question, return_tensors="pt").to(model.device)
+
+with torch.no_grad():
+    output_ids = model.generate(**inputs, max_new_tokens=64)
+
+answer = processor.decode(output_ids[0], skip_special_tokens=True)
+print(f"Q: {question}")
+print(f"A: {answer}")
+`;
+
+      // ── DEPTH ESTIMATION ───────────────────────────────────────────────────────
+      if (['depth-estimation'].includes(task)) return `\
+# ── Depth Estimation ─────────────────────────────────────────────────────────
+import torch.nn.functional as F
+from PIL import Image
+import requests
+
+IMAGE_URL = "https://upload.wikimedia.org/wikipedia/commons/thumb/4/43/Cute_dog.jpg/320px-Cute_dog.jpg"
+image = Image.open(requests.get(IMAGE_URL, stream=True).raw).convert("RGB")
+
+inputs = processor(images=image, return_tensors="pt").to(model.device)
+
+with torch.no_grad():
+    depth = model(**inputs).predicted_depth
+
+depth_up = F.interpolate(
+    depth.unsqueeze(1), size=image.size[::-1], mode="bicubic", align_corners=False
+).squeeze().cpu().numpy()
+
+print(f"Depth map shape : {depth_up.shape}")
+print(f"Depth range     : {depth_up.min():.2f} – {depth_up.max():.2f}")
+`;
+
+      // ── AUTOMATIC SPEECH RECOGNITION ──────────────────────────────────────────
+      if (['automatic-speech-recognition', 'asr'].includes(task)) return `\
+# ── Speech Recognition ────────────────────────────────────────────────────────
+import torchaudio
+
+AUDIO_PATH  = "/data/sample.wav"   # replace with your audio file
+waveform, sample_rate = torchaudio.load(AUDIO_PATH)
+
+if sample_rate != 16000:
+    waveform = torchaudio.functional.resample(waveform, sample_rate, 16000)
+
+audio_array = waveform.squeeze().numpy()
+inputs      = processor(audio_array, sampling_rate=16000, return_tensors="pt").to(model.device)
+
+if "input_features" in inputs:
+    inputs["input_features"] = inputs["input_features"].to(torch.float16)
+
+with torch.no_grad():
+    output_ids = model.generate(**inputs, max_new_tokens=256)
+
+transcript = processor.batch_decode(output_ids, skip_special_tokens=True)[0]
+print(f"Transcript: {transcript}")
+`;
+
+      // ── AUDIO CLASSIFICATION ───────────────────────────────────────────────────
+      if (['audio-classification'].includes(task)) return `\
+# ── Audio Classification ─────────────────────────────────────────────────────
+import torch.nn.functional as F
+import torchaudio
+
+AUDIO_PATH  = "/data/sample.wav"   # replace with your audio file
+waveform, sample_rate = torchaudio.load(AUDIO_PATH)
+
+if sample_rate != 16000:
+    waveform = torchaudio.functional.resample(waveform, sample_rate, 16000)
+
+inputs = processor(waveform.squeeze().numpy(), sampling_rate=16000,
+                   return_tensors="pt", padding=True).to(model.device)
+
+with torch.no_grad():
+    logits = model(**inputs).logits
+
+probs = F.softmax(logits[0], dim=-1)
+top5  = probs.topk(5)
+
+print("Top-5 audio classes:")
+for score, idx in zip(top5.values.tolist(), top5.indices.tolist()):
+    print(f"  {model.config.id2label[idx]:<35} {score:.2%}")
+`;
+
+      // ── TEXT TO IMAGE (Diffusers) ──────────────────────────────────────────────
+      if (['text-to-image'].includes(task)) return `\
+# ── Text to Image (Diffusers) ─────────────────────────────────────────────────
+# Cell 1 loaded the Diffusers pipeline as the pipe variable.
+
+prompt          = "A serene mountain landscape at sunset, photorealistic, 4K"
+negative_prompt = "blurry, watermark, low quality, ugly"
+
+image = pipe(
+    prompt=prompt,
+    negative_prompt=negative_prompt,
+    width=512, height=512,
+    num_inference_steps=30,
+    guidance_scale=7.5,
+).images[0]
+
+image.save("/data/output.png")
+print("Image saved to /data/output.png")
+`;
+
+      // ── TABLE QUESTION ANSWERING ───────────────────────────────────────────────
+      if (['table-question-answering'].includes(task)) return `\
+# ── Table Question Answering ─────────────────────────────────────────────────
+import pandas as pd
+
+table = pd.DataFrame({
+    "Name":       ["Alice", "Bob", "Charlie", "Diana"],
+    "Department": ["Engineering", "Marketing", "Engineering", "HR"],
+    "Salary":     [95000, 72000, 110000, 68000],
+    "Years":      [5, 3, 8, 2],
+})
+
+questions = [
+    "What is the average salary?",
+    "Who has the highest salary?",
+    "How many engineers are there?",
+]
+
+for q in questions:
+    inputs = tokenizer(table=table, queries=q, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    coords = tokenizer.convert_logits_to_predictions(
+        inputs, outputs.logits.detach(), outputs.logits_aggregation.detach()
+    )
+    print(f"Q: {q}")
+    print(f"A: {coords}\\n")
+`;
+
+      // ── DOCUMENT QUESTION ANSWERING ────────────────────────────────────────────
+      if (['document-question-answering'].includes(task)) return `\
+# ── Document Question Answering ───────────────────────────────────────────────
+from PIL import Image
+import requests
+
+DOC_URL  = "https://huggingface.co/datasets/hf-internal-testing/example-documents/resolve/main/jpeg_images/2.jpg"
+image    = Image.open(requests.get(DOC_URL, stream=True).raw).convert("RGB")
+question = "What is the total amount?"
+
+inputs = processor(image, question, return_tensors="pt").to(model.device)
+
+with torch.no_grad():
+    outputs = model(**inputs)
+
+start  = outputs.start_logits.argmax()
+end    = outputs.end_logits.argmax() + 1
+tokens = processor.tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
+answer = processor.tokenizer.convert_tokens_to_string(tokens[start:end])
+
+print(f"Q: {question}")
+print(f"A: {answer}")
+`;
+
+      // ── MASK GENERATION ───────────────────────────────────────────────────────
+      if (['mask-generation'].includes(task)) return `\
+# ── Mask Generation (SAM-style) ───────────────────────────────────────────────
+from PIL import Image
+import requests
+
+IMAGE_URL    = "http://images.cocodataset.org/val2017/000000039769.jpg"
+image        = Image.open(requests.get(IMAGE_URL, stream=True).raw).convert("RGB")
+input_points = [[[200, 200]]]  # (x, y) prompt point
+
+inputs = processor(images=image, input_points=input_points, return_tensors="pt").to(model.device)
+
+with torch.no_grad():
+    outputs = model(**inputs)
+
+masks = processor.post_process_masks(
+    outputs.pred_masks.cpu(),
+    inputs["original_sizes"].cpu(),
+    inputs["reshaped_input_sizes"].cpu(),
+)[0]
+
+print(f"Generated {masks.shape[0]} masks")
+for i, mask in enumerate(masks):
+    print(f"  Mask {i}: {mask.float().mean().item():.2%} coverage")
+`;
+
+      // ── FALLBACK ──────────────────────────────────────────────────────────────
+      return `\
+# ── Inference ─────────────────────────────────────────────────────────────────
+# The loader above detected your model architecture automatically.
+# Use 'tokenizer' for text models, 'processor' for vision/audio models.
+_tok   = tokenizer if tokenizer is not None else processor
+text   = "Hello, world!"
+inputs = _tok(text, return_tensors="pt").to(model.device)
+
+with torch.no_grad():
+    outputs = model(**inputs)
+
+print(outputs)
+`;
+    }
+
+    // ── Combine loader + task template ────────────────────────────────────────
+    // Cell 1 is generated by the Python hf_loader package.  Cell 2 remains a
+    // page task template and never participates in model-class selection.
+    function fallbackLoaderCell(modelId) {
+      return `\
+# --- Cell 1: Model Loader (runtime fallback) ---
+# The server-side Python generator was unavailable. This fallback still keeps
+# loading independent from the selected task and uses AutoConfig at runtime.
+import importlib
+import torch
+from transformers import AutoConfig
+
+MODEL_ID = ${JSON.stringify(modelId)}
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DTYPE = torch.float16 if DEVICE.type == "cuda" else torch.float32
+model = None
+tokenizer = None
+processor = None
+feature_extractor = None
+
+def has_diffusers_model_index():
+    try:
+        from huggingface_hub import hf_hub_download
+        hf_hub_download(MODEL_ID, "model_index.json")
+        return True
+    except Exception:
+        return False
+
+try:
+    config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
+except Exception:
+    if not has_diffusers_model_index():
+        raise
+    class DiffusersConfig:
+        auto_map = {}
+        architectures = []
+        model_type = ""
+        is_encoder_decoder = False
+    config = DiffusersConfig()
+
+auto_map = getattr(config, "auto_map", None) or {}
+architectures = list(getattr(config, "architectures", None) or [])
+trust_remote_code = bool(auto_map)
+is_encoder_decoder = bool(getattr(config, "is_encoder_decoder", False))
+architecture_text = " ".join(architectures).lower()
+model_type = str(getattr(config, "model_type", "") or "").lower()
+
+tokenizer = None
+processor = None
+feature_extractor = None
+if has_diffusers_model_index():
+    from diffusers import DiffusionPipeline
+    pipe_kwargs = {"dtype": DTYPE} if DEVICE.type == "cuda" else {}
+    pipe = DiffusionPipeline.from_pretrained(MODEL_ID, **pipe_kwargs).to(DEVICE)
+    model = None
+    loaded_class = "DiffusionPipeline"
+else:
+    mapped_class = next(
+        (name for name in auto_map if name.startswith("AutoModelFor")), None
+    )
+    model_type_class = {
+        "whisper": "AutoModelForSpeechSeq2Seq",
+        "wav2vec2": "AutoModelForCTC",
+        "hubert": "AutoModelForCTC",
+        "donut": "AutoModelForVision2Seq",
+    }.get(model_type)
+    if mapped_class:
+        model_class_name = mapped_class
+    elif "forquestionanswering" in architecture_text:
+        model_class_name = "AutoModelForQuestionAnswering"
+    elif "forcausallm" in architecture_text:
+        model_class_name = "AutoModelForCausalLM"
+    elif model_type_class:
+        model_class_name = model_type_class
+    elif is_encoder_decoder:
+        model_class_name = "AutoModelForSeq2SeqLM"
+    else:
+        model_class_name = "AutoModelForCausalLM"
+
+    transformers = importlib.import_module("transformers")
+    ModelClass = getattr(transformers, model_class_name)
+    model_kwargs = {"trust_remote_code": trust_remote_code}
+    if DEVICE.type == "cuda":
+        model_kwargs.update(dtype=DTYPE, device_map="auto")
+    model = ModelClass.from_pretrained(MODEL_ID, **model_kwargs)
+    if DEVICE.type != "cuda":
+        model = model.to(DEVICE)
+    model.eval()
+
+    modality_text = architecture_text + " " + model_type
+    if any(x in modality_text for x in ("vision", "image", "ocr", "llava")):
+        from transformers import AutoProcessor
+        processor = AutoProcessor.from_pretrained(
+            MODEL_ID, trust_remote_code=trust_remote_code
+        )
+    elif any(x in modality_text for x in ("audio", "speech", "whisper")):
+        from transformers import AutoProcessor
+        processor = AutoProcessor.from_pretrained(
+            MODEL_ID, trust_remote_code=trust_remote_code
+        )
+    else:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(
+            MODEL_ID, trust_remote_code=trust_remote_code
+        )
+    loaded_class = model_class_name
+print(f"Loaded {loaded_class} on {DEVICE}")
+`;
+    }
+
+    async function fetchLoaderCell(modelId) {
+      const endpoint = `/api/hf-loader?modelId=${encodeURIComponent(modelId)}`;
+      try {
+        const response = await fetch(endpoint, { headers: { 'Accept': 'application/json' } });
+        const payload = await response.json();
+        if (!response.ok || !payload.loader) {
+          throw new Error(payload.error || `Loader service returned ${response.status}`);
+        }
+        return payload.loader;
+      } catch (error) {
+        console.warn('Using browser fallback for HF loader:', error.message);
+        return fallbackLoaderCell(modelId);
+      }
+    }
+
+    async function insertModelCode(cellId, model) {
+      const notebook = getActiveNotebook();
+      if (!notebook) return;
+      const cell = notebook.cells.find(c => c.id === cellId);
+      if (!cell) return;
+
+      const inferenceCellId = cell.modelInfo && cell.modelInfo.inferenceCellId;
+      cell.modelInfo = {
+        id:             model.id,
+        task:           model.pipeline_tag,
+        downloads:      model.downloads,
+        likes:          model.likes,
+        inferenceCellId: inferenceCellId || null
+      };
+      const task = (model.pipeline_tag || '').toLowerCase();
+      cell.content = `# Preparing the architecture-aware loader for ${model.id}…`;
+      updateNotebook();
+      renderNotebookEditor();
+      const loader = await fetchLoaderCell(model.id);
+
+      // The user may have selected another model while the request was in
+      // flight. Never let a slower response overwrite the newer selection.
+      const latestNotebook = getActiveNotebook();
+      const latestCell = latestNotebook && latestNotebook.cells.find(c => c.id === cellId);
+      if (!latestCell || latestCell.modelInfo?.id !== model.id) return;
+
+      latestCell.content = loader;
+      const inference = generateTaskTemplate(task);
+      let inferenceCell = inferenceCellId
+        ? latestNotebook.cells.find(c => c.id === inferenceCellId)
+        : null;
+
+      if (!inferenceCell) {
+        inferenceCell = {
+          id: latestNotebook.nextCellId++,
+          type: 'code',
+          content: inference,
+          output: '',
+          status: 'idle',
+          outputFormat: 'text',
+          modelInfo: {
+            role: 'inference',
+            loaderCellId: cellId,
+            modelId: model.id,
+            task: model.pipeline_tag
+          }
+        };
+        const loaderIndex = latestNotebook.cells.findIndex(c => c.id === cellId);
+        latestNotebook.cells.splice(loaderIndex + 1, 0, inferenceCell);
+        latestCell.modelInfo.inferenceCellId = inferenceCell.id;
+      } else {
+        inferenceCell.content = inference;
+        inferenceCell.modelInfo = {
+          ...(inferenceCell.modelInfo || {}),
+          role: 'inference',
+          loaderCellId: cellId,
+          modelId: model.id,
+          task: model.pipeline_tag
+        };
+        inferenceCell.output = '';
+        inferenceCell.outputFormat = 'text';
+      }
+
+      updateNotebook();
+      renderNotebookEditor();
+    }
+
+    // ── Tab navigation ──────────────────────────────────────────
+    const TAB_MAP = {
+      'notebooks':     'notebook-workspace',
+      'hf-updates':    'hf-updates-workspace',
+      'datasets':      'datasets-workspace',
+      'payment-plans': 'payment-plans-workspace',
+      'settings':      'settings-workspace'
+    };
+
+    (function() {
+      const nav = document.getElementById('main-nav');
+      if (nav) {
+        nav.addEventListener('click', function(e) {
+        const li = e.target.closest('li[data-tab]');
+        if (!li) return;
+        const tab = li.dataset.tab;
+
+        // hide all workspaces
+        Object.values(TAB_MAP).forEach(function(id) {
+          var el = document.getElementById(id);
+          if (el) el.style.display = 'none';
+        });
+
+        // show target
+        var target = document.getElementById(TAB_MAP[tab]);
+        if (target) target.style.display = 'block';
+
+        // update active nav item
+        document.querySelectorAll('#main-nav li[data-tab]').forEach(function(item) {
+          item.classList.remove('active');
+        });
+        li.classList.add('active');
+
+        // kick off content load
+        if (tab === 'hf-updates') loadHFUpdates();
+        if (tab === 'datasets') loadDatasets(true);
+      });
+      }
+    })();
+
+    // ── Datasets search ─────────────────────────────────────────
+    let dsModels = [];
+    let dsNextCursor = null;
+    let dsLoading = false;
+
+    async function loadDatasets(reset) {
+      if (dsLoading) return;
+      dsLoading = true;
+
+      const listDiv = document.getElementById('ds-list');
+      const loadMoreBtn = document.getElementById('ds-load-more');
+      if (reset) {
+        dsModels = [];
+        dsNextCursor = null;
+        listDiv.innerHTML = '<p style="color:#94a3b8;padding:8px 0;">Fetching datasets…</p>';
+        if (loadMoreBtn) loadMoreBtn.style.display = 'none';
+      } else {
+        if (loadMoreBtn) loadMoreBtn.textContent = 'Loading…';
+      }
+
+      const sort   = document.getElementById('ds-sort').value;
+      const tag    = document.getElementById('ds-tag').value;
+      const search = document.getElementById('ds-search').value.trim();
+
+      const params = new URLSearchParams({ limit: '30', full: 'false' });
+      if (sort) { params.set('sort', sort); params.set('direction', '-1'); }
+      if (tag)    params.set('filter', tag);
+      if (search) params.set('search', search);
+      if (dsNextCursor) params.set('cursor', dsNextCursor);
+
+      try {
+        const response = await fetch(`https://huggingface.co/api/datasets?${params}`);
+        if (!response.ok) throw new Error(`HF API returned ${response.status}`);
+        const data = await response.json();
+        const batch = Array.isArray(data) ? data : (data.datasets || []);
+        dsNextCursor = response.headers.get('X-Next-Cursor') || null;
+        dsModels = reset ? batch : [...dsModels, ...batch];
+        renderDSList();
+      } catch (err) {
+        listDiv.innerHTML = `<p style="color:#f87171;">Failed to load: ${err.message}. <button class="cell-btn" onclick="loadDatasets(true)">Retry</button></p>`;
+        console.error('Datasets API error:', err);
+      }
+
+      dsLoading = false;
+    }
+
+    function renderDSList() {
+      const listDiv = document.getElementById('ds-list');
+      const loadMoreBtn = document.getElementById('ds-load-more');
+
+      if (dsModels.length === 0) {
+        listDiv.innerHTML = '<p style="color:#94a3b8;">No datasets found.</p>';
+        if (loadMoreBtn) loadMoreBtn.style.display = 'none';
+        return;
+      }
+
+      listDiv.innerHTML = dsModels.map(dsCard).join('');
+      if (loadMoreBtn) {
+        loadMoreBtn.style.display = dsNextCursor ? 'inline-block' : 'none';
+        loadMoreBtn.textContent = 'Load more';
+      }
+    }
+
+    function dsCard(d) {
+      const dl    = (d.downloads  || 0).toLocaleString();
+      const likes = (d.likes      || 0).toLocaleString();
+      const ago   = d.lastModified ? timeAgo(d.lastModified) : '';
+      const url   = `https://huggingface.co/datasets/${d.id}`;
+      const tags  = (d.tags || []).slice(0, 3).map(t => `<span class="hfu-badge">${t}</span>`).join(' ');
+      return `<div class="model-card" style="display:flex;gap:14px;align-items:flex-start;">
+        <div style="font-size:1.6rem;line-height:1;">🗂️</div>
+        <div style="flex:1;min-width:0;">
+          <div style="font-weight:600;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+            <a href="${url}" target="_blank" style="color:#93c5fd;text-decoration:none;">${d.id}</a>
+          </div>
+          <div style="font-size:0.78rem;color:#94a3b8;display:flex;flex-wrap:wrap;gap:6px;align-items:center;">
+            ${tags}
+            <span>⬇️ ${dl}</span>
+            <span>👍 ${likes}</span>
+            ${ago ? `<span>🕒 ${ago}</span>` : ''}
+          </div>
+        </div>
+      </div>`;
+    }
+
+    // ── HF Updates ──────────────────────────────────────────────
+    let hfuLoaded = {};
+    let hfuCurrentTab = 'trending';
+
+    function switchUpdateTab(tab, btn) {
+      hfuCurrentTab = tab;
+      document.querySelectorAll('.hfu-tab').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      document.querySelectorAll('.hfu-panel').forEach(p => p.style.display = 'none');
+      const panel = document.getElementById(`hfu-${tab}`);
+      if (panel) panel.style.display = 'flex';
+      if (!hfuLoaded[tab]) fetchUpdatePanel(tab);
+    }
+
+    async function loadHFUpdates() {
+      hfuLoaded = {};
+      ['trending','new-models','spaces','datasets','blog'].forEach(tab => {
+        const panel = document.getElementById(`hfu-${tab}`);
+        if (panel) panel.innerHTML = '<div class="hfu-loading">Loading…</div>';
+      });
+      fetchUpdatePanel(hfuCurrentTab);
+    }
+
+    async function fetchUpdatePanel(tab) {
+      hfuLoaded[tab] = true;
+      const panel = document.getElementById(`hfu-${tab}`);
+      if (!panel) return;
+      panel.innerHTML = '<div class="hfu-loading">⏳ Fetching from Hugging Face…</div>';
+
+      try {
+        if (tab === 'trending') {
+          const r = await fetch('https://huggingface.co/api/models?limit=20&full=false');
+          if (!r.ok) throw new Error(r.status);
+          const models = await r.json();
+          panel.innerHTML = models.length ? models.map(m => modelCard(m, '🔥')).join('') : '<div class="hfu-loading">No results.</div>';
+
+        } else if (tab === 'new-models') {
+          const r = await fetch('https://huggingface.co/api/models?sort=createdAt&direction=-1&limit=20&full=false');
+          if (!r.ok) throw new Error(r.status);
+          const models = await r.json();
+          panel.innerHTML = models.length ? models.map(m => modelCard(m, '✨')).join('') : '<div class="hfu-loading">No results.</div>';
+
+        } else if (tab === 'spaces') {
+          const r = await fetch('https://huggingface.co/api/spaces?sort=lastModified&direction=-1&limit=20&full=false');
+          if (!r.ok) throw new Error(r.status);
+          const spaces = await r.json();
+          panel.className = 'hfu-panel hfu-grid';
+          panel.innerHTML = spaces.length ? spaces.map(s => spaceCard(s)).join('') : '<div class="hfu-loading">No results.</div>';
+
+        } else if (tab === 'datasets') {
+          const r = await fetch('https://huggingface.co/api/datasets?sort=lastModified&direction=-1&limit=20&full=false');
+          if (!r.ok) throw new Error(r.status);
+          const datasets = await r.json();
+          panel.className = 'hfu-panel hfu-grid';
+          panel.innerHTML = datasets.length ? datasets.map(d => datasetCard(d)).join('') : '<div class="hfu-loading">No results.</div>';
+
+        } else if (tab === 'blog') {
+          const proxy = `https://api.allorigins.win/get?url=${encodeURIComponent('https://huggingface.co/blog/feed.xml')}`;
+          const r = await fetch(proxy);
+          if (!r.ok) throw new Error(r.status);
+          const json = await r.json();
+          const parser = new DOMParser();
+          const xml = parser.parseFromString(json.contents, 'text/xml');
+          const items = [...xml.querySelectorAll('item')].slice(0, 15);
+          panel.innerHTML = items.length ? items.map(item => blogCard(item)).join('') : '<div class="hfu-loading">No posts found.</div>';
+        }
+      } catch (err) {
+        panel.innerHTML = `<div class="hfu-loading" style="color:#f87171;">Failed to load: ${err.message}
+          <br><button class="toolbar-btn" style="margin-top:12px;" onclick="fetchUpdatePanel('${tab}')">Retry</button></div>`;
+        hfuLoaded[tab] = false;
+      }
+    }
+
+    function modelCard(m, icon) {
+      const task  = m.pipeline_tag || 'model';
+      const dl    = (m.downloads  || 0).toLocaleString();
+      const likes = (m.likes      || 0).toLocaleString();
+      const ago   = m.lastModified ? timeAgo(m.lastModified) : '';
+      const url   = `https://huggingface.co/${m.id}`;
+      return `<div class="hfu-card">
+        <div class="hfu-card-icon">${icon}</div>
+        <div class="hfu-card-body">
+          <div class="hfu-card-title"><a href="${url}" target="_blank">${m.id}</a></div>
+          <div class="hfu-card-meta">
+            <span class="hfu-badge">${task}</span>
+            ⬇️ ${dl} &nbsp;👍 ${likes} ${ago ? `&nbsp;🕒 ${ago}` : ''}
+          </div>
+        </div>
+      </div>`;
+    }
+
+    function spaceCard(s) {
+      const url  = `https://huggingface.co/spaces/${s.id}`;
+      const ago  = s.lastModified ? timeAgo(s.lastModified) : '';
+      const sdk  = s.sdk || '';
+      return `<div class="hfu-card" style="flex-direction:column;gap:6px;">
+        <div class="hfu-card-title">🚀 <a href="${url}" target="_blank">${s.id}</a></div>
+        <div class="hfu-card-meta">
+          ${sdk ? `<span class="hfu-badge">${sdk}</span>` : ''}
+          👍 ${(s.likes||0).toLocaleString()} ${ago ? `&nbsp;🕒 ${ago}` : ''}
+        </div>
+      </div>`;
+    }
+
+    function datasetCard(d) {
+      const url = `https://huggingface.co/datasets/${d.id}`;
+      const ago = d.lastModified ? timeAgo(d.lastModified) : '';
+      return `<div class="hfu-card" style="flex-direction:column;gap:6px;">
+        <div class="hfu-card-title">📦 <a href="${url}" target="_blank">${d.id}</a></div>
+        <div class="hfu-card-meta">
+          ⬇️ ${(d.downloads||0).toLocaleString()} &nbsp;👍 ${(d.likes||0).toLocaleString()}
+          ${ago ? `&nbsp;🕒 ${ago}` : ''}
+        </div>
+      </div>`;
+    }
+
+    function blogCard(item) {
+      const title   = item.querySelector('title')?.textContent || 'Untitled';
+      const link    = item.querySelector('link')?.textContent || '#';
+      const pubDate = item.querySelector('pubDate')?.textContent || '';
+      const desc    = item.querySelector('description')?.textContent || '';
+      const clean   = desc.replace(/<[^>]+>/g, '').slice(0, 160);
+      const date    = pubDate ? new Date(pubDate).toLocaleDateString() : '';
+      return `<div class="hfu-card">
+        <div class="hfu-card-icon">📰</div>
+        <div class="hfu-card-body">
+          <div class="hfu-card-title"><a href="${link}" target="_blank">${title}</a></div>
+          <div class="hfu-card-meta">${date}</div>
+          <div class="hfu-card-desc">${clean}…</div>
+        </div>
+      </div>`;
+    }
+
+    function timeAgo(iso) {
+      const diff = Date.now() - new Date(iso).getTime();
+      const m = Math.floor(diff / 60000);
+      if (m < 60)   return `${m}m ago`;
+      const h = Math.floor(m / 60);
+      if (h < 24)   return `${h}h ago`;
+      const d = Math.floor(h / 24);
+      if (d < 30)   return `${d}d ago`;
+      return new Date(iso).toLocaleDateString();
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+      initGpuTerminal();
+      // Fetch the active GPU provider so the notebook can route cell runs to
+      // the right backend.  ZeroGPU → structured /api/zerogpu-run; Modal →
+      // existing /api/run-cell.
+      fetch('/api/gpu-config').then(r => r.ok ? r.json() : null).then(cfg => {
+        if (cfg) gpuProvider = cfg;
+      }).catch(() => { /* server will fall back to its default */ });
+      setTimeout(() => {
+        loadAllNotebooks();
+        renderUI();
+      }, 1000);
+    });
+
+    // ── ZeroGPU structured execution path ────────────────────────────────────────
+    // When the active GPU provider is ZeroGPU the dashboard never sends
+    // arbitrary notebook-cell Python.  It posts a structured
+    // { model_id, task, inputs:{ prompt, max_new_tokens } } to /api/zerogpu-run,
+    // and the Space loads and runs the model itself.  The prompt is parsed from
+    // the inference cell's generated Python (the `prompt = "..."` line) so the
+    // generator stays the sole source of the displayed example prompt; this
+    // function only adapts the transport, not the model cell template.
+    // Server-side hard limit for ZeroGPU max_new_tokens (mirrors gpu_backends.js
+    // and the Space).  Used only to warn early — values are never silently clamped.
+    const ZEROGPU_MAX_NEW_TOKENS = 2048;
+
+function parsePromptAndMaxTokens(inferenceContent, defaultPrompt) {
+      const text = String(inferenceContent || '');
+      // Simpler/forgiving: first "prompt = <string>" with either kind of quotes.
+      let prompt = defaultPrompt || 'Hello, world!';
+      const m2 = text.match(/^\s*prompt\s*=\s*f?(?:"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'|```([\s\S]*?)```)\s*$/m);
+      if (m2) prompt = m2[1] !== undefined ? m2[1] : (m2[2] !== undefined ? m2[2] : (m2[3] || defaultPrompt));
+
+      let maxNewTokens = 128;
+      const mTok = text.match(/max_new_tokens\s*=\s*(\d+)/);
+      if (mTok) {
+        const n = parseInt(mTok[1], 10);
+        // No silent clamping: the requested value is passed through verbatim.
+        // Values above the server-side hard limit (ZEROGPU_MAX_NEW_TOKENS)
+        // produce a visible validation error from /api/zerogpu-run instead of
+        // being silently reduced.
+        if (Number.isFinite(n) && n >= 1) maxNewTokens = n;
+      }
+      return { prompt, max_new_tokens: maxNewTokens };
+    }
+
+    async function runCellViaZeroGPU(notebook, cell) {
+      initGpuTerminal();
+      setGpuState('checking');
+      writeGpuLine(`\n$ ZeroGPU call… (${new Date().toLocaleTimeString()})`, 'gray');
+
+      // Resolve the model cell + task.  Inference cells point at their loader
+      // cell via modelInfo.loaderCellId; model cells themselves carry modelInfo.id.
+      let modelId = null;
+      let task = 'text-generation';
+      let inferenceContent = '';
+      if (cell.modelInfo?.role === 'inference') {
+        const loader = notebook.cells.find(c => c.id === cell.modelInfo.loaderCellId && c.type === 'model');
+        modelId = loader?.modelInfo?.id || cell.modelInfo.modelId || null;
+        task = String(cell.modelInfo.task || loader?.modelInfo?.task || task).toLowerCase();
+        inferenceContent = cell.content || '';
+      } else {
+        modelId = cell.modelInfo?.id || null;
+        task = String(cell.modelInfo?.task || task).toLowerCase();
+        const infs = notebook.cells.find(c =>
+          c.modelInfo?.role === 'inference' && c.modelInfo?.loaderCellId === cell.id
+        );
+        inferenceContent = infs?.content || '';
+      }
+
+      if (!modelId) {
+        writeGpuLine('❌ No model id resolved for this cell — pick a model in the picker first.', 'red');
+        setGpuState('disconnected');
+        return null;
+      }
+
+      const { prompt, max_new_tokens } = parsePromptAndMaxTokens(inferenceContent, 'Once upon a time');
+
+      writeGpuLine(`↗ POST /api/zerogpu-run  model=${modelId}  task=${task}  max_new_tokens=${max_new_tokens}`, 'gray');
+      if (max_new_tokens > ZEROGPU_MAX_NEW_TOKENS) {
+        writeGpuLine(`⚠️ max_new_tokens=${max_new_tokens} exceeds the hard limit of ${ZEROGPU_MAX_NEW_TOKENS} — the server will reject this with a validation error. Lower it in the inference cell.`, 'yellow');
+      }
+      writeGpuLine(`  prompt: ${prompt.length > 60 ? prompt.slice(0, 60) + '…' : prompt}`);
+
+      const body = { model_id: modelId, task, inputs: { prompt, max_new_tokens } };
+      try {
+        const res  = await fetch('/api/zerogpu-run', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify(body)
+        });
+
+        const status = res.status;
+        const contentType = res.headers.get('content-type') || 'N/A';
+        const contentLength = res.headers.get('content-length') || 'N/A';
+        const rawText = await res.text();
+
+        writeGpuLine(`🔍 DIAG: POST /api/zerogpu-run → status=${status} content-type=${contentType} content-length=${contentLength}`, 'gray');
+        writeGpuLine(`🔍 DIAG: first 3000 chars: ${rawText.slice(0, 3000)}`, 'gray');
+
+        let data;
+        try {
+          data = JSON.parse(rawText);
+        } catch (e) {
+          writeGpuLine(`🔍 DIAG: JSON parse failed: ${e.message}`, 'red');
+          data = { error: 'Non-JSON response from server', raw: rawText.slice(0, 500) };
+        }
+
+        setGpuState(res.ok ? 'connected' : 'disconnected');
+
+        if (!res.ok || data.error) {
+          const code = data.code ? ` (${data.code})` : '';
+          writeGpuLine(`❌ ZeroGPU${code}: ${data.error || JSON.stringify(data)}`, 'red');
+          return null;
+        }
+        const text = (data.output || '').trim();
+        if (text) {
+          for (const line of text.split('\n')) writeGpuLine(line);
+        }
+        writeGpuLine('✔ Done.', 'green');
+        return text || '✅ Executed successfully (no output)';
+      } catch (err) {
+        setGpuState('disconnected');
+        writeGpuLine(`❌ Network error: ${err.message}`, 'red');
+        return null;
+      }
+    }
+
+    // Streams a cell's code execution over SSE into the shared GPU terminal.
+    // Falls back to the (still-available) /api/run-cell JSON endpoint for
+    // very long code blocks, since EventSource passes code via query string
+    // and long URLs can get rejected by servers/proxies.
+    const STREAM_CODE_LENGTH_LIMIT = 6000;
+
+    function streamCellToTerminal(code) {
+      initGpuTerminal();
+
+      if ((code || '').length > STREAM_CODE_LENGTH_LIMIT) {
+        writeGpuLine('⚠️ Code is long, falling back to standard (non-streamed) execution…', 'yellow');
+        return runCellViaJson(code);
+      }
+
+      return new Promise((resolve) => {
+        if (activeStream) {
+          activeStream.close();
+          activeStream = null;
+        }
+
+        setGpuState('checking');
+        writeGpuLine(`\n$ Running cell… (${new Date().toLocaleTimeString()})`, 'gray');
+
+        const lines = [];
+        let sawOutput = false;
+        const url = `/api/stream-logs?code=${encodeURIComponent(code || '')}`;
+        const es  = new EventSource(url);
+        activeStream = es;
+
+        const finish = (ok) => {
+          if (activeStream === es) activeStream = null;
+          es.close();
+          setGpuState(ok ? 'connected' : 'disconnected');
+          resolve({ ok, text: lines.join('\n').trim() });
+        };
+
+        es.onmessage = (evt) => {
+          try {
+            const { line } = JSON.parse(evt.data);
+            sawOutput = true;
+            lines.push(line);
+            const isErrLine = /Traceback|Error/.test(line);
+            writeGpuLine(line, isErrLine ? 'red' : undefined);
+          } catch {
+            // ignore malformed frame
+          }
+        };
+
+        es.addEventListener('done', (evt) => {
+          let ok = sawOutput;
+          try {
+            const data = JSON.parse(evt.data);
+            ok = data.ok !== false;
+            if (data.message) writeGpuLine(data.message, ok ? 'gray' : 'red');
+          } catch {
+            // ignore malformed frame
+          }
+          writeGpuLine(ok ? '✔ Done.' : '✖ Finished with errors.', ok ? 'green' : 'red');
+          finish(ok);
+        });
+
+        es.onerror = () => {
+          writeGpuLine('❌ Connection to GPU stream lost.', 'red');
+          finish(false);
+        };
+      });
+    }
+
+    async function runCellViaJson(code) {
+      setGpuState('checking');
+      try {
+        const res  = await fetch('/api/run-cell', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ code })
+        });
+        const data = await res.json();
+        setGpuState('connected');
+
+        if (!res.ok || data.error) {
+          writeGpuLine(data.error || JSON.stringify(data), 'red');
+          return { ok: false, text: data.error || JSON.stringify(data) };
+        }
+        if (data.status === 'error' || data.stderr) {
+          const text = [data.stderr, data.output].filter(Boolean).join('\n').trim();
+          writeGpuLine(text, 'red');
+          return { ok: false, text };
+        }
+        const text = data.output?.trim() || '';
+        if (text) writeGpuLine(text);
+        writeGpuLine('✔ Done.', 'green');
+        return { ok: true, text };
+      } catch (err) {
+        setGpuState('disconnected');
+        writeGpuLine(`❌ Network error: ${err.message}`, 'red');
+        return { ok: false, text: `Network error: ${err.message}` };
+      }
+    }
+
+    window.onclick = function(event) {
+      const modal = document.getElementById('model-picker-modal');
+      if (event.target === modal) {
+        closeModelPicker();
+      }
+    }

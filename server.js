@@ -94,7 +94,7 @@ app.use(cors({
     if (allowedOrigins.includes(origin) || allowedOrigins.includes('*')) return cb(null, true);
     // For development, allow localhost any port
     if (origin.startsWith('http://localhost:') || origin.startsWith('http://127.0.0.1:')) return cb(null, true);
-    return cb(new Error('Not allowed by CORS'), false);
+    return cb(null, false); // reject cleanly — no thrown Error, no 500
   },
   credentials: true
 }));
@@ -895,6 +895,16 @@ app.get('/*splat', (req,res,next)=>{
   if (req.path.startsWith('/api/')) return next();
   // Let static handle if file exists, otherwise 404
   return res.status(404).send('Not found');
+});
+
+// ── Generic error handler (must be last) ────────────────────────────────
+app.use((err, req, res, next) => {
+  console.error(err); // full detail stays in server logs
+  if (res.headersSent) return next(err);
+  res.status(err.status || 500).json({
+    error: process.env.NODE_ENV === 'production' ? 'internal server error' : err.message,
+    code: 'internal_error'
+  });
 });
 
 if (require.main === module) {

@@ -79,6 +79,7 @@ app.use(helmet({
         "https://identitytoolkit.googleapis.com",  // Firebase Auth REST calls
         "https://securetoken.googleapis.com",       // Firebase token refresh
       ],
+      "script-src-attr": ["'unsafe-inline'"],
     },
   },
 }));

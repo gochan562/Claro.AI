@@ -59,7 +59,29 @@ const gpuBackend = resolveBackend(process.env);
 const trainingBackend = require('./training_backend');
 
 // ── Security headers ───────────────────────────────────────────────────
-app.use(helmet());
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      ...helmet.contentSecurityPolicy.getDefaultDirectives(),
+      "script-src": [
+        "'self'",
+        "https://www.gstatic.com",       // Firebase SDK
+        "https://cdn.jsdelivr.net",      // marked, dompurify, xterm, chart.js
+        "https://cdnjs.cloudflare.com",  // codemirror
+      ],
+      "img-src": [
+        "'self'",
+        "data:",
+        "https://api.dicebear.com",      // dashboard avatar
+      ],
+      "connect-src": [
+        "'self'",
+        "https://identitytoolkit.googleapis.com",  // Firebase Auth REST calls
+        "https://securetoken.googleapis.com",       // Firebase token refresh
+      ],
+    },
+  },
+}));
 
 // ── CORS allow-list ────────────────────────────────────────────────────
 const allowedOrigins = (process.env.FRONTEND_ORIGIN || 'http://localhost:5000')

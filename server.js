@@ -16,6 +16,35 @@ const app  = express();
 const PORT = process.env.PORT || 5000;
 const execFileAsync = promisify(execFile);
 
+// ── Firebase Admin (for verifying Firebase ID tokens) ───────────────────
+if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
+  try {
+    const credPath = '/tmp/firebase-service-account.json';
+    fs.writeFileSync(credPath, process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
+    process.env.GOOGLE_APPLICATION_CREDENTIALS = credPath;
+  } catch (e) {
+    console.error('Failed to write GOOGLE_APPLICATION_CREDENTIALS_JSON to tmp file', e);
+  }
+}
+let admin;
+let getAuth;
+try {
+  admin = require('firebase-admin');
+  ({ getAuth } = require('firebase-admin/auth'));
+  // Only initialize if credentials are available; otherwise lazy-init will fail gracefully on first use
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS || process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON || process.env.FIREBASE_CONFIG) {
+    admin.initializeApp({ credential: admin.credential.applicationDefault() });
+  } else {
+    // Initialize without explicit credential for environments where ADC is not set;
+    // verifyIdToken will fail until proper credentials are provided, which is expected in tests.
+    try { admin.initializeApp(); } catch (_) {}
+  }
+} catch (e) {
+  console.warn('firebase-admin not available or failed to init:', e.message);
+  admin = null;
+  getAuth = null;
+}
+
 // GPU provider abstraction.  GPU_PROVIDER controls which backend resolves:
 //   "zerogpu" (default) → Hugging Face ZeroGPU Space (Gradio API)
 //   "modal"             → existing Modal endpoints (forwarded unchanged)
@@ -209,6 +238,43 @@ app.get('/api/auth/me', (req,res)=>{
   const user = findUserById(req.session.userId);
   if (!user) return res.status(401).json({ error: 'unauthorized' });
   return res.json({ user: { id: user.id, email: user.email, username: user.username, role: user.role } });
+});
+
+app.post('/api/auth/firebase-session', async (req, res) => {
+  try {
+    if (!admin || !getAuth) return res.status(500).json({ error: 'firebase admin not configured', code: 'server_error' });
+    const { idToken, username } = req.body || {};
+    if (!idToken) return res.status(400).json({ error: 'missing idToken', code: 'bad_request' });
+    const decoded = await getAuth().verifyIdToken(idToken);
+    const cleanEmail = String(decoded.email || '').trim().toLowerCase();
+    if (!cleanEmail) return res.status(400).json({ error: 'token has no email', code: 'bad_request' });
+
+    let user = findUserByEmail(cleanEmail);
+    if (!user) {
+      const users = loadUsers();
+      const adminEmails = (process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || '')
+        .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+      const role = adminEmails.includes(cleanEmail) ? 'admin'
+                  : (users.length === 0 ? 'admin' : 'user');
+      user = {
+        id: 'user_' + require('crypto').randomBytes(6).toString('hex'),
+        email: cleanEmail,
+        username: (username || decoded.name || cleanEmail.split('@')[0]),
+        passwordHash: null,
+        provider: 'firebase',
+        createdAt: new Date().toISOString()
+      };
+      users.push(user);
+      saveUsers(users);
+    }
+    req.session.userId = user.id;
+    req.session.email = user.email;
+    req.session.role = user.role;
+    return res.json({ ok: true, user: { id: user.id, email: user.email, username: user.username, role: user.role } });
+  } catch (e) {
+    console.error('firebase-session error', e);
+    return res.status(401).json({ error: 'invalid or expired token', code: 'unauthorized' });
+  }
 });
 
 // ── GET /api/hf-loader (public, used for model picker) ─────────────────
@@ -662,6 +728,7 @@ app.post('/api/inference/trained', requireAuth, strictLimiter, async (req, res) 
     return res.status(status).json({ error: err.message, code });
   }
 
+  // Use artifact metadata to derive paths — never use client-provided paths
   const jobId = meta.job_id;
   const taskType = String(task || meta.task_type || 'text-generation').toLowerCase();
   const maxTokens = Math.min(parseInt(max_new_tokens, 10) || 100, 2048);

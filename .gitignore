@@ -7,3 +7,5 @@ __pycache__/
 .env
 .env.*
 !.env.example
+firebase-service-account.json
+/tmp/firebase-service-account.json

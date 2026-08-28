@@ -204,13 +204,35 @@
     </div>
   </div>
 
+  <script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import {
+    getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword,
+    GoogleAuthProvider, GithubAuthProvider, signInWithPopup
+  } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyD9hhRlXX_PmTSlOnVAtRGtLwiGNTQPJV8",
+    authDomain: "claro-ai-signup.firebaseapp.com",
+    projectId: "claro-ai-signup",
+    storageBucket: "claro-ai-signup.firebasestorage.app",
+    messagingSenderId: "879903723540",
+    appId: "1:879903723540:web:d7f90ec1c91e0ec27bd701"
+  };
+  const app = initializeApp(firebaseConfig);
+  const auth = getAuth(app);
+  window._auth = auth;
+  window._fb = { signInWithEmailAndPassword, createUserWithEmailAndPassword,
+                 GoogleAuthProvider, GithubAuthProvider, signInWithPopup };
+</script>
   <script>
-    async function postJSON(url, body) {
-      const res = await fetch(url, {
+    async function establishServerSession(firebaseUser) {
+      const idToken = await firebaseUser.getIdToken();
+      const res = await fetch('/api/auth/firebase-session', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        body: JSON.stringify(body)
+        body: JSON.stringify({ idToken })
       });
       const data = await res.json().catch(() => ({}));
       return { res, data };
@@ -218,26 +240,36 @@
     document.querySelector(".login").addEventListener("click", async () => {
       const email = document.getElementById("email").value.trim();
       const password = document.getElementById("password").value;
-      if (!email || !password) {
-        alert("⚠️ Please fill in both email and password.");
-        return;
-      }
-      if (!email.includes("@")) {
-        alert("⚠️ Invalid email format.");
-        return;
-      }
-      const { res, data } = await postJSON('/api/auth/login', { email, password });
-      if (res.ok && data.ok) {
-        window.location.href = "dashboard.html";
-      } else {
-        alert("⚠️ Login failed: " + (data.error || res.statusText));
+      if (!email || !password) { alert("⚠️ Please fill in both email and password."); return; }
+      if (!email.includes("@")) { alert("⚠️ Invalid email format."); return; }
+      try {
+        const cred = await window._fb.signInWithEmailAndPassword(window._auth, email, password);
+        const { res, data } = await establishServerSession(cred.user);
+        if (res.ok && data.ok) window.location.href = "dashboard.html";
+        else alert("⚠️ Login failed: " + (data.error || res.statusText));
+      } catch (e) {
+        alert("⚠️ Login failed: " + (e.message || "unknown error"));
       }
     });
-    document.getElementById("google-login").addEventListener("click", () => {
-      alert("Google sign-in is not configured for this deployment. Please use email/password.");
+    document.getElementById("google-login").addEventListener("click", async () => {
+      try {
+        const cred = await window._fb.signInWithPopup(window._auth, new window._fb.GoogleAuthProvider());
+        const { res, data } = await establishServerSession(cred.user);
+        if (res.ok && data.ok) window.location.href = "dashboard.html";
+        else alert("⚠️ Sign-in failed: " + (data.error || res.statusText));
+      } catch (e) {
+        alert("⚠️ Sign-in failed: " + (e.message || "unknown error"));
+      }
     });
-    document.getElementById("github-login").addEventListener("click", () => {
-      alert("GitHub sign-in is not configured for this deployment. Please use email/password.");
+    document.getElementById("github-login").addEventListener("click", async () => {
+      try {
+        const cred = await window._fb.signInWithPopup(window._auth, new window._fb.GithubAuthProvider());
+        const { res, data } = await establishServerSession(cred.user);
+        if (res.ok && data.ok) window.location.href = "dashboard.html";
+        else alert("⚠️ Sign-in failed: " + (data.error || res.statusText));
+      } catch (e) {
+        alert("⚠️ Sign-in failed: " + (e.message || "unknown error"));
+      }
     });
   </script>
 </body>

@@ -23,32 +23,23 @@ async function establishServerSession(firebaseUser) {
         alert("⚠️ Login failed: " + (e.message || "unknown error"));
       }
     });
-    document.getElementById("google-login").addEventListener("click", async () => {
+document.getElementById("google-login").addEventListener("click", async () => {
   try {
-    await window._fb.signInWithRedirect(window._auth, new window._fb.GoogleAuthProvider());
-    // page navigates away here; nothing after this line runs until the user returns
+    const cred = await window._fb.signInWithPopup(window._auth, new window._fb.GoogleAuthProvider());
+    const { res, data } = await establishServerSession(cred.user);
+    if (res.ok && data.ok) window.location.href = "dashboard.html";
+    else alert("⚠️ Sign-in failed: " + (data.error || res.statusText));
   } catch (e) {
     alert("⚠️ Sign-in failed: " + (e.message || "unknown error"));
   }
 });
 document.getElementById("github-login").addEventListener("click", async () => {
   try {
-    await window._fb.signInWithRedirect(window._auth, new window._fb.GithubAuthProvider());
+    const cred = await window._fb.signInWithPopup(window._auth, new window._fb.GithubAuthProvider());
+    const { res, data } = await establishServerSession(cred.user);
+    if (res.ok && data.ok) window.location.href = "dashboard.html";
+    else alert("⚠️ Sign-in failed: " + (data.error || res.statusText));
   } catch (e) {
     alert("⚠️ Sign-in failed: " + (e.message || "unknown error"));
   }
 });
-(async () => {
-  try {
-    const cred = await window._fb.getRedirectResult(window._auth);
-    if (cred && cred.user) {
-      const { res, data } = await establishServerSession(cred.user);
-      if (res.ok && data.ok) window.location.href = "dashboard.html";
-      else alert("⚠️ Sign-in failed: " + (data.error || res.statusText));
-    }
-  } catch (e) {
-    if (e && e.code && e.code !== 'auth/null-user') {
-      alert("⚠️ Sign-in failed: " + (e.message || "unknown error"));
-    }
-  }
-})();

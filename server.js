@@ -67,6 +67,7 @@ app.use(helmet({
       "script-src": [
         "'self'",
         "https://www.gstatic.com",       // Firebase SDK
+        "https://apis.google.com",        // NEW: Google iframe/popup helper (pi.js)
         "https://cdn.jsdelivr.net",      // marked, dompurify, xterm, chart.js
         "https://cdnjs.cloudflare.com",  // codemirror
       ],
@@ -79,6 +80,7 @@ app.use(helmet({
         "'self'",
         "https://identitytoolkit.googleapis.com",  // Firebase Auth REST calls
         "https://securetoken.googleapis.com",       // Firebase token refresh
+        "https://www.googleapis.com",      // NEW: required alongside apis.google.com
       ],
       "script-src-attr": ["'unsafe-inline'"],
     },

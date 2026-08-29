@@ -1,7 +1,7 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
   import {
     getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword,
-    GoogleAuthProvider, GithubAuthProvider, signInWithPopup
+    GoogleAuthProvider, GithubAuthProvider, signInWithRedirect, getRedirectResult
   } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 
   const firebaseConfig = {
@@ -16,4 +16,4 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/fireba
   const auth = getAuth(app);
   window._auth = auth;
   window._fb = { signInWithEmailAndPassword, createUserWithEmailAndPassword,
-                 GoogleAuthProvider, GithubAuthProvider, signInWithPopup };
+                 GoogleAuthProvider, GithubAuthProvider, signInWithRedirect, getRedirectResult };

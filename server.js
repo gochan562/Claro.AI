@@ -60,6 +60,7 @@ const trainingBackend = require('./training_backend');
 
 // ── Security headers ───────────────────────────────────────────────────
 app.use(helmet({
+  crossOriginOpenerPolicy: { policy: "same-origin-allow-popups" },
   contentSecurityPolicy: {
     directives: {
       ...helmet.contentSecurityPolicy.getDefaultDirectives(),

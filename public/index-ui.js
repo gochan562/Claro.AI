@@ -10,9 +10,6 @@ const fileInput = document.getElementById("modelFile");
       }
     });
 
-document.getElementById('nav-login').addEventListener('click', () => {
-  location.href = 'Login.html';
-});
-document.getElementById('nav-signup').addEventListener('click', () => {
-  location.href = 'signup.html';
+document.getElementById('nav-dashboard').addEventListener('click', () => {
+  location.href = 'dashboard.html';
 });

@@ -2,11 +2,8 @@ require('dotenv').config();
 const express = require('express');
 const cors    = require('cors');
 const helmet  = require('helmet');
-const session = require('express-session');
 const rateLimit = require('express-rate-limit');
 const { ipKeyGenerator } = require('express-rate-limit');
-const bcrypt  = require('bcrypt');
-const fs      = require('fs');
 const path    = require('path');
 const { Readable } = require('stream');
 const { execFile } = require('child_process');
@@ -16,34 +13,18 @@ const app  = express();
 const PORT = process.env.PORT || 5000;
 const execFileAsync = promisify(execFile);
 
-// ── Firebase Admin (for verifying Firebase ID tokens) ───────────────────
-if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
-  try {
-    const credPath = '/tmp/firebase-service-account.json';
-    fs.writeFileSync(credPath, process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
-    process.env.GOOGLE_APPLICATION_CREDENTIALS = credPath;
-  } catch (e) {
-    console.error('Failed to write GOOGLE_APPLICATION_CREDENTIALS_JSON to tmp file', e);
-  }
-}
-let admin;
-let getAuth;
-try {
-  admin = require('firebase-admin');
-  ({ getAuth } = require('firebase-admin/auth'));
-  // Only initialize if credentials are available; otherwise lazy-init will fail gracefully on first use
-  if (process.env.GOOGLE_APPLICATION_CREDENTIALS || process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON || process.env.FIREBASE_CONFIG) {
-    admin.initializeApp({ credential: admin.credential.applicationDefault() });
-  } else {
-    // Initialize without explicit credential for environments where ADC is not set;
-    // verifyIdToken will fail until proper credentials are provided, which is expected in tests.
-    try { admin.initializeApp(); } catch (_) {}
-  }
-} catch (e) {
-  console.warn('firebase-admin not available or failed to init:', e.message);
-  admin = null;
-  getAuth = null;
-}
+// ── Auth removed ─────────────────────────────────────────────────────────
+// Claro.AI runs as a single-user local app with no login. There is no
+// Firebase Admin, no session, and no user store. Training/GPU endpoints that
+// were previously gated behind requireAuth/requireAdmin are intentionally
+// open. NOTE: /api/run-cell and /api/stream-logs forward caller-supplied code
+// to a Modal backend and therefore allow remote code execution by anyone who
+// can reach this server — see the route comments below. Only expose this
+// server to trusted networks (localhost by default).
+
+// Single anonymous owner id used for training jobs (per-user quota and job
+// ownership collapse to one local user; no account system).
+const ANON_USER_ID = 'local-user';
 
 // GPU provider abstraction.  GPU_PROVIDER controls which backend resolves:
 //   "zerogpu" (default) → Hugging Face ZeroGPU Space (Gradio API)
@@ -66,8 +47,6 @@ app.use(helmet({
       ...helmet.contentSecurityPolicy.getDefaultDirectives(),
       "script-src": [
         "'self'",
-        "https://www.gstatic.com",       // Firebase SDK
-        "https://apis.google.com",        // NEW: Google iframe/popup helper (pi.js)
         "https://cdn.jsdelivr.net",      // marked, dompurify, xterm, chart.js
         "https://cdnjs.cloudflare.com",  // codemirror
       ],
@@ -78,9 +57,6 @@ app.use(helmet({
       ],
       "connect-src": [
         "'self'",
-        "https://identitytoolkit.googleapis.com",  // Firebase Auth REST calls
-        "https://securetoken.googleapis.com",       // Firebase token refresh
-        "https://www.googleapis.com",      // NEW: required alongside apis.google.com
       ],
       "script-src-attr": ["'unsafe-inline'"],
     },
@@ -106,20 +82,6 @@ app.use(cors({
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// ── Session ────────────────────────────────────────────────────────────
-const SESSION_SECRET = process.env.SESSION_SECRET || 'change-me-to-a-long-random-string-please-set-SESSION_SECRET';
-app.use(session({
-  secret: SESSION_SECRET,
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production', // true only over https in prod
-    sameSite: 'lax',
-    maxAge: 1000*60*60*24 // 1 day
-  }
-}));
-
 // ── Rate limiting ───────────────────────────────────────────────────────
 const globalLimiter = rateLimit({
   windowMs: 15*60*1000,
@@ -132,175 +94,17 @@ app.use(globalLimiter);
 const strictLimiter = rateLimit({
   windowMs: 60*1000,
   max: 10,
-  keyGenerator: (req) => req.session?.userId || ipKeyGenerator(req.ip),
+  keyGenerator: (req) => ipKeyGenerator(req.ip),
   standardHeaders: true,
   legacyHeaders: false,
   handler: (req,res)=> res.status(429).json({ error: 'too many requests', code: 'rate_limited' })
 });
-
-// ── User store (file-based JSON outside web root) ─────────────────────
-const USERS_FILE = path.join(__dirname, 'users.json');
-function loadUsers(){
-  try {
-    if (!fs.existsSync(USERS_FILE)) return [];
-    const raw = fs.readFileSync(USERS_FILE,'utf8');
-    return JSON.parse(raw);
-  } catch { return []; }
-}
-function saveUsers(users){
-  try { fs.writeFileSync(USERS_FILE, JSON.stringify(users,null,2)); } catch(e){ console.error('Failed to save users', e); }
-}
-function findUserByEmail(email){
-  const users = loadUsers();
-  return users.find(u => u.email.toLowerCase() === String(email).toLowerCase());
-}
-function findUserById(id){
-  const users = loadUsers();
-  return users.find(u => u.id === id);
-}
-function validateEmail(email){
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email).trim());
-}
-
-// ── Auth middleware ────────────────────────────────────────────────────
-function requireAuth(req,res,next){
-  if (!req.session?.userId) return res.status(401).json({ error: 'unauthorized', code: 'unauthorized' });
-  const user = findUserById(req.session.userId);
-  if (!user) return res.status(401).json({ error: 'unauthorized', code: 'unauthorized' });
-  req.user = user;
-  next();
-}
-function requireAdmin(req,res,next){
-  if (!req.session?.userId) return res.status(401).json({ error: 'unauthorized', code: 'unauthorized' });
-  const user = findUserById(req.session.userId);
-  if (!user) return res.status(401).json({ error: 'unauthorized', code: 'unauthorized' });
-  const adminEmails = (process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || '').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
-  const isAdmin = user.role === 'admin' || adminEmails.includes(user.email.toLowerCase());
-  if (!isAdmin) return res.status(403).json({ error: 'forbidden', code: 'forbidden' });
-  req.user = user;
-  next();
-}
-function checkOwnershipOr404(job, userId, res){
-  if (!trainingBackend.isOwner(job, userId)) {
-    // Check admin override
-    const user = findUserById(userId);
-    const adminEmails = (process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || '').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
-    const isAdmin = user && (user.role === 'admin' || adminEmails.includes(user.email.toLowerCase()));
-    if (isAdmin) return true;
-    // Return 404 to avoid confirming existence
-    res.status(404).json({ error: 'Job not found', code: 'not_found' });
-    return false;
-  }
-  return true;
-}
 
 // ── Static serving (restricted to public/) ─────────────────────────────
 app.use(express.static(path.join(__dirname, 'public')));
 // Explicitly handle root
 app.get('/', (req,res)=>{
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-// ── Auth endpoints ─────────────────────────────────────────────────────
-app.post('/api/auth/signup', async (req,res)=>{
-  try {
-    const { email, password, username, name } = req.body || {};
-    const cleanEmail = String(email||'').trim().toLowerCase();
-    const cleanUser = String(username || name || '').trim();
-    const pwd = String(password||'');
-    if (!validateEmail(cleanEmail)) return res.status(400).json({ error: 'Invalid email format', code: 'bad_request' });
-    if (!pwd || pwd.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters', code: 'bad_request' });
-    if (findUserByEmail(cleanEmail)) return res.status(409).json({ error: 'Email already registered', code: 'conflict' });
-    const hash = await bcrypt.hash(pwd, 12);
-    const users = loadUsers();
-    const id = 'user_' + require('crypto').randomBytes(6).toString('hex');
-    const role = users.length === 0 ? 'admin' : 'user'; // first user is admin for bootstrapping
-    const adminEmails = (process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || '').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
-    const finalRole = adminEmails.includes(cleanEmail) ? 'admin' : role;
-    const user = { id, email: cleanEmail, username: cleanUser || cleanEmail.split('@')[0], passwordHash: hash, role: finalRole, createdAt: new Date().toISOString() };
-    users.push(user);
-    saveUsers(users);
-    // Auto-login after signup
-    req.session.userId = user.id;
-    req.session.email = user.email;
-    req.session.role = user.role;
-    return res.json({ ok:true, user: { id: user.id, email: user.email, username: user.username, role: user.role } });
-  } catch(e){
-    console.error('signup error', e);
-    return res.status(500).json({ error: 'signup failed', code: 'server_error' });
-  }
-});
-
-app.post('/api/auth/login', async (req,res)=>{
-  try {
-    const { email, password } = req.body || {};
-    const cleanEmail = String(email||'').trim().toLowerCase();
-    const pwd = String(password||'');
-    if (!cleanEmail || !pwd) return res.status(400).json({ error: 'Email and password required', code: 'bad_request' });
-    const user = findUserByEmail(cleanEmail);
-    if (!user) return res.status(401).json({ error: 'Invalid credentials', code: 'unauthorized' });
-    const ok = await bcrypt.compare(pwd, user.passwordHash);
-    if (!ok) return res.status(401).json({ error: 'Invalid credentials', code: 'unauthorized' });
-    req.session.userId = user.id;
-    req.session.email = user.email;
-    req.session.role = user.role;
-    return res.json({ ok:true, user: { id: user.id, email: user.email, username: user.username, role: user.role } });
-  } catch(e){
-    console.error('login error', e);
-    return res.status(500).json({ error: 'login failed', code: 'server_error' });
-  }
-});
-
-app.post('/api/auth/logout', (req,res)=>{
-  req.session.destroy(err=>{
-    if (err) return res.status(500).json({ error: 'logout failed' });
-    res.clearCookie('connect.sid');
-    return res.json({ ok:true });
-  });
-});
-
-app.get('/api/auth/me', (req,res)=>{
-  if (!req.session?.userId) return res.status(401).json({ error: 'unauthorized', code: 'unauthorized' });
-  const user = findUserById(req.session.userId);
-  if (!user) return res.status(401).json({ error: 'unauthorized' });
-  return res.json({ user: { id: user.id, email: user.email, username: user.username, role: user.role } });
-});
-
-app.post('/api/auth/firebase-session', async (req, res) => {
-  try {
-    if (!admin || !getAuth) return res.status(500).json({ error: 'firebase admin not configured', code: 'server_error' });
-    const { idToken, username } = req.body || {};
-    if (!idToken) return res.status(400).json({ error: 'missing idToken', code: 'bad_request' });
-    const decoded = await getAuth().verifyIdToken(idToken);
-    const cleanEmail = String(decoded.email || '').trim().toLowerCase();
-    if (!cleanEmail) return res.status(400).json({ error: 'token has no email', code: 'bad_request' });
-
-    let user = findUserByEmail(cleanEmail);
-    if (!user) {
-      const users = loadUsers();
-      const adminEmails = (process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || '')
-        .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-      const role = adminEmails.includes(cleanEmail) ? 'admin'
-                  : (users.length === 0 ? 'admin' : 'user');
-      user = {
-        id: 'user_' + require('crypto').randomBytes(6).toString('hex'),
-        email: cleanEmail,
-        username: (username || decoded.name || cleanEmail.split('@')[0]),
-        passwordHash: null,
-        provider: 'firebase',
-        createdAt: new Date().toISOString()
-      };
-      users.push(user);
-      saveUsers(users);
-    }
-    req.session.userId = user.id;
-    req.session.email = user.email;
-    req.session.role = user.role;
-    return res.json({ ok: true, user: { id: user.id, email: user.email, username: user.username, role: user.role } });
-  } catch (e) {
-    console.error('firebase-session error', e);
-    return res.status(401).json({ error: 'invalid or expired token', code: 'unauthorized' });
-  }
 });
 
 // ── GET /api/hf-loader (public, used for model picker) ─────────────────
@@ -389,9 +193,11 @@ app.get('/api/gpu-config', (req, res) => {
 });
 
 // ── GET /api/stream-logs ─────────────────────────────────────────────────────
-// NOTE: This endpoint was previously open to RCE when GPU_PROVIDER=modal.
-// Now gated behind admin auth.
-app.get('/api/stream-logs', requireAuth, requireAdmin, async (req, res) => {
+// NOTE: This endpoint forwards caller-supplied code to a Modal backend, so
+// anyone who can reach this server can execute code via the configured Modal
+// app. It was previously gated behind admin auth; with login removed it is
+// open. Only expose this server to trusted networks (localhost by default).
+app.get('/api/stream-logs', async (req, res) => {
   const { MODAL_STREAM_URL, MODAL_AUTH_SECRET } = process.env;
   const code = req.query.code || '';
 
@@ -458,7 +264,7 @@ app.get('/api/stream-logs', requireAuth, requireAdmin, async (req, res) => {
 });
 
 // ── POST /api/zerogpu-run ─────────────────────────────────────────────────────
-app.post('/api/zerogpu-run', requireAuth, strictLimiter, async (req, res) => {
+app.post('/api/zerogpu-run', strictLimiter, async (req, res) => {
   if (gpuBackend.kind !== 'zerogpu') {
     return res.status(400).json({
       error: `Not on ZeroGPU backend (current provider: ${gpuBackend.kind}). Set GPU_PROVIDER=zerogpu to use this endpoint.`,
@@ -483,7 +289,7 @@ app.post('/api/zerogpu-run', requireAuth, strictLimiter, async (req, res) => {
 });
 
 // ── GET /api/zerogpu-stream ──────────────────────────────────────────────────
-app.get('/api/zerogpu-stream', requireAuth, async (req, res) => {
+app.get('/api/zerogpu-stream', async (req, res) => {
   res.set({
     'Content-Type':      'text/event-stream',
     'Cache-Control':     'no-cache',
@@ -525,9 +331,11 @@ app.get('/api/zerogpu-stream', requireAuth, async (req, res) => {
 });
 
 // ── POST /api/run-cell ────────────────────────────────────────────────────────
-// Disabled by default for security. Only admin may use it when explicitly enabled.
-// Even admin is rate-limited.
-app.post('/api/run-cell', requireAuth, requireAdmin, strictLimiter, async (req, res) => {
+// NOTE: This endpoint executes caller-supplied code on the Modal backend, so
+// anyone who can reach this server can run code via the configured Modal app.
+// It was previously gated behind admin auth; with login removed it is open
+// (rate-limited). Only expose this server to trusted networks.
+app.post('/api/run-cell', strictLimiter, async (req, res) => {
   const { code } = req.body || {};
   if (!code || !String(code).trim()) {
     return res.status(400).json({ error: 'No code provided.' });
@@ -553,16 +361,16 @@ app.post('/api/run-cell', requireAuth, requireAdmin, strictLimiter, async (req, 
 });
 
 // ── Training Engine ────────────────────────────────────────────────────────
-app.post('/api/train/start', requireAuth, strictLimiter, async (req, res) => {
+app.post('/api/train/start', strictLimiter, async (req, res) => {
   try {
-    // Per-user quota: 1 concurrent job
-    const active = trainingBackend.getActiveJobCountForUser(req.session.userId);
+    // Single-user quota: 1 concurrent job for the local user
+    const active = trainingBackend.getActiveJobCountForUser(ANON_USER_ID);
     const limit = parseInt(process.env.TRAIN_MAX_CONCURRENT_PER_USER || '1',10);
     if (active >= limit) {
       return res.status(429).json({ error: `Concurrent job limit reached (${limit}). Wait for your current job to finish.`, code: 'quota_exceeded' });
     }
     const config = trainingBackend.validateTrainingRequest(req.body);
-    const job = trainingBackend.createJob(config, req.session.userId);
+    const job = trainingBackend.createJob(config, ANON_USER_ID);
     trainingBackend.startJob(job);
     return res.json({
       job_id: job.job_id,
@@ -577,10 +385,9 @@ app.post('/api/train/start', requireAuth, strictLimiter, async (req, res) => {
   }
 });
 
-app.get('/api/train/status/:job_id', requireAuth, (req, res) => {
+app.get('/api/train/status/:job_id', (req, res) => {
   const job = trainingBackend.getJob(req.params.job_id);
   if (!job) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
-  if (!checkOwnershipOr404(job, req.session.userId, res)) return;
   return res.json({
     job_id: job.job_id,
     status: job.status,
@@ -593,10 +400,9 @@ app.get('/api/train/status/:job_id', requireAuth, (req, res) => {
   });
 });
 
-app.get('/api/train/metrics/:job_id', requireAuth, (req, res) => {
+app.get('/api/train/metrics/:job_id', (req, res) => {
   const job = trainingBackend.getJob(req.params.job_id);
   if (!job) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
-  if (!checkOwnershipOr404(job, req.session.userId, res)) return;
 
   const wantsSSE = (req.headers.accept || '').includes('text/event-stream') || req.query.stream === '1' || req.query.stream === 'true';
   if (wantsSSE) {
@@ -627,10 +433,9 @@ app.get('/api/train/metrics/:job_id', requireAuth, (req, res) => {
   });
 });
 
-app.get('/api/train/stream/:job_id', requireAuth, (req, res) => {
+app.get('/api/train/stream/:job_id', (req, res) => {
   const job = trainingBackend.getJob(req.params.job_id);
   if (!job) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
-  if (!checkOwnershipOr404(job, req.session.userId, res)) return;
   res.set({
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -645,11 +450,11 @@ app.get('/api/train/stream/:job_id', requireAuth, (req, res) => {
   req.on('close', () => clearInterval(ping));
 });
 
-app.get('/api/train/list', requireAuth, requireAdmin, (req, res) => {
+app.get('/api/train/list', (req, res) => {
   return res.json({ jobs: trainingBackend.listJobs() });
 });
 
-app.post('/api/train/stop', requireAuth, (req, res) => {
+app.post('/api/train/stop', (req, res) => {
   const job_id = String(req.body.job_id || req.body.jobId || req.query.job_id || '').trim();
   const diagCaller = req.body._diag_caller || req.headers['x-diag-caller'] || 'unknown';
   const diagCellId = req.body._diag_cellId || req.body.cellId || 'unknown';
@@ -659,54 +464,21 @@ app.post('/api/train/stop', requireAuth, (req, res) => {
   if (!job_id) return res.status(400).json({ error: 'job_id is required', code: 'bad_request' });
   const job = trainingBackend.getJob(job_id);
   if (!job) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
-  if (!checkOwnershipOr404(job, req.session.userId, res)) return;
   const stopped = trainingBackend.stopJob(job_id, { caller: diagCaller, cellId: diagCellId, userInitiated: diagUserInitiated, stack: diagStack });
   if (!stopped) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
   return res.json({ job_id, status: stopped.status, message: 'Job stopped' });
 });
 
-app.post('/api/train/stop/:job_id', requireAuth, (req, res) => {
+app.post('/api/train/stop/:job_id', (req, res) => {
   console.log(`[TRAIN-DIAG] POST /api/train/stop/:job_id job_id=${req.params.job_id} ts=${new Date().toISOString()} ip=${req.ip}`);
   const job = trainingBackend.getJob(req.params.job_id);
   if (!job) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
-  if (!checkOwnershipOr404(job, req.session.userId, res)) return;
   const stopped = trainingBackend.stopJob(req.params.job_id, { caller: 'stop/:job_id', userInitiated: false });
   if (!stopped) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
   return res.json({ job_id: stopped.job_id, status: stopped.status, message: 'Job stopped' });
 });
 
-app.get('/api/train/artifacts/:job_id', requireAuth, (req, res) => {
-  // Need to check ownership before revealing metadata; getArtifactMetadata will throw if job not found,
-  // but we need to ensure 404 for non-owner. We can check via getJob first.
-  const job = trainingBackend.getJob(req.params.job_id);
-  // Also handle case where job is on disk but not in memory: need to check diskMeta ownership
-  // We try to get metadata and then check, but if not in memory we need to read disk job.json
-  // For simplicity, if job exists in memory, check ownership; if not, try to load disk and check.
-  if (job) {
-    if (!checkOwnershipOr404(job, req.session.userId, res)) return;
-  } else {
-    // Fallback: try to read disk job.json to check owner without leaking existence
-    try {
-      const dir = trainingBackend._safeArtifactDir(req.params.job_id);
-      const jobJsonPath = path.join(dir, 'job.json');
-      if (fs.existsSync(jobJsonPath)) {
-        const meta = JSON.parse(fs.readFileSync(jobJsonPath,'utf8'));
-        if (meta.user_id && meta.user_id !== req.session.userId) {
-          // Check admin
-          const user = findUserById(req.session.userId);
-          const adminEmails = (process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || '').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
-          const isAdmin = user && (user.role === 'admin' || adminEmails.includes(user.email.toLowerCase()));
-          if (!isAdmin) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
-        } else if (!meta.user_id) {
-          // Legacy job without owner: only admin may access
-          const user = findUserById(req.session.userId);
-          const adminEmails = (process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || '').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
-          const isAdmin = user && (user.role === 'admin' || adminEmails.includes(user.email.toLowerCase()));
-          if (!isAdmin) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
-        }
-      }
-    } catch {}
-  }
+app.get('/api/train/artifacts/:job_id', (req, res) => {
   try {
     const meta = trainingBackend.getArtifactMetadata(req.params.job_id);
     return res.json(meta);
@@ -717,34 +489,9 @@ app.get('/api/train/artifacts/:job_id', requireAuth, (req, res) => {
   }
 });
 
-app.post('/api/inference/trained', requireAuth, strictLimiter, async (req, res) => {
+app.post('/api/inference/trained', strictLimiter, async (req, res) => {
   const { job_id, prompt, max_new_tokens, task, image, image_base64, imageBase64 } = req.body || {};
   if (!job_id) return res.status(400).json({ error: 'job_id is required', code: 'bad_request' });
-  // Ownership check before inference
-  const jobCheck = trainingBackend.getJob(String(job_id).trim());
-  if (jobCheck) {
-    if (!checkOwnershipOr404(jobCheck, req.session.userId, res)) return;
-  } else {
-    // Fallback disk check as in artifacts
-    try {
-      const dir = trainingBackend._safeArtifactDir(String(job_id).trim());
-      const jobJsonPath = path.join(dir, 'job.json');
-      if (fs.existsSync(jobJsonPath)) {
-        const meta = JSON.parse(fs.readFileSync(jobJsonPath,'utf8'));
-        if (meta.user_id && meta.user_id !== req.session.userId) {
-          const user = findUserById(req.session.userId);
-          const adminEmails = (process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || '').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
-          const isAdmin = user && (user.role === 'admin' || adminEmails.includes(user.email.toLowerCase()));
-          if (!isAdmin) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
-        } else if (!meta.user_id) {
-          const user = findUserById(req.session.userId);
-          const adminEmails = (process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || '').split(',').map(s=>s.trim().toLowerCase()).filter(Boolean);
-          const isAdmin = user && (user.role === 'admin' || adminEmails.includes(user.email.toLowerCase()));
-          if (!isAdmin) return res.status(404).json({ error: 'Job not found', code: 'not_found' });
-        }
-      }
-    } catch {}
-  }
   let meta;
   try {
     meta = trainingBackend.getArtifactMetadata(String(job_id).trim());
@@ -868,7 +615,7 @@ app.post('/api/inference/trained', requireAuth, strictLimiter, async (req, res) 
 });
 
 // ── POST /api/train (legacy) ──────────────────────────────────────────────────
-app.post('/api/train', requireAuth, strictLimiter, async (req, res) => {
+app.post('/api/train', strictLimiter, async (req, res) => {
   const { MODAL_URL } = process.env;
 
   if (!MODAL_URL) {

@@ -34,6 +34,7 @@ const EDUCATIONAL_HINTS = {
   batch_size: 'How many examples the model processes at once. Larger batches usually need more memory.',
   learning_rate: 'How strongly the model changes its parameters during training.',
   validation_split: 'The percentage of examples kept aside to check whether the model generalizes to data it wasn\'t trained on.',
+  max_steps: 'Stop after this many training steps. Leave blank for Auto (based on epochs and dataset size).',
   lora: 'LoRA lets large models learn by updating a much smaller set of parameters.',
 };
 
@@ -43,6 +44,7 @@ const LIMITS = {
   batch_size: { min: 1, max: 32 },
   learning_rate: { min: 1e-6, max: 1e-2 },
   validation_split: { min: 0, max: 50 },
+  max_steps: { min: 1, max: 10000 },
   lora_r: { min: 1, max: 64 },
   lora_alpha: { min: 1, max: 128 },
   lora_dropout: { min: 0, max: 0.5 },
@@ -158,7 +160,7 @@ function validateTrainingConfigFrontend(t) {
   // max_steps optional
   if (t.max_steps !== '' && t.max_steps !== null && t.max_steps !== undefined) {
     const ms = Number(t.max_steps);
-    if (String(t.max_steps).trim() !== '' && (!_isInt(ms) || ms < 1 || ms > 10000)) errors.max_steps = 'Use an integer between 1 and 10000, or leave empty.';
+    if (String(t.max_steps).trim() !== '' && (!_isInt(ms) || ms < LIMITS.max_steps.min || ms > LIMITS.max_steps.max)) errors.max_steps = `Use an integer between ${LIMITS.max_steps.min} and ${LIMITS.max_steps.max}, or leave empty.`;
   }
 
   const valid = Object.keys(errors).length === 0;
@@ -257,10 +259,12 @@ function getPreviewData(t) {
     // Use backend's fallback note: show as "Depends on dataset size (backend will use epochs \u00d7 ~100 as progress total)"
     resourceUsage = eff === 'lora' ? 'LoRA — efficient (updates <20% params)' : 'Full fine-tuning';
   }
+  const maxStepsSet = t.max_steps !== '' && t.max_steps != null && String(t.max_steps).trim() !== '' && Number.isFinite(Number(t.max_steps));
   return {
     task: getTaskDisplayName(t.task_type),
     model: t.model_id,
     dataset: t.dataset_id,
+    maxSteps: maxStepsSet ? String(Number(t.max_steps)) : 'Auto',
     method: eff === 'lora' ? 'LoRA' : eff === 'full' ? 'Full fine-tuning' : TRAINING_METHOD_DISPLAY[t.training_method] || effDisplay,
     effectiveMethod: eff,
     epochs: t.epochs,

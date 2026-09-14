@@ -168,6 +168,8 @@ async function run() {
       assert.ok(sent && typeof sent.train_request_json === 'object', 'config must be wrapped as {train_request_json} (flat objects are rejected by the v2 gateway)');
       assert.strictEqual(sent.train_request_json.model_id, 'a/b');
       assert.strictEqual(sent.train_request_json.job_id, job.job_id);
+      assert.ok('max_steps' in sent.train_request_json, 'max_steps field must always be present (null = Auto)');
+      assert.strictEqual(sent.train_request_json.max_steps, null);
       assert.ok(!('code' in sent) && !('code' in sent.train_request_json), 'must not send arbitrary code');
       // artifacts downloaded + extracted, inference-ready
       assert.strictEqual(mock.hits.artifactGet, 1);
@@ -324,6 +326,42 @@ async function run() {
     console.log('✓ zip extraction rejects traversal paths');
     fs.rmSync(dir, { recursive: true, force: true });
     fs.rmSync(dest, { recursive: true, force: true });
+  }
+
+  // ── 7b. explicit max_steps=5 reaches the remote ZeroGPU Trainer ──
+  {
+    const mock = await startMockSpace({ mode: 'hang' });
+    process.env.TRAINING_PROVIDER = 'zerogpu';
+    process.env.ZEROGPU_TRAIN_API = `http://127.0.0.1:${mock.port}/gradio_api`;
+    process.env.ZEROGPU_TRAIN_TIMEOUT_MS = '60000';
+    stubSpawn();
+    tb.clearAllJobs();
+    try {
+      const cfg = tb.validateTrainingRequest({
+        model_id: 'a/b', dataset_id: 'c/d', task_type: 'text-classification',
+        epochs: 2, batch_size: 8, learning_rate: 2e-5, validation_split: 10, max_steps: 5,
+      });
+      assert.strictEqual(cfg.max_steps, 5);
+      const job = tb.createJob(cfg, 'local-user');
+      assert.strictEqual(job.progress.total_steps, 5, 'total_steps starts at explicit max_steps');
+      tb.startJob(job);
+      const t0 = Date.now();
+      while (mock.hits.trainPost === 0 && Date.now() - t0 < 10000) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.strictEqual(mock.hits.trainPost, 1);
+      const sent = mock.hits.bodies[0].train_request_json;
+      assert.strictEqual(sent.max_steps, 5, 'remote payload must carry explicit max_steps (Trainer stops after 5)');
+      assert.strictEqual(sent.epochs, 2, 'epochs still sent alongside');
+      assert.strictEqual(spawnCalls.length, 0, 'no local spawn on the zerogpu path');
+      console.log('✓ zerogpu remote payload carries max_steps=5 (not UI-only metadata)');
+    } finally {
+      delete process.env.ZEROGPU_TRAIN_TIMEOUT_MS;
+      restoreSpawn();
+      mock.server.close();
+      cleanupJobDirs();
+      tb.clearAllJobs();
+    }
   }
 
   // ── 8. scheduler denials classify as zerogpu_quota (never model error) ──

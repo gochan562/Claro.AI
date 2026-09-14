@@ -120,6 +120,7 @@ let notebookRegistry = {
               cell.training.batch_size = cell.training.batch_size || 8;
               cell.training.learning_rate = cell.training.learning_rate || 0.00002;
               cell.training.validation_split = cell.training.validation_split ?? 10;
+              if (!('max_steps' in cell.training)) cell.training.max_steps = '';
               cell.training.status = cell.training.status || 'idle';
               cell.training.progress = cell.training.progress || { current_epoch:0, current_step:0, train_loss:null, eval_loss:null, eta:null, gpu_status:'idle', training_method:'auto', trainable_params:null, total_params:null };
               cell.training.metrics = cell.training.metrics || [];
@@ -643,6 +644,15 @@ let notebookRegistry = {
       return m + 'm ' + s + 's';
     }
 
+    // "Step 7 / 20" when the total is known (explicit max_steps, estimate, or
+    // runner-reported total), otherwise just the current step count.
+    function formatStepProgress(progress) {
+      const cur = progress?.current_step ?? 0;
+      const total = progress?.total_steps;
+      if (total === null || total === undefined || !Number.isFinite(Number(total))) return String(cur);
+      return `${cur} / ${total}`;
+    }
+
     function isLargeModelFrontend(modelId) {
       if (typeof TrainingUI !== 'undefined' && TrainingUI.isLargeModelFrontend) return TrainingUI.isLargeModelFrontend(modelId);
       const m = String(modelId||'').toLowerCase();
@@ -796,6 +806,12 @@ let notebookRegistry = {
                 <div class="train-field-hint">The percentage of examples kept aside to check generalization.</div>
                 <div class="train-field-error" id="tr-${cell.id}-err-validation_split"></div>
               </div>
+              <div class="training-field">
+                <label>Max steps <span class="train-help-tooltip" data-tooltip="Stop after this many training steps. Leave blank for Auto (based on epochs and dataset size).">?</span></label>
+                <input type="number" id="tr-${cell.id}-maxsteps" class="train-input" min="1" max="10000" step="1" placeholder="Auto" value="${t.max_steps === '' || t.max_steps == null ? '' : t.max_steps}" ${locked} oninput="updateTrainingField(${cell.id},'max_steps',this.value)" />
+                <div class="train-field-hint">Blank = Auto (epochs × dataset size). Or stop after N steps.</div>
+                <div class="train-field-error" id="tr-${cell.id}-err-max_steps"></div>
+              </div>
               <div class="training-field" style="grid-column:1 / -1;">
                 <label>Training method <span class="train-help-tooltip" data-tooltip="Claro.AI can automatically pick the best method. LoRA trains a small set of additional parameters for large models.">?</span></label>
                 <select id="tr-${cell.id}-method" ${locked} onchange="updateTrainingMethod(${cell.id},this.value)">
@@ -852,6 +868,7 @@ let notebookRegistry = {
               <span class="train-preview-label">Epochs</span><span class="train-preview-value" id="tr-${cell.id}-pv-epochs">${preview.epochs}</span>
               <span class="train-preview-label">Batch size</span><span class="train-preview-value" id="tr-${cell.id}-pv-batch">${preview.batch_size}</span>
               <span class="train-preview-label">Validation</span><span class="train-preview-value" id="tr-${cell.id}-pv-val">${preview.validation}</span>
+              <span class="train-preview-label">Max steps</span><span class="train-preview-value" id="tr-${cell.id}-pv-maxsteps">${preview.maxSteps}</span>
             </div>
             <div class="train-preview-divider"></div>
             <div class="train-preview-grid">
@@ -889,7 +906,7 @@ let notebookRegistry = {
 
           <div class="training-metrics-grid" id="tr-${cell.id}-metrics">
             <div class="training-metric-card"><div class="training-metric-label">Epoch</div><div class="training-metric-value" id="tr-${cell.id}-epoch">${t.progress?.current_epoch ?? 0}</div></div>
-            <div class="training-metric-card"><div class="training-metric-label">Step</div><div class="training-metric-value" id="tr-${cell.id}-step">${t.progress?.current_step ?? 0}</div></div>
+            <div class="training-metric-card"><div class="training-metric-label">Step</div><div class="training-metric-value" id="tr-${cell.id}-step">${formatStepProgress(t.progress)}</div></div>
             <div class="training-metric-card"><div class="training-metric-label">Train Loss</div><div class="training-metric-value" id="tr-${cell.id}-train">${t.progress?.train_loss != null ? Number(t.progress.train_loss).toFixed(4) : '—'}</div></div>
             <div class="training-metric-card"><div class="training-metric-label">Val Loss</div><div class="training-metric-value" id="tr-${cell.id}-eval">${t.progress?.eval_loss != null ? Number(t.progress.eval_loss).toFixed(4) : '—'}</div></div>
             <div class="training-metric-card"><div class="training-metric-label">ETA</div><div class="training-metric-value small" id="tr-${cell.id}-eta">${formatETA(t.progress?.eta)}</div></div>
@@ -1146,6 +1163,7 @@ let notebookRegistry = {
         setIf(`tr-${cellId}-pv-epochs`, preview.epochs);
         setIf(`tr-${cellId}-pv-batch`, preview.batch_size);
         setIf(`tr-${cellId}-pv-val`, preview.validation);
+        setIf(`tr-${cellId}-pv-maxsteps`, preview.maxSteps);
         setIf(`tr-${cellId}-pv-steps`, preview.estimatedSteps);
         setIf(`tr-${cellId}-pv-time`, preview.estimatedTime);
         setIf(`tr-${cellId}-pv-resource`, preview.resourceUsage);
@@ -1733,7 +1751,7 @@ let notebookRegistry = {
       if (gdot) gdot.className = 'training-gpu-dot ' + t.status;
       if (gtxt) gtxt.textContent = t.progress?.gpu_status || t.status;
       if (epochEl) epochEl.textContent = t.progress?.current_epoch ?? 0;
-      if (stepEl) stepEl.textContent = t.progress?.current_step ?? 0;
+      if (stepEl) stepEl.textContent = formatStepProgress(t.progress);
       if (trainEl) trainEl.textContent = t.progress?.train_loss != null ? Number(t.progress.train_loss).toFixed(4) : '—';
       if (evalEl) evalEl.textContent = t.progress?.eval_loss != null ? Number(t.progress.eval_loss).toFixed(4) : '—';
       if (etaEl) etaEl.textContent = formatETA(t.progress?.eta);

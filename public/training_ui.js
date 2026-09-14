@@ -123,7 +123,8 @@ const DATASET_PRESETS = {
     name: 'Beans (leaf images)',
     description: '1,296 bean leaf photos in 3 classes: healthy, angular leaf spot, bean rust.',
     taskTypes: ['image-classification'],
-    datasetId: 'beans',
+    // Canonical repository. Resolve directly — no speculative owner fallbacks.
+    datasetId: 'AI-Lab-Makerere/beans',
   },
 };
 

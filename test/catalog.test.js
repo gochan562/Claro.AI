@@ -53,9 +53,9 @@ async function run() {
       [{ model_preset: 'distilbert-base', dataset_preset: 'ag-news', task_type: 'text-classification', epochs: 3 },
         'distilbert-base-uncased', 'fancyzhx/ag_news', 5000],
       [{ model_preset: 'mobilenet-v2', dataset_preset: 'beans', task_type: 'image-classification', epochs: 2 },
-        'google/mobilenet_v2_1.0_224', 'beans', 2000],
+        'google/mobilenet_v2_1.0_224', 'AI-Lab-Makerere/beans', 2000],
       [{ model_preset: 'resnet-18', dataset_preset: 'beans', task_type: 'image-classification', epochs: 5 },
-        'microsoft/resnet-18', 'beans', 2000],
+        'microsoft/resnet-18', 'AI-Lab-Makerere/beans', 2000],
     ];
     for (const [body, modelId, datasetId, samples] of cases) {
       const cfg = tb.validateTrainingRequest(body);
@@ -65,6 +65,18 @@ async function run() {
       assert.ok(cfg.model_preset && cfg.dataset_preset, 'preset keys echoed in config');
     }
     console.log('✓ 1. valid preset combinations resolve server-side (4 combos)');
+
+  // ── 1b. Beans resolves to the exact canonical repository ──
+  {
+    assert.strictEqual(ui.getDatasetPreset('beans').id, 'beans', 'frontend preset ID unchanged');
+    assert.strictEqual(ui.getDatasetPreset('beans').datasetId, 'AI-Lab-Makerere/beans');
+    const cfg = tb.validateTrainingRequest(
+      { model_preset: 'mobilenet-v2', dataset_preset: 'beans', task_type: 'image-classification', epochs: 1 });
+    assert.strictEqual(cfg.dataset_id, 'AI-Lab-Makerere/beans', 'resolved config must carry the canonical repo ID');
+    assert.strictEqual(cfg.model_preset, 'mobilenet-v2');
+    assert.strictEqual(cfg.dataset_preset, 'beans');
+    console.log('✓ 1b. Beans preset resolves to exactly AI-Lab-Makerere/beans');
+  }
   }
 
   // ── 2. incompatible combinations rejected ──

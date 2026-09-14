@@ -375,6 +375,8 @@ class ZeroGPUBackend {
                     code === 'model_load_error'     ? 502 :
                     code === 'gguf_multiple_files'  ? 422 :
                     code === 'gpu_oom'              ? 502 :
+                    code === 'zerogpu_quota'        ? 502 :
+                    code === 'gpu_unavailable'      ? 502 :
                     502;
                   throw new GpuError(`ZeroGPU model error: ${message}`, code, status);
                 }
@@ -424,6 +426,8 @@ class ZeroGPUBackend {
               code === 'model_load_error'     ? 502 :
               code === 'gguf_multiple_files'  ? 422 :
               code === 'gpu_oom'              ? 502 :
+              code === 'zerogpu_quota'        ? 502 :
+              code === 'gpu_unavailable'      ? 502 :
               502;
             throw new GpuError(`ZeroGPU model error: ${message}`, code, status);
           }
@@ -455,7 +459,7 @@ class ZeroGPUBackend {
       } catch {
         // already a string
       }
-      if (/No GPU available|quota|GHA seconds|GPU is not available/i.test(message)) code = 'zerogpu_quota';
+      if (/No GPU available|quota|runs.?limit|credits|exceed|GHA seconds|GPU is not available/i.test(message)) code = 'zerogpu_quota';
       if (/No GPU was available after \d+s/i.test(message)) code = 'zerogpu_timeout';
       if (/Not Found/i.test(message)) code = 'space_unavailable';
       if (/Unrecognized|does not have|model_type|from_pretrained/i.test(message)) code = 'invalid_model_id';
@@ -466,6 +470,9 @@ class ZeroGPUBackend {
       }
       if (code === 'gpu_oom') {
         displayMessage = 'GPU out of memory: this model does not fit on the available ZeroGPU. Try a smaller/quantized model or switch GPU provider.';
+      }
+      if (code === 'zerogpu_quota') {
+        displayMessage = 'ZeroGPU cannot provide a GPU right now (quota exhausted, runs limit, or no capacity). Check the Space owner\u2019s ZeroGPU quota/billing and retry later. The model itself was not the problem.';
       }
       throw new GpuError(`ZeroGPU error: ${displayMessage}`, code, status);
     }

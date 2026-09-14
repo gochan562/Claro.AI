@@ -223,6 +223,23 @@ function translateBackendError(errMsg, code) {
   return errMsg || "Training failed. Open Training Logs for technical details.";
 }
 
+// Pure step-count math shared by the UI preview and tests.
+// Returns a positive integer, or null when the inputs are insufficient
+// (the caller must then display "Estimate unavailable" — never invent one).
+// trainRows: effective training samples AFTER the max_samples cap and the
+// validation split have been applied.
+function estimateStepsFromSamples({ trainRows, batchSize, epochs, maxSteps } = {}) {
+  const ms = (maxSteps === '' || maxSteps == null) ? null : Number(maxSteps);
+  if (ms !== null && Number.isFinite(ms) && ms > 0) return Math.floor(ms);
+  const tr = Number(trainRows);
+  const bs = Number(batchSize);
+  const ep = Number(epochs);
+  if (!Number.isFinite(tr) || tr <= 0) return null;
+  if (!Number.isFinite(bs) || bs < 1) return null;
+  if (!Number.isFinite(ep) || ep < 1) return null;
+  return Math.max(1, Math.ceil(tr / Math.floor(bs)) * Math.floor(ep));
+}
+
 function getPreviewData(t) {
   const eff = getEffectiveTrainingMethod(t);
   const effDisplay = eff === 'lora' ? 'LoRA' : eff === 'full' ? 'Full fine-tuning' : 'Recommended';
@@ -264,13 +281,13 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     TASK_TYPES, TASK_DISPLAY, TASK_EXPLANATIONS, TRAINING_METHOD_DISPLAY, TRAINING_METHOD_EXPLANATIONS, EDUCATIONAL_HINTS, LIMITS,
     isLargeModelFrontend, getEffectiveTrainingMethod, getTaskDisplayName, getTaskExplanation, getTrainingMethodDisplay, getTrainingMethodExplanation,
-    validateModelIdFrontend, validateDatasetIdFrontend, validateTrainingConfigFrontend, getTrainingSummary, getCompatibilityInfo, translateBackendError, getPreviewData, getFieldHelp,
+    validateModelIdFrontend, validateDatasetIdFrontend, validateTrainingConfigFrontend, getTrainingSummary, getCompatibilityInfo, translateBackendError, getPreviewData, getFieldHelp, estimateStepsFromSamples,
   };
 }
 if (typeof window !== 'undefined') {
   window.TrainingUI = {
     TASK_TYPES, TASK_DISPLAY, TASK_EXPLANATIONS, TRAINING_METHOD_DISPLAY, TRAINING_METHOD_EXPLANATIONS, EDUCATIONAL_HINTS, LIMITS,
     isLargeModelFrontend, getEffectiveTrainingMethod, getTaskDisplayName, getTaskExplanation, getTrainingMethodDisplay, getTrainingMethodExplanation,
-    validateModelIdFrontend, validateDatasetIdFrontend, validateTrainingConfigFrontend, getTrainingSummary, getCompatibilityInfo, translateBackendError, getPreviewData, getFieldHelp,
+    validateModelIdFrontend, validateDatasetIdFrontend, validateTrainingConfigFrontend, getTrainingSummary, getCompatibilityInfo, translateBackendError, getPreviewData, getFieldHelp, estimateStepsFromSamples,
   };
 }

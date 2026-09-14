@@ -29,6 +29,7 @@ from backend import (
     run_inference,
     estimate_gpu_duration,
 )
+from train_api import train as train_fn, cancel_train as cancel_train_fn, unpack_request as _unpack_request
 
 # Defaults used when the local Claro.AI provider does not pass model_id/task
 # (e.g. someone clicking Submit in the Space UI directly).
@@ -37,6 +38,30 @@ DEFAULT_TASK = "text-generation"
 
 # Hard limit for max_new_tokens
 MAX_NEW_TOKENS_LIMIT = 2048
+
+
+def _startup_diagnostics():
+    """Log runtime versions at Space startup. Versions only — no secrets,
+    no model/data contents. Helps distinguish environment issues (torch/CUDA
+    vs scheduler) from model issues when a GPU call fails."""
+    try:
+        import torch
+        print(f"[CLARO] runtime torch={torch.__version__} cuda_build={torch.version.cuda}", flush=True)
+    except Exception as e:
+        print(f"[CLARO] runtime torch import failed: {e}", flush=True)
+    try:
+        import transformers
+        print(f"[CLARO] runtime transformers={transformers.__version__}", flush=True)
+    except Exception as e:
+        print(f"[CLARO] runtime transformers import failed: {e}", flush=True)
+    try:
+        import spaces
+        print(f"[CLARO] runtime spaces={getattr(spaces, '__version__', 'unknown')}", flush=True)
+    except Exception as e:
+        print(f"[CLARO] runtime spaces import failed: {e}", flush=True)
+
+
+_startup_diagnostics()
 
 
 def _parse_structured(prompt_or_json: str):
@@ -65,9 +90,12 @@ def _parse_structured(prompt_or_json: str):
     return prompt_or_json, None, None, None, None, None
 
 
-def _gpu_duration(max_new_tokens, task, model_id, *_args, **_kwargs):
+def _gpu_duration(prompt, max_new_tokens, task, model_id, *_args, **_kwargs):
     """Callable duration for @spaces.GPU.
 
+    NOTE: spaces invokes this with the SAME positional args as the wrapped
+    function, so the signature must mirror _gpu_infer's leading parameters
+    (prompt first) — otherwise every value binds to the wrong name.
     ZeroGPU bills actual compute time, but `duration` is the kill-switch window.
     We size it to the workload (task + max_new_tokens + model size hint) instead
     of the one-size-fits-all default, so a 15-token request never reserves the
@@ -89,6 +117,13 @@ def _gpu_infer(prompt, max_new_tokens, task, model_id, gguf_file, revision, temp
     requested task, and offloads it again.  Model *loading* deliberately happens
     on the CPU worker (see generate()) so cold loads do not consume GPU seconds.
     """
+    try:
+        import torch
+        print(f"[CLARO] gpu torch={torch.__version__} cuda_available={torch.cuda.is_available()}", flush=True)
+        if torch.cuda.is_available():
+            print(f"[CLARO] gpu device={torch.cuda.current_device()} name={torch.cuda.get_device_name(0)}", flush=True)
+    except Exception as diag_e:
+        print(f"[CLARO] gpu diagnostics unavailable: {diag_e}", flush=True)
     return run_inference(
         model_id=model_id,
         task=task,
@@ -228,6 +263,15 @@ def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=Non
         err_msg = str(e)
         if "CUDA out of memory" in err_msg or "out of memory" in err_msg.lower():
             return f"[CLARO:gpu_oom] GPU out of memory: {err_msg}"
+        # Scheduler-side GPU denials (quota exhausted, runs limit, no
+        # capacity) are NOT model errors — surface them under their own code
+        # so the client can tell "no GPU available" apart from "model broken".
+        low_msg = err_msg.lower()
+        if ("runs limit" in low_msg or "quota" in low_msg or "credits" in low_msg
+                or "too many requests" in low_msg or "no gpu" in low_msg
+                or "gpu is not available" in low_msg):
+            return (f"[CLARO:zerogpu_quota] ZeroGPU cannot provide a GPU right now: {err_msg.strip()[:300]} "
+                    f"(check the Space owner's ZeroGPU quota/billing; the model itself was not the problem)")
         return f"[CLARO:model_runtime] unexpected error: {e}\n{tb}"
 
 
@@ -237,7 +281,68 @@ def show_cache():
     return json.dumps(stats, indent=2)
 
 
-demo = gr.Interface(
+# ── Remote training endpoint ──────────────────────────────────────────────
+# Runs the SAME training_runner.py Trainer logic as local training, but on
+# the ZeroGPU worker.  Accepts ONE structured JSON argument (validated, no
+# code).  It is a generator: intermediate yields stream as SSE `generating`
+# frames (JSON log/metric/progress events) and the final return value arrives
+# as the `complete` frame together with a zip of the output dir.
+import os as _os
+
+_TRAIN_GPU_MAX = max(120, int(_os.environ.get("CLARO_TRAIN_GPU_DURATION_MAX", "1800")))
+
+
+def _train_gpu_duration(train_request_json=None, *args, **_kwargs):
+    """Size the @spaces.GPU kill-switch window from the request.
+
+    ~90s base (dataset/model download + init) + ~1.5s per expected optimizer
+    step, clamped to [120, CLARO_TRAIN_GPU_DURATION_MAX].  This is a ceiling,
+    not a reservation: ZeroGPU bills actual compute time.
+    """
+    obj = _unpack_request(train_request_json, args, _kwargs)
+    try:
+        obj = json.loads(obj) if isinstance(obj, str) else (obj or {})
+    except Exception:
+        obj = {}
+    if not isinstance(obj, dict):
+        obj = {}
+    try:
+        epochs = max(1, int(obj.get("epochs", 3)))
+    except Exception:
+        epochs = 3
+    try:
+        raw_max = obj.get("max_steps", obj.get("maxSteps"))
+        max_steps = int(raw_max) if raw_max not in (None, "") else None
+    except Exception:
+        max_steps = None
+    steps = max_steps if max_steps else epochs * 100
+    return max(120, min(_TRAIN_GPU_MAX, int(90 + steps * 1.5)))
+
+
+@spaces.GPU(duration=_train_gpu_duration)
+def _gpu_train(train_request_json=None, *args, **kwargs):
+    yield from train_fn(_unpack_request(train_request_json, args, kwargs))
+
+
+TRAIN_REQUEST_EXAMPLE = json.dumps({
+    "model_id": "distilbert-base-uncased",
+    "dataset_id": "stanfordnlp/imdb",
+    "task_type": "text-classification",
+    "epochs": 2,
+    "batch_size": 8,
+    "learning_rate": 0.00002,
+    "validation_split": 10,
+    "max_samples": 5000,
+    "max_steps": None,
+    "training_method": "full",
+    "lora_r": 8,
+    "lora_alpha": 16,
+    "lora_dropout": 0.05,
+    "target_modules": "auto",
+    "job_id": "train_0123456789ab",
+}, indent=2)
+
+demo_infer = gr.Interface(
     fn=generate,
     inputs=[
         gr.Textbox(label="Prompt (or JSON: {model_id,task,prompt,max_new_tokens,do_sample})"),
@@ -257,6 +362,37 @@ demo = gr.Interface(
         "using Claro.AI's architecture resolver, with safe in-worker caching. "
         "No arbitrary Python execution — only structured model/task/input."
     ),
+)
+
+train_demo = gr.Interface(
+    fn=_gpu_train,
+    inputs=[gr.Textbox(label="Training request (JSON)", value=TRAIN_REQUEST_EXAMPLE, lines=12)],
+    outputs=[
+        gr.Textbox(label="Event stream (last event)"),
+        gr.File(label="Artifacts zip (available when finished)"),
+    ],
+    title="Claro.AI Training — ZeroGPU worker",
+    description=(
+        "Runs real Hugging Face Trainer fine-tuning (full or LoRA) on ZeroGPU "
+        "from a structured JSON request. No arbitrary code is accepted. "
+        "Progress streams as JSON events; finished jobs return an artifacts zip."
+    ),
+    api_name="train",
+)
+
+cancel_demo = gr.Interface(
+    fn=cancel_train_fn,
+    inputs=[gr.Textbox(label="Job id (train_...)")],
+    outputs=[gr.Textbox(label="Result")],
+    title="Cancel training job",
+    description="Requests cooperative cancellation of a running remote training job.",
+    api_name="cancel_train",
+)
+
+demo = gr.TabbedInterface(
+    [demo_infer, train_demo, cancel_demo],
+    ["Inference", "Training", "Cancel"],
+    title="Claro.AI GPU — generic backend + trainer",
 )
 
 if __name__ == "__main__":

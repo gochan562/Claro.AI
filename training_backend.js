@@ -19,7 +19,7 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { spawn } = require('child_process');
+const childProcess = require('child_process');
 
 // ── Resource limits (env overrides) ──
 const MAX_EPOCHS = parseInt(process.env.TRAIN_MAX_EPOCHS || '5', 10);
@@ -436,6 +436,57 @@ function _log(job, line) {
   _broadcast(job, 'log', { line });
 }
 
+// Shape one Trainer metric line {step, epoch, train_loss?, eval_loss?, learning_rate?}
+// into job progress + metrics. Shared by the local stdout parser and the
+// ZeroGPU remote event stream so both providers behave identically.
+// Returns true when the line carried a real Trainer metric.
+function _applyTrainerMetric(job, m) {
+  if (!m || typeof m.step !== 'number' ||
+      (typeof m.train_loss !== 'number' && typeof m.eval_loss !== 'number')) {
+    return false;
+  }
+  const cfg = job.config;
+  const elapsed = job.start_time ? Math.round((_now() - job.start_time) / 1000) : 0;
+  const metric = {
+    step: m.step,
+    epoch: typeof m.epoch === 'number' ? m.epoch : job.progress.current_epoch,
+    train_loss: m.train_loss,
+    eval_loss: m.eval_loss,
+    learning_rate: m.learning_rate !== undefined ? m.learning_rate : job.progress.learning_rate,
+    elapsed_time: elapsed,
+  };
+  // do not fabricate missing fields — only plot what Trainer emitted
+  if (metric.train_loss === undefined) delete metric.train_loss;
+  if (metric.eval_loss === undefined) delete metric.eval_loss;
+
+  const total = job.progress.total_steps || (cfg.max_steps || cfg.epochs * 100);
+  // Remote providers keep their provider tag in the GPU badge; local runs
+  // flip loading/idle -> training exactly as before.
+  const keepStatus = job.progress.gpu_status;
+  const nextGpu = (keepStatus === 'zerogpu' || keepStatus === 'modal' || keepStatus === 'local')
+    ? keepStatus : 'training';
+  _updateProgress(job, {
+    current_step: metric.step,
+    current_epoch: metric.epoch,
+    train_loss: metric.train_loss !== undefined ? metric.train_loss : job.progress.train_loss,
+    eval_loss: metric.eval_loss !== undefined ? metric.eval_loss : job.progress.eval_loss,
+    learning_rate: metric.learning_rate,
+    elapsed_time: elapsed,
+    eta: Math.max(0, Math.round((total - metric.step) * 1.2)),
+    percent: total > 0 ? Math.min(100, Math.round((metric.step / total) * 100)) : 0,
+    gpu_status: nextGpu,
+  });
+  _pushMetric(job, metric);
+  // status: if eval_loss present, it's evaluation step
+  if (m.eval_loss !== undefined) {
+    _setStatus(job, 'evaluating');
+    setTimeout(() => { if (job.status === 'evaluating' && !job._aborted) _setStatus(job, 'training'); }, 600);
+  } else {
+    if (job.status !== 'training') _setStatus(job, 'training');
+  }
+  return true;
+}
+
 function resolveTrainingProvider(env) {
   const p = String(env.TRAINING_PROVIDER || env.GPU_PROVIDER || 'local').toLowerCase().trim();
   if (['local', 'zerogpu', 'modal'].includes(p)) return p;
@@ -459,7 +510,7 @@ function _findPythonWithDeps() {
     '/opt/homebrew/bin/python3',
   ];
   candidates.push(...extra);
-  const { spawnSync } = require('child_process');
+  const spawnSync = childProcess.spawnSync;
   for (const bin of candidates) {
     try {
       const r = spawnSync(bin, ['-c', 'import torch, transformers, datasets, accelerate; print("ok")'], { timeout: 5000, encoding: 'utf8' });
@@ -478,7 +529,7 @@ function _startPythonTraining(job) {
   let pythonBin = process.env.PYTHON_BIN || 'python3';
   // Quick check: if the requested bin doesn't have torch, try to find one that does
   try {
-    const { spawnSync } = require('child_process');
+    const spawnSync = childProcess.spawnSync;
     const chk = spawnSync(pythonBin, ['-c', 'import torch'], { timeout: 3000 });
     if (chk.status !== 0) {
       const alt = _findPythonWithDeps();
@@ -537,7 +588,7 @@ function _startPythonTraining(job) {
 
   let proc;
   try {
-    proc = spawn(pythonBin, args, { cwd: __dirname, env: process.env });
+    proc = childProcess.spawn(pythonBin, args, { cwd: __dirname, env: process.env });
   } catch (e) {
     const msg = `Failed to spawn Python (${pythonBin}): ${e.message}`;
     _log(job, `[TRAIN] training_error: ${msg}`);
@@ -567,42 +618,7 @@ function _startPythonTraining(job) {
       if (line.startsWith('{') && line.includes('"step"')) {
         try {
           const m = JSON.parse(line);
-          if (typeof m.step === 'number' && (typeof m.train_loss === 'number' || typeof m.eval_loss === 'number')) {
-            const elapsed = Math.round((_now() - job.start_time) / 1000);
-            const metric = {
-              step: m.step,
-              epoch: typeof m.epoch === 'number' ? m.epoch : job.progress.current_epoch,
-              train_loss: m.train_loss,
-              eval_loss: m.eval_loss,
-              learning_rate: m.learning_rate !== undefined ? m.learning_rate : job.progress.learning_rate,
-              elapsed_time: elapsed,
-            };
-            // do not fabricate missing fields — only plot what Trainer emitted
-            if (metric.train_loss === undefined) delete metric.train_loss;
-            if (metric.eval_loss === undefined) delete metric.eval_loss;
-
-            const total = job.progress.total_steps || (cfg.max_steps || cfg.epochs * 100);
-            _updateProgress(job, {
-              current_step: metric.step,
-              current_epoch: metric.epoch,
-              train_loss: metric.train_loss !== undefined ? metric.train_loss : job.progress.train_loss,
-              eval_loss: metric.eval_loss !== undefined ? metric.eval_loss : job.progress.eval_loss,
-              learning_rate: metric.learning_rate,
-              elapsed_time: elapsed,
-              eta: Math.max(0, Math.round((total - metric.step) * 1.2)),
-              percent: Math.min(100, Math.round((metric.step / total) * 100)),
-              gpu_status: 'training',
-            });
-            _pushMetric(job, metric);
-            // status: if eval_loss present, it's evaluation step
-            if (m.eval_loss !== undefined) {
-              _setStatus(job, 'evaluating');
-              setTimeout(() => { if (job.status === 'evaluating' && !job._aborted) _setStatus(job, 'training'); }, 600);
-            } else {
-              if (job.status !== 'training') _setStatus(job, 'training');
-            }
-            continue;
-          }
+          if (_applyTrainerMetric(job, m)) continue;
         } catch (_) {
           // not a metric JSON, treat as log
         }
@@ -611,6 +627,13 @@ function _startPythonTraining(job) {
       // status markers from runner
       if (line.startsWith('[TRAIN]')) {
         _log(job, line);
+        // Real total optimizer steps reported by the runner — replaces the
+        // epochs*100 progress fallback with the actual denominator.
+        const totalMatch = line.match(/total_steps=(\d+)/);
+        if (totalMatch) {
+          const t = parseInt(totalMatch[1], 10);
+          if (Number.isFinite(t) && t > 0) _updateProgress(job, { total_steps: t });
+        }
         const low = line.toLowerCase();
         // LoRA trainable info: e.g. [TRAIN] lora trainable=5186 total=93181 (5.57%)
         if (low.includes('trainable') && low.includes('total')) {
@@ -752,13 +775,620 @@ function _startPythonTraining(job) {
   });
 }
 
+// ── ZeroGPU remote training ─────────────────────────────────────────────
+// provider === 'zerogpu' runs the SAME training_runner.py Trainer logic on the
+// ZeroGPU Space through its structured /train endpoint (space/train_api.py).
+// This path NEVER spawns a local Python process: no child_process use below.
+// Progress arrives as SSE `generating` frames and is fed into the exact same
+// _log / _pushMetric / _updateProgress / _setStatus helpers as local training,
+// so the UI, SSE fan-out, lifecycle and artifacts behave identically.
+
+class ZeroGpuTrainError extends Error {
+  constructor(message, code, status = 502) {
+    super(message);
+    this.name = 'ZeroGpuTrainError';
+    this.code = code;       // machine-readable, mirrors gpu_backends codes
+    this.status = status;   // HTTP-ish status for API responses
+  }
+}
+
+function _zeroGpuTrainConfig(env) {
+  const space = env.ZEROGPU_SPACE || 'Gochan562/claro_ai_gpu';
+  let apiBase;
+  if (env.ZEROGPU_TRAIN_API) {
+    apiBase = String(env.ZEROGPU_TRAIN_API).replace(/\/+$/, '');
+  } else {
+    const { defaultSpaceUrl } = require('./gpu_backends');
+    apiBase = `${defaultSpaceUrl(space)}/gradio_api`;
+  }
+  const token = env.ZEROGPU_API_TOKEN || '';
+  return { spaceId: space, apiBase, token };
+}
+
+function _zeroGpuHeaders(token) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  return headers;
+}
+
+function _zeroGpuSpaceOrigin(apiBase) {
+  const m = String(apiBase).match(/^(https?:\/\/[^/]+)\/gradio_api\/?$/);
+  if (m) return m[1];
+  return String(apiBase).replace(/\/+$/, '');
+}
+
+async function _postZeroGpuFn(apiBase, fnName, body, signal, token, timeoutMs = 30000) {
+  const url = `${apiBase}/call/v2/${fnName}`;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  const onAbort = () => ctrl.abort();
+  if (signal) {
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  }
+  try {
+    const res = await fetch(url, { method: 'POST', headers: _zeroGpuHeaders(token), body: JSON.stringify(body), signal: ctrl.signal });
+    if (res.status === 404) {
+      throw new ZeroGpuTrainError(
+        `ZeroGPU endpoint not found at ${url}. Deploy the latest space/app.py (with the /${fnName} endpoint) to the Space.`,
+        'space_unavailable', 502);
+    }
+    if (res.status === 502 || res.status === 503 || res.status === 429) {
+      const detail = await res.text().catch(() => '');
+      const sleepy = /sleeping|paused|building|loading/i.test(detail);
+      throw new ZeroGpuTrainError(
+        sleepy ? `ZeroGPU Space is unavailable (HTTP ${res.status}). It may be sleeping or building.`
+               : `ZeroGPU Space rejected the request (HTTP ${res.status}): ${detail.slice(0, 200)}`,
+        'space_unavailable', res.status);
+    }
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '');
+      throw new ZeroGpuTrainError(`ZeroGPU call failed (HTTP ${res.status}): ${detail.slice(0, 200)}`, 'space_unavailable', res.status);
+    }
+    let payload;
+    try { payload = JSON.parse(await res.text()); }
+    catch (err) { throw new ZeroGpuTrainError(`ZeroGPU returned non-JSON response: ${err.message}`, 'malformed_response', 502); }
+    const eventId = payload && payload.event_id;
+    if (!eventId || typeof eventId !== 'string') {
+      throw new ZeroGpuTrainError(`ZeroGPU did not return an event_id: ${JSON.stringify(payload).slice(0, 200)}`, 'malformed_response', 502);
+    }
+    return eventId;
+  } catch (err) {
+    if (err instanceof ZeroGpuTrainError) throw err;
+    if (err.name === 'AbortError') throw new ZeroGpuTrainError(`ZeroGPU ${fnName} request was cancelled.`, 'cancelled', 499);
+    throw new ZeroGpuTrainError(`Could not reach ZeroGPU training API ${url}: ${err.message}`, 'space_unavailable', 504);
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onAbort);
+  }
+}
+
+// Read the SSE event stream for one ZeroGPU call. `onGenerating(dataArray)`
+// is invoked for every `generating` frame. Resolves with the `complete`
+// frame's data array. Throws ZeroGpuTrainError on `error` frames or a stream
+// that closes without completing.
+async function _fetchZeroGpuSse(apiBase, fnName, eventId, signal, token, onGenerating) {
+  const { Readable } = require('stream');
+  const url = `${apiBase}/call/${fnName}/${encodeURIComponent(eventId)}`;
+  const headers = {};
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  let res;
+  try {
+    res = await fetch(url, { signal, headers });
+  } catch (err) {
+    if (err.name === 'AbortError') throw new ZeroGpuTrainError('ZeroGPU stream was cancelled.', 'cancelled', 499);
+    throw new ZeroGpuTrainError(`Lost connection to ZeroGPU stream: ${err.message}`, 'space_unavailable', 504);
+  }
+  if (res.status === 404) {
+    throw new ZeroGpuTrainError('ZeroGPU event was not found (event expired or Space restarted).', 'space_unavailable', 502);
+  }
+  if (!res.ok || !res.body) {
+    const detail = await res.text().catch(() => '');
+    throw new ZeroGpuTrainError(`ZeroGPU stream open failed (HTTP ${res.status}): ${detail.slice(0, 200)}`, 'space_unavailable', res.status || 502);
+  }
+  const nodeStream = Readable.fromWeb(res.body);
+  let buffer = '';
+  let eventType = '';
+  let dataBuf = '';
+  let hadError = false;
+  let errMsg = '';
+
+  const handleFrame = () => {
+    if (!eventType) return null;
+    if (eventType === 'complete') {
+      try { return { done: true, data: JSON.parse(dataBuf) }; }
+      catch { throw new ZeroGpuTrainError(`ZeroGPU returned malformed complete frame: ${dataBuf.slice(0, 200)}`, 'malformed_response', 502); }
+    }
+    if (eventType === 'error') {
+      hadError = true;
+      errMsg = dataBuf;
+      return null;
+    }
+    if (eventType === 'generating' && onGenerating) {
+      try { onGenerating(JSON.parse(dataBuf)); }
+      catch { /* ignore malformed progress frame */ }
+    }
+    return null;
+  };
+
+  for await (const chunk of nodeStream) {
+    buffer += chunk.toString('utf8');
+    let idx;
+    while ((idx = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, idx).replace(/\r$/, '');
+      buffer = buffer.slice(idx + 1);
+      if (line === '' || line === '\r') {
+        const r = handleFrame();
+        if (r && r.done) return r.data;
+        eventType = '';
+        dataBuf = '';
+        continue;
+      }
+      if (line.startsWith('event:')) eventType = line.slice(6).trim();
+      else if (line.startsWith('data:')) dataBuf = line.slice(5).trim();
+      else if (line.endsWith(': heartbeat')) { /* keep-alive, ignored */ }
+    }
+  }
+  // Flush a final frame if the stream ended without a trailing blank line.
+  if (eventType && dataBuf !== '') {
+    const r = handleFrame();
+    if (r && r.done) return r.data;
+  }
+  if (hadError) throw _classifyZeroGpuErrorFrame(errMsg);
+  throw new ZeroGpuTrainError('ZeroGPU stream closed without a complete frame.', 'malformed_response', 502);
+}
+
+function _classifyZeroGpuErrorFrame(errMsg) {
+  let message = errMsg;
+  let code = 'zerogpu_runtime';
+  try {
+    const parsed = JSON.parse(errMsg);
+    if (parsed && typeof parsed === 'object' && parsed.error) message = parsed.error;
+    if (parsed && parsed.title === 'ZeroGPU worker error') code = 'zerogpu_quota';
+    if (parsed && parsed.title === 'ZeroGPU queue timeout') code = 'zerogpu_timeout';
+  } catch { /* already a string */ }
+  if (/No GPU available|quota|runs.?limit|credits|exceed|GHA seconds|GPU is not available/i.test(message)) code = 'zerogpu_quota';
+  if (/No GPU was available after \d+s/i.test(message)) code = 'zerogpu_timeout';
+  if (/Not Found/i.test(message)) code = 'space_unavailable';
+  if (/out of memory/i.test(message)) code = 'gpu_oom';
+  if (code === 'zerogpu_timeout') {
+    message = 'ZeroGPU timeout: the Space could not start the job within its queue/execution limit. Try again later or use a smaller configuration.';
+  }
+  if (code === 'zerogpu_quota') {
+    message = 'ZeroGPU cannot provide a GPU right now (quota exhausted, runs limit, or no capacity). Check the Space owner\u2019s ZeroGPU quota/billing and retry later.';
+  }
+  if (code === 'gpu_oom') {
+    message = 'GPU out of memory on ZeroGPU: this model does not fit. Try a smaller/quantized model.';
+  }
+  return new ZeroGpuTrainError(`ZeroGPU error: ${message}`, code, 502);
+}
+
+// Apply one remote stream event to the job. Mirrors the local stdout parser
+// (markers + metric lines) so both providers drive identical UI updates.
+function _applyRemoteTrainEvent(job, ev) {
+  if (!ev || typeof ev !== 'object') return;
+  if (ev.type === 'metric' && ev.metric) {
+    _applyTrainerMetric(job, ev.metric);
+    return;
+  }
+  if (ev.type === 'progress' && ev.progress && typeof ev.progress === 'object') {
+    const patch = {};
+    for (const k of ['total_steps', 'trainable_params', 'total_params', 'current_step', 'current_epoch']) {
+      if (typeof ev.progress[k] === 'number' && Number.isFinite(ev.progress[k])) patch[k] = ev.progress[k];
+    }
+    if (Object.keys(patch).length) _updateProgress(job, patch);
+    return;
+  }
+  if (ev.type === 'status') {
+    if (ev.line) _log(job, String(ev.line));
+    if (ev.status === 'failed') {
+      if (job.status !== 'failed') _setStatus(job, 'failed');
+      if (!job.error) job.error = 'training_error';
+    } else if (ev.status) {
+      _setStatus(job, ev.status);
+    }
+    return;
+  }
+  if (ev.type === 'error') {
+    _log(job, `[TRAIN] training_error: ${ev.error || 'remote worker error'}`);
+    if (job.status !== 'failed') _setStatus(job, 'failed');
+    job.error = 'training_error';
+    return;
+  }
+  // 'log' and anything else carrying a line
+  if (typeof ev.line === 'string') {
+    _log(job, ev.line);
+    const totalMatch = ev.line.match(/total_steps=(\d+)/);
+    if (totalMatch) {
+      const t = parseInt(totalMatch[1], 10);
+      if (Number.isFinite(t) && t > 0) _updateProgress(job, { total_steps: t });
+    }
+    const low = ev.line.toLowerCase();
+    if (low.includes('training_error')) {
+      if (job.status !== 'failed') _setStatus(job, 'failed');
+      job.error = 'training_error';
+    } else if (low.includes('evaluating')) {
+      _setStatus(job, 'evaluating');
+    } else if (low.includes('loading')) {
+      _setStatus(job, 'loading');
+    } else if (low.includes('training') && !low.includes('training_error')) {
+      if (job.status === 'loading' || job.status === 'queued') _setStatus(job, 'training');
+    }
+    // NOTE: a remote '[TRAIN] finished' line alone never finalizes the job —
+    // only the manifest + downloaded artifacts do.
+  }
+}
+
+function _zeroGpuFileCandidates(apiBase, file) {
+  const origin = _zeroGpuSpaceOrigin(apiBase);
+  const out = [];
+  const push = (u) => { if (u && !out.includes(u)) out.push(u); };
+  if (file && typeof file.url === 'string' && file.url) {
+    push(file.url.startsWith('http') ? file.url : `${origin}${file.url.startsWith('/') ? '' : '/'}${file.url}`);
+  }
+  if (file && typeof file.path === 'string' && file.path) {
+    if (file.path.startsWith('http')) push(file.path);
+    else {
+      push(`${origin}/gradio_api/file=${file.path}`);
+      push(`${origin}/file=${file.path}`);
+      push(`${origin}/gradio_api/file/${file.path.replace(/^\/+/, '')}`);
+    }
+  }
+  return out;
+}
+
+async function _downloadZeroGpuFile(apiBase, file, signal, token) {
+  const maxBytes = Number(process.env.ZEROGPU_TRAIN_MAX_ARTIFACT_BYTES || 2000000000);
+  const candidates = _zeroGpuFileCandidates(apiBase, file);
+  if (!candidates.length) throw new ZeroGpuTrainError('ZeroGPU finished but returned no downloadable artifact file.', 'missing_artifact', 502);
+  let lastErr = null;
+  for (const url of candidates) {
+    try {
+      const headers = {};
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+      const res = await fetch(url, { signal, headers });
+      if (!res.ok || !res.body) { lastErr = new Error(`HTTP ${res.status}`); continue; }
+      const chunks = [];
+      let total = 0;
+      for await (const chunk of res.body) {
+        total += chunk.length;
+        if (total > maxBytes) throw new ZeroGpuTrainError(`Artifact exceeds size limit (${maxBytes} bytes).`, 'artifact_error', 502);
+        chunks.push(Buffer.from(chunk));
+      }
+      const buf = Buffer.concat(chunks);
+      if (!buf.length) { lastErr = new Error('empty file'); continue; }
+      return buf;
+    } catch (err) {
+      if (err instanceof ZeroGpuTrainError) throw err;
+      lastErr = err;
+    }
+  }
+  throw new ZeroGpuTrainError(`Could not download ZeroGPU artifacts: ${lastErr ? lastErr.message : 'unknown'}`, 'artifact_error', 502);
+}
+
+// Minimal dependency-free ZIP reader (stored + deflate). Archive paths are
+// NEVER trusted: absolute paths and `..` segments are skipped, and every
+// destination is verified to stay inside destDir.
+function _extractZipBuffer(buf, destDir) {
+  const zlib = require('zlib');
+  if (!Buffer.isBuffer(buf)) buf = Buffer.from(buf);
+  if (buf.length < 22) throw new ZeroGpuTrainError('Artifact is not a zip file (too small).', 'artifact_error', 502);
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= Math.max(0, buf.length - 22 - 0xffff); i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new ZeroGpuTrainError('Artifact is not a zip file (EOCD missing).', 'artifact_error', 502);
+  const cdCount = buf.readUInt16LE(eocd + 10);
+  const cdOffset = buf.readUInt32LE(eocd + 16);
+  const base = path.resolve(destDir);
+  const names = [];
+  let p = cdOffset;
+  for (let i = 0; i < cdCount; i++) {
+    if (buf.readUInt32LE(p) !== 0x02014b50) throw new ZeroGpuTrainError('Artifact zip central directory is corrupt.', 'artifact_error', 502);
+    const flags = buf.readUInt16LE(p + 8);
+    const method = buf.readUInt16LE(p + 10);
+    const compSize = buf.readUInt32LE(p + 20);
+    const nameLen = buf.readUInt16LE(p + 28);
+    const extraLen = buf.readUInt16LE(p + 30);
+    const commentLen = buf.readUInt16LE(p + 32);
+    const localOffset = buf.readUInt32LE(p + 42);
+    const rawName = buf.toString('utf8', p + 46, p + 46 + nameLen);
+    p += 46 + nameLen + extraLen + commentLen;
+    const parts = rawName.split('/').filter((s) => s && s !== '.');
+    const unsafe = !parts.length || rawName.startsWith('/') || parts.includes('..');
+    if (unsafe) continue;
+    const resolved = path.resolve(path.join(destDir, ...parts));
+    if (resolved !== base && !resolved.startsWith(base + path.sep)) continue;
+    if (rawName.endsWith('/')) { fs.mkdirSync(resolved, { recursive: true }); continue; }
+    if (flags & 0x08) throw new ZeroGpuTrainError(`Artifact zip uses streaming entries (${rawName}); cannot extract safely.`, 'artifact_error', 502);
+    if (buf.readUInt32LE(localOffset) !== 0x04034b50) throw new ZeroGpuTrainError('Artifact zip local header is corrupt.', 'artifact_error', 502);
+    const lhNameLen = buf.readUInt16LE(localOffset + 26);
+    const lhExtraLen = buf.readUInt16LE(localOffset + 28);
+    const dataStart = localOffset + 30 + lhNameLen + lhExtraLen;
+    const comp = buf.subarray(dataStart, dataStart + compSize);
+    let data;
+    if (method === 0) data = Buffer.from(comp);
+    else if (method === 8) data = zlib.inflateRawSync(comp);
+    else throw new ZeroGpuTrainError(`Artifact zip uses unsupported method ${method} (${rawName}).`, 'artifact_error', 502);
+    fs.mkdirSync(path.dirname(resolved), { recursive: true });
+    fs.writeFileSync(resolved, data);
+    names.push(parts.join('/'));
+  }
+  return names;
+}
+
+function _failZeroGpuJob(job, message, code = 'training_error') {
+  if (job.end_time) return; // already terminal
+  _log(job, `[TRAIN] training_error: ${message}`);
+  _setStatus(job, 'failed');
+  _updateProgress(job, { gpu_status: 'idle', eta: 0 });
+  job.error = code === 'stopped_by_user' ? 'stopped_by_user' : 'training_error';
+  job.end_time = _now();
+  _broadcast(job, 'done', { status: 'failed', error: job.error, message });
+  _saveArtifacts(job);
+}
+
+async function _requestZeroGpuCancel(apiBase, jobId, token) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 20000);
+  try {
+    const eventId = await _postZeroGpuFn(apiBase, 'cancel_train', { job_id: jobId }, ctrl.signal, token, 15000);
+    const data = await _fetchZeroGpuSse(apiBase, 'cancel_train', eventId, ctrl.signal, token, null);
+    const first = Array.isArray(data) ? data[0] : data;
+    try {
+      const parsed = typeof first === 'string' ? JSON.parse(first) : first;
+      return !!(parsed && parsed.ok);
+    } catch { return false; }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function _finishZeroGpuJob(job, manifest, file) {
+  if (job._remote && job._remote.timeout) { clearTimeout(job._remote.timeout); job._remote.timeout = null; }
+  if (job._aborted) {
+    _log(job, '[TRAIN] remote worker finished after cancel; results ignored');
+    return Promise.resolve();
+  }
+  if (!manifest || manifest.status !== 'finished') {
+    _failZeroGpuJob(job, (manifest && manifest.message) || 'remote training failed without a manifest');
+    return Promise.resolve();
+  }
+  if (!file) {
+    _failZeroGpuJob(job, 'remote training finished but returned no artifacts');
+    return Promise.resolve();
+  }
+  const { apiBase, token } = job._remote || {};
+  const controller = new AbortController();
+  if (job._remote) job._remote.downloadController = controller;
+  return _downloadZeroGpuFile(apiBase, file, controller.signal, token).then(
+    (zipBuf) => {
+      if (job._aborted) {
+        _log(job, '[TRAIN] artifacts downloaded after cancel; results ignored');
+        return;
+      }
+      const dir = _safeArtifactDir(job.job_id);
+      fs.mkdirSync(dir, { recursive: true });
+      const names = _extractZipBuffer(zipBuf, dir);
+      _log(job, `[TRAIN] artifacts downloaded (${names.length} files) -> ${dir}`);
+      job.artifacts_dir = dir;
+      job.end_time = _now();
+      _setStatus(job, 'finished');
+      _updateProgress(job, { gpu_status: 'idle', eta: 0, percent: 100 });
+      _broadcast(job, 'done', { status: 'finished' });
+      _saveArtifacts(job); // writes metrics.json / job.json / training_logs.txt alongside model files
+    },
+    (err) => {
+      if (job._aborted) return;
+      _failZeroGpuJob(job, err.message || String(err), err.code);
+    }
+  );
+}
+
+function _startZeroGPUTraining(job) {
+  const cfg = job.config;
+  let remote;
+  try {
+    remote = _zeroGpuTrainConfig(process.env);
+  } catch (e) {
+    _failZeroGpuJob(job, e.message || String(e));
+    return;
+  }
+  job.start_time = _now();
+  _setStatus(job, 'loading');
+  _log(job, `[TRAIN] loading model=${cfg.model_id} dataset=${cfg.dataset_id} task=${cfg.task_type} provider=zerogpu space=${remote.spaceId} method=${cfg.training_method}`);
+  if (cfg.training_method === 'lora') {
+    _log(job, `[TRAIN] lora r=${cfg.lora_r} alpha=${cfg.lora_alpha} dropout=${cfg.lora_dropout} target_modules=${cfg.target_modules}`);
+  }
+  _log(job, `[TRAIN] config epochs=${cfg.epochs} batch_size=${cfg.batch_size} lr=${cfg.learning_rate} max_steps=${cfg.max_steps || 'auto'} validation_split=${cfg.validation_split}%`);
+  _updateProgress(job, { gpu_status: 'zerogpu', total_steps: cfg.max_steps || (cfg.epochs * 100) });
+
+  // Structured training parameters only — never arbitrary code.
+  // The v2 gateway maps the POST body onto the endpoint's DECLARED inputs,
+  // so the config must be wrapped under the single `train_request_json`
+  // input name (a flat config object is rejected with HTTP 500).
+  const payload = {
+    train_request_json: {
+      model_id: cfg.model_id,
+      dataset_id: cfg.dataset_id,
+      task_type: cfg.task_type,
+      epochs: cfg.epochs,
+      batch_size: cfg.batch_size,
+      learning_rate: cfg.learning_rate,
+      validation_split: cfg.validation_split,
+      max_samples: cfg.max_samples,
+      max_steps: cfg.max_steps,
+      training_method: cfg.training_method,
+      lora_r: cfg.lora_r,
+      lora_alpha: cfg.lora_alpha,
+      lora_dropout: cfg.lora_dropout,
+      target_modules: cfg.target_modules,
+      job_id: job.job_id,
+    },
+  };
+  const controller = new AbortController();
+  const timeoutMs = Number(process.env.ZEROGPU_TRAIN_TIMEOUT_MS) || (cfg.max_time_sec + 180) * 1000;
+  job._remote = { eventId: null, controller, timeout: null, apiBase: remote.apiBase, token: remote.token, downloadController: null };
+  job._remote.timeout = setTimeout(() => {
+    if (job.end_time || ['finished', 'failed'].includes(job.status)) return;
+    try { controller.abort(); } catch (_) {}
+    _failZeroGpuJob(job, `ZeroGPU training timed out after ${Math.round(timeoutMs / 1000)}s (event=${(job._remote && job._remote.eventId) || 'n/a'}). The Space may still be running; results will be ignored.`);
+  }, timeoutMs);
+  if (job._remote.timeout.unref) job._remote.timeout.unref();
+
+  (async () => {
+    try {
+      _log(job, `[TRAIN] POST ${remote.apiBase}/call/v2/train`);
+      const eventId = await _postZeroGpuFn(remote.apiBase, 'train', payload, controller.signal, remote.token, 60000);
+      if (job._aborted) return;
+      job._remote.eventId = eventId;
+      _log(job, `[TRAIN] ZeroGPU event=${eventId}; streaming progress`);
+      const data = await _fetchZeroGpuSse(remote.apiBase, 'train', eventId, controller.signal, remote.token, (frame) => {
+        if (job._aborted) return;
+        const first = Array.isArray(frame) ? frame[0] : frame;
+        if (typeof first !== 'string') return;
+        let ev;
+        try { ev = JSON.parse(first); }
+        catch { _log(job, first); return; }
+        _applyRemoteTrainEvent(job, ev);
+      });
+      // complete frame: [manifestJson, fileObj|null]
+      const arr = Array.isArray(data) ? data : [data];
+      let manifest = null;
+      try { manifest = typeof arr[0] === 'string' ? JSON.parse(arr[0]) : arr[0]; }
+      catch { manifest = null; }
+      const file = arr.length > 1 && arr[1] && typeof arr[1] === 'object' ? arr[1] : null;
+      await _finishZeroGpuJob(job, manifest, file);
+    } catch (err) {
+      if (job._aborted || job.end_time) return;
+      if (err && (err.code === 'cancelled' || err.name === 'AbortError')) {
+        _failZeroGpuJob(job, 'cancelled by user', 'stopped_by_user');
+        return;
+      }
+      _failZeroGpuJob(job, (err && err.message) || String(err), err && err.code);
+    } finally {
+      if (job._remote && job._remote.timeout) { clearTimeout(job._remote.timeout); job._remote.timeout = null; }
+    }
+  })();
+}
+
+// ── Step-count estimation (no fake numbers) ──────────────────────────────
+// Resolves the dataset's real row count via the datasets-server API and
+// computes optimizer steps = ceil(train_rows / batch_size) * epochs
+// (or max_steps when set). Never throws: unknown → estimated_total_steps null.
+// Small in-memory cache: dataset row counts don't change between keystrokes.
+const _rowCountCache = new Map();
+
+async function _fetchJson(url, fetchImpl, timeoutMs = 8000) {
+  const f = fetchImpl || fetch;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await f(url, { signal: ctrl.signal });
+    if (!res.ok) return null;
+    return await res.json().catch(() => null);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function _fetchDatasetRowCount(datasetId, fetchImpl) {
+  if (_rowCountCache.has(datasetId)) return _rowCountCache.get(datasetId);
+  // Step 1: resolve a config+split (datasets-server requires all three params).
+  const splits = await _fetchJson(
+    `https://datasets-server.huggingface.co/splits?dataset=${encodeURIComponent(datasetId)}`, fetchImpl);
+  let config = null;
+  let split = null;
+  const list = splits && Array.isArray(splits.splits) ? splits.splits : null;
+  if (list && list.length) {
+    const train = list.find((s) => String(s.split).toLowerCase() === 'train') || list[0];
+    config = train.config;
+    split = train.split;
+  }
+  let total = null;
+  if (config && split) {
+    // /rows (length=1) carries num_rows_total for the split; first-rows does not.
+    const rows = await _fetchJson(
+      `https://datasets-server.huggingface.co/rows?dataset=${encodeURIComponent(datasetId)}` +
+      `&config=${encodeURIComponent(config)}&split=${encodeURIComponent(split)}&offset=0&length=1`, fetchImpl);
+    const n = Number(rows && rows.num_rows_total);
+    if (Number.isFinite(n) && n > 0) total = Math.floor(n);
+  }
+  if (total) _rowCountCache.set(datasetId, total);
+  return total;
+}
+
+async function estimateTrainingSteps(opts = {}, fetchImpl) {
+  const empty = { estimated_total_steps: null, train_rows: null, total_rows: null, basis: 'insufficient-config' };
+  const rawMax = opts.max_steps !== undefined ? opts.max_steps : opts.maxSteps;
+  if (rawMax !== null && rawMax !== undefined && String(rawMax).trim() !== '') {
+    const n = Number(rawMax);
+    if (Number.isFinite(n) && Number.isInteger(n) && n > 0) {
+      return { estimated_total_steps: n, train_rows: null, total_rows: null, basis: 'max_steps' };
+    }
+  }
+  const datasetId = String(opts.dataset_id || opts.datasetId || '').trim();
+  const epochs = Number(opts.epochs);
+  const batch = Number(opts.batch_size !== undefined ? opts.batch_size : opts.batchSize);
+  if (!datasetId || !Number.isFinite(epochs) || epochs < 1 || !Number.isFinite(batch) || batch < 1) return empty;
+  const total = await _fetchDatasetRowCount(datasetId, fetchImpl);
+  if (!total) return { estimated_total_steps: null, train_rows: null, total_rows: null, basis: 'unknown-dataset-size' };
+  const maxSamples = Number(opts.max_samples) > 0 ? Number(opts.max_samples) : MAX_SAMPLES;
+  const effective = Math.min(total, maxSamples);
+  const valFrac = Math.min(50, Math.max(0, Number(opts.validation_split !== undefined ? opts.validation_split : opts.validationSplit) || 0)) / 100;
+  const trainRows = Math.max(1, Math.round(effective * (1 - valFrac)));
+  const steps = Math.max(1, Math.ceil(trainRows / batch) * Math.floor(epochs));
+  return { estimated_total_steps: steps, train_rows: trainRows, total_rows: total, basis: 'dataset-rows' };
+}
+
+// Best-effort: patch a queued/running job's progress denominator with the
+// real estimate. Never throws; safe to fire-and-forget after train/start.
+async function refreshTotalStepsEstimate(job) {
+  try {
+    if (!job || job.end_time || ['finished', 'failed'].includes(job.status)) return null;
+    if (job.config && job.config.max_steps) {
+      _updateProgress(job, { total_steps: job.config.max_steps });
+      return job.config.max_steps;
+    }
+    const est = await estimateTrainingSteps(job.config || {});
+    if (est.estimated_total_steps && !job.end_time && !['finished', 'failed'].includes(job.status)) {
+      _updateProgress(job, { total_steps: est.estimated_total_steps });
+      _log(job, `[TRAIN] estimated total_steps=${est.estimated_total_steps} (${est.basis}, train_rows=${est.train_rows})`);
+    }
+    return est.estimated_total_steps;
+  } catch {
+    return null;
+  }
+}
+
 function startJob(job) {
   const provider = resolveTrainingProvider(process.env);
   job.config.provider = provider;
-  // gpu_status reflects requested provider but real execution is via Python Trainer
-  job.progress.gpu_status = provider === 'zerogpu' ? 'zerogpu' : provider === 'modal' ? 'modal' : 'local';
-  _log(job, `[TRAIN] provider=${provider} starting real training (Trainer)`);
-  _startPythonTraining(job);
+  if (provider === 'zerogpu') {
+    // Remote execution on the ZeroGPU Space — NEVER spawns local Python.
+    job.progress.gpu_status = 'zerogpu';
+    _log(job, `[TRAIN] provider=zerogpu starting remote training (ZeroGPU Space)`);
+    _startZeroGPUTraining(job);
+  } else if (provider === 'modal') {
+    // No Modal training runner exists: fail loudly instead of silently
+    // running locally while the UI claims "modal".
+    job.progress.gpu_status = 'modal';
+    const msg = 'Modal training is not implemented (no remote runner). Set TRAINING_PROVIDER=local or zerogpu.';
+    _log(job, `[TRAIN] training_error: ${msg}`);
+    _setStatus(job, 'failed');
+    _updateProgress(job, { gpu_status: 'idle', eta: 0 });
+    job.error = 'training_error';
+    job.end_time = _now();
+    _broadcast(job, 'done', { status: 'failed', error: job.error, message: msg });
+    _saveArtifacts(job);
+  } else {
+    // Local execution only when explicitly selected.
+    job.progress.gpu_status = 'local';
+    _log(job, `[TRAIN] provider=local starting real training (Trainer)`);
+    _startPythonTraining(job);
+  }
   return job;
 }
 
@@ -776,7 +1406,24 @@ function stopJob(job_id, opts = {}) {
   _log(job, `[TRAIN-DIAG] stopJob caller=${caller} cellId=${cellId} userInitiated=${userInitiated} stack=${String(stack).slice(0,500)}`);
 
   // Terminate Python process and its children if possible
-  if (job._pythonProc) {
+  if (job._remote) {
+    const { controller, timeout, apiBase, token, eventId, downloadController } = job._remote;
+    if (timeout) { clearTimeout(timeout); job._remote.timeout = null; }
+    try { if (controller) controller.abort(); } catch (_) {}
+    try { if (downloadController) downloadController.abort(); } catch (_) {}
+    // Best-effort remote cancellation: the Space acknowledges via its
+    // cancel_train endpoint. If it cannot be reached, the worker may run to
+    // completion in the background, but its results are ignored locally
+    // (job._aborted) so nothing is ever presented as a stopped-then-finished job.
+    _requestZeroGpuCancel(apiBase, job_id, token).then(
+      (ok) => _log(job, ok
+        ? `[TRAIN] remote cancel acknowledged for ${job_id} (event=${eventId || 'n/a'})`
+        : `[TRAIN] remote cancel NOT confirmed for ${job_id} — worker may finish in background; results will be ignored`),
+      (e) => _log(job, `[TRAIN] remote cancel request failed (${e.message}) — worker may finish in background; results will be ignored`)
+    );
+    _log(job, `[TRAIN] stop requested for remote ZeroGPU job (caller=${caller})`);
+    job._remote.eventId = null;
+  } else if (job._pythonProc) {
     const proc = job._pythonProc;
     job._pythonProc = null;
     try {
@@ -850,6 +1497,11 @@ function clearAllJobs() {
     if (job._pythonProc) {
       try { job._pythonProc.kill('SIGKILL'); } catch (_) {}
     }
+    if (job._remote) {
+      try { if (job._remote.controller) job._remote.controller.abort(); } catch (_) {}
+      try { if (job._remote.downloadController) job._remote.downloadController.abort(); } catch (_) {}
+      if (job._remote.timeout) { clearTimeout(job._remote.timeout); job._remote.timeout = null; }
+    }
     job.sseClients.clear();
   }
   jobs.clear();
@@ -875,6 +1527,14 @@ module.exports = {
   _updateProgress,
   _setStatus,
   _log,
+  _applyTrainerMetric,
+  _applyRemoteTrainEvent,
+  _extractZipBuffer,
+  _zeroGpuTrainConfig,
+  _classifyZeroGpuErrorFrame,
+  estimateTrainingSteps,
+  refreshTotalStepsEstimate,
+  ZeroGpuTrainError,
   jobs,
   ALLOWED_TASKS,
   MAX_EPOCHS,

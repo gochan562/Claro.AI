@@ -879,6 +879,20 @@ def _to_gpu(result: LoaderResult) -> float:
     import torch
     if not torch.cuda.is_available():
         return 0.0
+    # Minimal accelerator self-test BEFORE touching the model: a 1-element
+    # CUDA op. If the accelerator itself is broken (bad CUDA init, driver /
+    # binary mismatch), fail here with code=gpu_unavailable instead of letting
+    # the subsequent model ops fail with a misleading model error.
+    try:
+        _probe = torch.randn(1, device="cuda") + 1
+        print(f"[CLARO] cuda self-test ok: {float(_probe.flatten()[0]):.4f}", flush=True)
+        del _probe
+    except Exception as e:
+        raise ClaroBackendError(
+            f"ZeroGPU accelerator self-test failed ({type(e).__name__}: {e}). "
+            f"The GPU itself is unusable — this is an environment issue, not the model.",
+            code="gpu_unavailable",
+        )
     start = time.time()
     try:
         result.model.to("cuda")

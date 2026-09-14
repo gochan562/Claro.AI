@@ -1180,6 +1180,45 @@ let notebookRegistry = {
 
       // Sync advanced visibility
       syncAdvancedVisibility(cellId);
+
+      // Best-effort live step estimate from the real dataset size (debounced).
+      refreshTrainingEstimate(cellId);
+    }
+
+    const _estimateTimers = {};
+    function refreshTrainingEstimate(cellId) {
+      try {
+        const nb = getActiveNotebook();
+        const cell = nb?.cells.find(c => c.id === cellId);
+        const t = cell?.training;
+        if (!cell || !t) return;
+        if (['loading','training','evaluating'].includes(t.status)) return;
+        if (_estimateTimers[cellId]) clearTimeout(_estimateTimers[cellId]);
+        _estimateTimers[cellId] = setTimeout(async () => {
+          try {
+            const params = new URLSearchParams({
+              dataset_id: t.dataset_id || '',
+              epochs: String(t.epochs ?? ''),
+              batch_size: String(t.batch_size ?? ''),
+              max_steps: (t.max_steps === '' || t.max_steps == null) ? '' : String(t.max_steps),
+              validation_split: String(t.validation_split ?? ''),
+            });
+            const url = new URL(`/api/train/estimate?${params.toString()}`, window.location.href).toString();
+            const res = await fetch(url);
+            if (!res.ok) return;
+            const data = await res.json();
+            // Cell may have started/changed while we waited — re-check.
+            const nb2 = getActiveNotebook();
+            const t2 = nb2?.cells.find(c => c.id === cellId)?.training;
+            if (!t2 || ['loading','training','evaluating'].includes(t2.status)) return;
+            // Only overwrite when the server resolved the real dataset size.
+            if (data && Number.isFinite(Number(data.estimated_total_steps)) && Number(data.estimated_total_steps) > 0) {
+              const el = document.getElementById(`tr-${cellId}-pv-steps`);
+              if (el) el.textContent = `${Number(data.estimated_total_steps)} (est. from dataset size)`;
+            }
+          } catch (_) { /* estimate is best-effort; preview keeps its fallback */ }
+        }, 600);
+      } catch (_) {}
     }
 
     function fixCompatibility(cellId) {

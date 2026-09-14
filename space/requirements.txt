@@ -1,7 +1,18 @@
 transformers>=5.0.0
-torch
+# PyTorch floor per current Hugging Face ZeroGPU guidance (2.8.0+). Unpinned
+# torch floats across CUDA major builds between rebuilds, which is exactly how
+# "worked yesterday, CUDA failure today" happens — keep the documented floor.
+torch>=2.8.0
 accelerate
 spaces
 diffusers>=0.30.0
 sentencepiece
 protobuf
+# ── Remote training worker (train_api.py reuses training_runner.py) ──
+datasets
+peft
+safetensors
+huggingface_hub
+pillow
+numpy
+scikit-learn

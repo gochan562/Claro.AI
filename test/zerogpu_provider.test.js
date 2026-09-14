@@ -300,6 +300,56 @@ async function run() {
   assert.strictEqual(postCount, 1, `duplicate request must reuse the in-flight call (got ${postCount} POSTs)`);
   console.log('✓ test 11: duplicate concurrent request deduplicated (1 POST for 2 runs)');
 
+  // ─── 12. Space returns [CLARO:zerogpu_quota] inside the success frame ──
+  // Scheduler-side GPU denials (quota/runs-limit) must arrive typed as
+  // zerogpu_quota — never disguised as a model error — with an actionable
+  // message (quota/billing), status 502.
+  setBackendResponses((u, init) => {
+    if (u.endsWith('/gradio_api/call/v2/generate')) return { status: 200, json: { event_id: 'evt-quota' } };
+    if (u.endsWith('/gradio_api/call/generate/evt-quota')) {
+      return {
+        ok: true, status: 200,
+        body: 'event: complete\ndata: "[CLARO:zerogpu_quota] ZeroGPU cannot provide a GPU right now: You have exceeded your ZeroGPU runs limit"\n\n',
+      };
+    }
+    return { status: 404, text: '?' };
+  });
+  err = null;
+  try {
+    await new ZeroGPUBackend(infra).run(
+      { model_id: 'm/m', task: 'text-generation', inputs: { prompt: 'x', max_new_tokens: 5 } },
+      new AbortController().signal
+    );
+  } catch (e) { err = e; }
+  assert(err instanceof GpuError, 'should be GpuError');
+  assert.strictEqual(err.code, 'zerogpu_quota', 'quota string must map to zerogpu_quota, not model_runtime');
+  assert.strictEqual(err.status, 502);
+  console.log('✓ test 12: [CLARO:zerogpu_quota] from complete frame mapped to typed quota error');
+
+  // ─── 13. Bare scheduler denial (e.g. AcceleratorError class) still classifies
+  // by message: runs-limit text without a quota title must map to zerogpu_quota.
+  setBackendResponses((u, init) => {
+    if (u.endsWith('/gradio_api/call/v2/generate')) return { status: 200, json: { event_id: 'evt-acc' } };
+    if (u.endsWith('/gradio_api/call/generate/evt-acc')) {
+      return {
+        ok: true, status: 200,
+        body: 'event: error\ndata: {"error": "AcceleratorError: You have exceeded your ZeroGPU runs limit"}\n\n',
+      };
+    }
+    return { status: 404, text: '?' };
+  });
+  err = null;
+  try {
+    await new ZeroGPUBackend(infra).run(
+      { model_id: 'm/m', task: 'text-generation', inputs: { prompt: 'x', max_new_tokens: 5 } },
+      new AbortController().signal
+    );
+  } catch (e) { err = e; }
+  assert(err instanceof GpuError, 'should be GpuError');
+  assert.strictEqual(err.code, 'zerogpu_quota', 'runs-limit denial must map to zerogpu_quota');
+  assert(err.message.includes('quota') || err.message.includes('retry later'), 'message must be actionable');
+  console.log('✓ test 13: scheduler denial by message maps to zerogpu_quota with actionable text');
+
   delete global.fetch;
   console.log('\nAll ZeroGPU integration tests passed.');
 }

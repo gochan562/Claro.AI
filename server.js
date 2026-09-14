@@ -361,6 +361,24 @@ app.post('/api/run-cell', strictLimiter, async (req, res) => {
 });
 
 // ── Training Engine ────────────────────────────────────────────────────────
+// Real step-count estimate from dataset size (no fake numbers). Used by the
+// Training Cell preview; estimated_total_steps is null when the dataset size
+// cannot be resolved. Time estimates are intentionally NOT invented.
+app.get('/api/train/estimate', async (req, res) => {
+  try {
+    const est = await trainingBackend.estimateTrainingSteps({
+      dataset_id: req.query.dataset_id || req.query.datasetId || '',
+      epochs: req.query.epochs,
+      batch_size: req.query.batch_size !== undefined ? req.query.batch_size : req.query.batchSize,
+      max_steps: req.query.max_steps !== undefined ? req.query.max_steps : req.query.maxSteps,
+      validation_split: req.query.validation_split !== undefined ? req.query.validation_split : req.query.validationSplit,
+    });
+    return res.json(est);
+  } catch (err) {
+    return res.json({ estimated_total_steps: null, train_rows: null, total_rows: null, basis: 'estimate-failed' });
+  }
+});
+
 app.post('/api/train/start', strictLimiter, async (req, res) => {
   try {
     // Single-user quota: 1 concurrent job for the local user
@@ -372,6 +390,9 @@ app.post('/api/train/start', strictLimiter, async (req, res) => {
     const config = trainingBackend.validateTrainingRequest(req.body);
     const job = trainingBackend.createJob(config, ANON_USER_ID);
     trainingBackend.startJob(job);
+    // Best-effort: replace the epochs*100 progress fallback with the real
+    // estimate once the dataset size resolves (broadcasts to SSE clients).
+    trainingBackend.refreshTotalStepsEstimate(job).catch(() => {});
     return res.json({
       job_id: job.job_id,
       status: job.status,

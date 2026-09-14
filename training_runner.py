@@ -583,6 +583,15 @@ def run_training(args):
             else:
                 raise
 
+        # Report the real total optimizer steps so clients can replace the
+        # epochs*100 progress fallback with the actual denominator.
+        try:
+            _dl_len = len(trainer.get_train_dataloader())
+            _total = int(training_args.max_steps) if int(getattr(training_args, 'max_steps', -1)) > 0 else int(_dl_len * float(training_args.num_train_epochs))
+            _log(f"total_steps={max(1, _total)}")
+        except Exception as _e:
+            _log(f"total_steps unavailable: {_e}")
+
         trainer.train()
 
         # final eval if validation exists

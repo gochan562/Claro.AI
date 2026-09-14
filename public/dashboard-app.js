@@ -128,6 +128,12 @@ let notebookRegistry = {
             }
             // ensure LoRA fields for existing training cells (created before LoRA)
             if (cell.type === 'training' && cell.training) {
+              if (typeof TrainingUI !== 'undefined' && TrainingUI.migrateLegacyTrainingToPresets) {
+                try { TrainingUI.migrateLegacyTrainingToPresets(cell.training); } catch (_) {}
+              } else {
+                if (!('model_preset' in cell.training)) cell.training.model_preset = 'custom';
+                if (!('dataset_preset' in cell.training)) cell.training.dataset_preset = 'custom';
+              }
               if (!('training_method' in cell.training)) cell.training.training_method = 'auto';
               if (!('lora_r' in cell.training)) cell.training.lora_r = 8;
               if (!('lora_alpha' in cell.training)) cell.training.lora_alpha = 16;
@@ -250,6 +256,8 @@ let notebookRegistry = {
       }
       if (type === 'training') {
         cell.training = {
+          model_preset: 'distilbert-base',
+          dataset_preset: 'imdb',
           model_id: 'distilbert-base-uncased',
           dataset_id: 'stanfordnlp/imdb',
           task_type: 'text-classification',
@@ -675,6 +683,8 @@ let notebookRegistry = {
     function buildTrainingCellBody(cell) {
       if (!cell.training) {
         cell.training = {
+          model_preset: 'distilbert-base',
+          dataset_preset: 'imdb',
           model_id: 'distilbert-base-uncased',
           dataset_id: 'stanfordnlp/imdb',
           task_type: 'text-classification',
@@ -725,7 +735,21 @@ let notebookRegistry = {
       // validation & compat will be computed after DOM attached, but initial render
       const valInfo = (typeof TrainingUI !== 'undefined' && TrainingUI.validateTrainingConfigFrontend) ? TrainingUI.validateTrainingConfigFrontend(t) : {valid:true, errors:{}};
       const compatInfo = (typeof TrainingUI !== 'undefined' && TrainingUI.getCompatibilityInfo) ? TrainingUI.getCompatibilityInfo(t) : {status:'unknown', message:'Compatibility will be checked when training starts.'};
-      const preview = (typeof TrainingUI !== 'undefined' && TrainingUI.getPreviewData) ? TrainingUI.getPreviewData(t) : {task:t.task_type, model:t.model_id, dataset:t.dataset_id, method:effLabel, epochs:t.epochs, batch_size:t.batch_size, validation:t.validation_split+'%', estimatedSteps:'Estimate unavailable', estimatedTime:'Estimate unavailable', resourceUsage:'Estimate unavailable'};
+      const preview = (typeof TrainingUI !== 'undefined' && TrainingUI.getPreviewData) ? TrainingUI.getPreviewData(t) : {task:t.task_type, model:t.model_id, dataset:t.dataset_id, advancedDetails:`Model ID ${t.model_id || '(none)'} · Dataset ID ${t.dataset_id || '(none)'}`, method:effLabel, epochs:t.epochs, batch_size:t.batch_size, validation:t.validation_split+'%', estimatedSteps:'Estimate unavailable', estimatedTime:'Estimate unavailable', resourceUsage:'Estimate unavailable'};
+
+      // preset selectors (curated catalog; Custom keeps legacy raw IDs)
+      const hasCatalog = (typeof TrainingUI !== 'undefined') && TrainingUI.MODEL_PRESETS;
+      const modelPresetChoices = hasCatalog ? TrainingUI.modelsForTaskType(t.task_type) : [];
+      const curModelPresetRaw = t.model_preset || 'custom';
+      const effModelPresetId = (curModelPresetRaw !== 'custom' && modelPresetChoices.some((m) => m.id === curModelPresetRaw)) ? curModelPresetRaw : 'custom';
+      const effModelPreset = hasCatalog ? TrainingUI.getModelPreset(effModelPresetId) : null;
+      const datasetChoicePool = hasCatalog ? TrainingUI.datasetsForModelPreset(effModelPreset) : [];
+      const datasetPresetChoices = datasetChoicePool.filter((d) => !t.task_type || (d.taskTypes || []).includes(t.task_type));
+      const curDatasetPresetRaw = t.dataset_preset || 'custom';
+      const effDatasetPresetId = (curDatasetPresetRaw !== 'custom' && datasetPresetChoices.some((d) => d.id === curDatasetPresetRaw)) ? curDatasetPresetRaw : 'custom';
+      const effDatasetPreset = hasCatalog ? TrainingUI.getDatasetPreset(effDatasetPresetId) : null;
+      const escAttr = (v) => String(v == null ? '' : v).replace(/"/g, '&quot;');
+      const escHtml = (v) => String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
       // friendly labels for task
       const taskOptions = [
@@ -754,19 +778,32 @@ let notebookRegistry = {
           </div>
 
           <div>
-            <div class="train-section-label">Model <span class="train-help-tooltip" data-tooltip="The AI model you\u2019ll train. For example: distilbert-base-uncased">?</span></div>
+            <div class="train-section-label">Model <span class="train-help-tooltip" data-tooltip="Pick a curated model preset, or choose Custom to enter any Hugging Face model ID.">?</span></div>
             <div class="training-field">
-              <input type="text" id="tr-${cell.id}-model" class="train-input" value="${String(t.model_id).replace(/"/g,'&quot;')}" placeholder="distilbert-base-uncased or owner/model-name" ${locked} oninput="updateTrainingField(${cell.id},'model_id',this.value)" />
-              <div class="train-field-hint">The AI model you\u2019ll train.</div>
+              <select id="tr-${cell.id}-modelpreset" ${locked} onchange="updateModelPreset(${cell.id},this.value)">
+                ${modelPresetChoices.map((m)=>`<option value="${m.id}" ${effModelPresetId===m.id?'selected':''}>${escHtml(m.name)}</option>`).join('')}
+                <option value="custom" ${effModelPresetId==='custom'?'selected':''}>Custom&hellip;</option>
+              </select>
+              <div class="train-field-hint" id="tr-${cell.id}-model-desc">${effModelPreset ? escHtml(effModelPreset.description) : 'Custom Hugging Face model ID (validated with global limits only).'}</div>
+              <div id="tr-${cell.id}-model-custom-wrap" style="${effModelPresetId==='custom'?'':'display:none;'}margin-top:8px;">
+                <input type="text" id="tr-${cell.id}-model" class="train-input" value="${escAttr(t.model_id)}" placeholder="distilbert-base-uncased or owner/model-name" ${locked} oninput="updateTrainingField(${cell.id},'model_id',this.value)" />
+                <div class="train-field-hint">The AI model you\u2019ll train.</div>
+              </div>
               <div class="train-field-error" id="tr-${cell.id}-err-model"></div>
             </div>
           </div>
 
-          <div>
-            <div class="train-section-label">Dataset <span class="train-help-tooltip" data-tooltip="The examples the model will learn from. For example: stanfordnlp/imdb">?</span></div>
+<div class="train-section-label">Dataset <span class="train-help-tooltip" data-tooltip="Pick a dataset compatible with the selected model, or choose Custom to enter any Hugging Face dataset ID.">?</span></div>
             <div class="training-field">
-              <input type="text" id="tr-${cell.id}-dataset" class="train-input" value="${String(t.dataset_id).replace(/"/g,'&quot;')}" placeholder="stanfordnlp/imdb or owner/dataset-name" ${locked} oninput="updateTrainingField(${cell.id},'dataset_id',this.value)" />
-              <div class="train-field-hint">The examples the model will learn from.</div>
+              <select id="tr-${cell.id}-datasetpreset" ${locked} onchange="updateDatasetPreset(${cell.id},this.value)">
+                ${datasetPresetChoices.map((d)=>`<option value="${d.id}" ${effDatasetPresetId===d.id?'selected':''}>${escHtml(d.name)}</option>`).join('')}
+                <option value="custom" ${effDatasetPresetId==='custom'?'selected':''}>Custom&hellip;</option>
+              </select>
+              <div class="train-field-hint" id="tr-${cell.id}-dataset-desc">${effDatasetPreset ? escHtml(effDatasetPreset.description) : 'Custom Hugging Face dataset ID (validated with global limits only).'}</div>
+              <div id="tr-${cell.id}-dataset-custom-wrap" style="${effDatasetPresetId==='custom'?'':'display:none;'}margin-top:8px;">
+                <input type="text" id="tr-${cell.id}-dataset" class="train-input" value="${escAttr(t.dataset_id)}" placeholder="stanfordnlp/imdb or owner/dataset-name" ${locked} oninput="updateTrainingField(${cell.id},'dataset_id',this.value)" />
+                <div class="train-field-hint">The examples the model will learn from.</div>
+              </div>
               <div class="train-field-error" id="tr-${cell.id}-err-dataset"></div>
             </div>
           </div>
@@ -870,6 +907,8 @@ let notebookRegistry = {
               <span class="train-preview-label">Validation</span><span class="train-preview-value" id="tr-${cell.id}-pv-val">${preview.validation}</span>
               <span class="train-preview-label">Max steps</span><span class="train-preview-value" id="tr-${cell.id}-pv-maxsteps">${preview.maxSteps}</span>
             </div>
+            <div class="train-preview-divider"></div>
+            <div style="font-size:11px;color:#64748b;" id="tr-${cell.id}-pv-advwrap">Advanced details: <span style="font-family:monospace;" id="tr-${cell.id}-pv-adv">${preview.advancedDetails}</span></div>
             <div class="train-preview-divider"></div>
             <div class="train-preview-grid">
               <span class="train-preview-label">Estimated steps</span><span class="train-preview-value" id="tr-${cell.id}-pv-steps">${preview.estimatedSteps}</span>
@@ -1164,6 +1203,7 @@ let notebookRegistry = {
         setIf(`tr-${cellId}-pv-batch`, preview.batch_size);
         setIf(`tr-${cellId}-pv-val`, preview.validation);
         setIf(`tr-${cellId}-pv-maxsteps`, preview.maxSteps);
+        setIf(`tr-${cellId}-pv-adv`, preview.advancedDetails);
         setIf(`tr-${cellId}-pv-steps`, preview.estimatedSteps);
         setIf(`tr-${cellId}-pv-time`, preview.estimatedTime);
         setIf(`tr-${cellId}-pv-resource`, preview.resourceUsage);
@@ -1655,6 +1695,31 @@ let notebookRegistry = {
         cell.training[key] = Number(value);
       } else if (key === 'target_modules') {
         cell.training[key] = String(value).trim() || 'auto';
+      } else if (key === 'task_type') {
+        // Task drives the curated catalog: presets that cannot do the new
+        // task fall back to Custom (raw IDs preserved); a surviving model
+        // preset pulls its dataset list along so options stay compatible.
+        cell.training[key] = value;
+        const ui = (typeof TrainingUI !== 'undefined') ? TrainingUI : null;
+        if (ui) {
+          const t = cell.training;
+          const mp = (t.model_preset && t.model_preset !== 'custom') ? ui.getModelPreset(t.model_preset) : null;
+          if (mp && !mp.taskTypes.includes(value)) t.model_preset = 'custom';
+          const dp = (t.dataset_preset && t.dataset_preset !== 'custom') ? ui.getDatasetPreset(t.dataset_preset) : null;
+          if (dp && !dp.taskTypes.includes(value)) t.dataset_preset = 'custom';
+          const mp2 = (t.model_preset && t.model_preset !== 'custom') ? ui.getModelPreset(t.model_preset) : null;
+          const dp2 = (t.dataset_preset && t.dataset_preset !== 'custom') ? ui.getDatasetPreset(t.dataset_preset) : null;
+          if (mp2 && (!dp2 || !mp2.datasets.includes(dp2.id))) {
+            const first = ui.getDatasetPreset(mp2.datasets[0]);
+            if (first) {
+              t.dataset_preset = first.id;
+              t.dataset_id = first.datasetId;
+            }
+          }
+        }
+        updateNotebook();
+        renderNotebookEditor();
+        return;
       } else {
         cell.training[key] = value;
       }
@@ -1669,6 +1734,51 @@ let notebookRegistry = {
       cell.training.training_method = value;
       updateNotebook();
       updateTrainingValidationUI(cellId);
+    }
+
+    function updateModelPreset(cellId, value) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training) return;
+      const t = cell.training;
+      const ui = (typeof TrainingUI !== 'undefined') ? TrainingUI : null;
+      t.model_preset = value;
+      if (ui && value && value !== 'custom') {
+        const mp = ui.getModelPreset(value);
+        if (mp) {
+          t.model_id = mp.modelId;
+          if (!mp.taskTypes.includes(t.task_type)) t.task_type = mp.taskTypes[0];
+          // repair dataset side toward a compatible preset
+          const dp = (t.dataset_preset && t.dataset_preset !== 'custom') ? ui.getDatasetPreset(t.dataset_preset) : null;
+          if (!dp || !mp.datasets.includes(dp.id)) {
+            const first = ui.getDatasetPreset(mp.datasets[0]);
+            if (first) {
+              t.dataset_preset = first.id;
+              t.dataset_id = first.datasetId;
+            }
+          }
+        }
+      }
+      updateNotebook();
+      renderNotebookEditor();
+    }
+
+    function updateDatasetPreset(cellId, value) {
+      const nb = getActiveNotebook();
+      const cell = nb?.cells.find(c => c.id === cellId);
+      if (!cell || !cell.training) return;
+      const t = cell.training;
+      const ui = (typeof TrainingUI !== 'undefined') ? TrainingUI : null;
+      t.dataset_preset = value;
+      if (ui && value && value !== 'custom') {
+        const dp = ui.getDatasetPreset(value);
+        if (dp) {
+          t.dataset_id = dp.datasetId;
+          if (!dp.taskTypes.includes(t.task_type)) t.task_type = dp.taskTypes[0];
+        }
+      }
+      updateNotebook();
+      renderNotebookEditor();
     }
 
     function initTrainingChart(cellId) {
@@ -2211,6 +2321,8 @@ print(f"Loaded trained model from {MODEL_DIR}")
       try {
         const startUrl = new URL('/api/train/start', window.location.href).toString();
         const startBody = {
+          model_preset: t.model_preset || null,
+          dataset_preset: t.dataset_preset || null,
           model_id: t.model_id,
           dataset_id: t.dataset_id,
           task_type: t.task_type,

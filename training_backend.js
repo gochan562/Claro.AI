@@ -20,6 +20,9 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const childProcess = require('child_process');
+// Shared catalog (pure helpers only — the backend re-resolves preset IDs
+// server-side and never trusts frontend-supplied IDs or limits).
+const trainingUI = require('./training_ui');
 
 // ── Resource limits (env overrides) ──
 const MAX_EPOCHS = parseInt(process.env.TRAIN_MAX_EPOCHS || '5', 10);
@@ -87,9 +90,48 @@ function validateTrainingRequest(body) {
   if (!body || typeof body !== 'object') {
     throw Object.assign(new Error('Request body must be an object'), { code: 'bad_request', status: 400 });
   }
-  const model_id = String(body.model_id || body.modelId || '').trim();
-  const dataset_id = String(body.dataset_id || body.datasetId || '').trim();
+  let model_id = String(body.model_id || body.modelId || '').trim();
+  let dataset_id = String(body.dataset_id || body.datasetId || '').trim();
   const task_type = normalizeTask(body.task_type || body.task || body.taskType);
+
+  // ── Preset resolution (server-side, authoritative) ─────────────────────
+  // When preset IDs are present, underlying IDs resolve from the catalog —
+  // any frontend-supplied model_id/dataset_id is ignored. Absent presets
+  // (''/null/undefined) mean legacy raw mode with global limits only.
+  const mpKey = trainingUI.normPresetId(body.model_preset !== undefined ? body.model_preset : body.modelPreset);
+  const dpKey = trainingUI.normPresetId(body.dataset_preset !== undefined ? body.dataset_preset : body.datasetPreset);
+  let modelPreset = null;
+  let datasetPreset = null;
+  let modelPresetKey = null;
+  let datasetPresetKey = null;
+  if (mpKey !== null || dpKey !== null) {
+    modelPresetKey = mpKey || trainingUI.CUSTOM_PRESET;
+    datasetPresetKey = dpKey || trainingUI.CUSTOM_PRESET;
+    if (modelPresetKey !== trainingUI.CUSTOM_PRESET) {
+      modelPreset = trainingUI.getModelPreset(modelPresetKey);
+      if (!modelPreset) {
+        throw Object.assign(new Error(`Unknown model preset: ${modelPresetKey}`), { code: 'bad_request', status: 400 });
+      }
+      model_id = modelPreset.modelId;
+    }
+    if (datasetPresetKey !== trainingUI.CUSTOM_PRESET) {
+      datasetPreset = trainingUI.getDatasetPreset(datasetPresetKey);
+      if (!datasetPreset) {
+        throw Object.assign(new Error(`Unknown dataset preset: ${datasetPresetKey}`), { code: 'bad_request', status: 400 });
+      }
+      dataset_id = datasetPreset.datasetId;
+    }
+    const chk = trainingUI.checkPresetCompatibility({ modelPreset: modelPresetKey, datasetPreset: datasetPresetKey, taskType: task_type });
+    if (!chk.ok) {
+      throw Object.assign(new Error(chk.error), { code: 'bad_request', status: 400 });
+    }
+  }
+
+  // Preset resource ceilings apply on top of the global limits.
+  const epochCap = Math.min(MAX_EPOCHS, modelPreset ? modelPreset.maxEpochs : MAX_EPOCHS);
+  const batchCap = Math.min(MAX_BATCH, modelPreset ? modelPreset.maxBatchSize : MAX_BATCH);
+  const stepsCap = Math.min(MAX_STEPS_LIMIT, modelPreset ? modelPreset.maxSteps : MAX_STEPS_LIMIT);
+  const samplesCap = Math.min(MAX_SAMPLES, modelPreset ? modelPreset.maxSamples : MAX_SAMPLES);
 
   if (!model_id || !/^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)?$/.test(model_id)) {
     throw Object.assign(new Error(`Invalid model_id: ${model_id || '(empty)'}`), { code: 'invalid_model_id', status: 400 });
@@ -107,19 +149,25 @@ function validateTrainingRequest(body) {
   let max_steps = body.max_steps !== undefined ? body.max_steps : (body.maxSteps !== undefined ? body.maxSteps : null);
   let validation_split = body.validation_split !== undefined ? Number(body.validation_split) : (body.validationSplit !== undefined ? Number(body.validationSplit) : 10);
 
-  if (!Number.isFinite(epochs) || !Number.isInteger(epochs) || epochs < 1 || epochs > MAX_EPOCHS) {
-    throw Object.assign(new Error(`epochs must be integer 1..${MAX_EPOCHS}`), { code: 'bad_request', status: 400 });
+  if (!Number.isFinite(epochs) || !Number.isInteger(epochs) || epochs < 1 || epochs > epochCap) {
+    throw Object.assign(new Error(modelPreset
+      ? `epochs must be integer 1..${epochCap} for preset '${modelPreset.id}'`
+      : `epochs must be integer 1..${epochCap}`), { code: 'bad_request', status: 400 });
   }
-  if (!Number.isFinite(batch_size) || !Number.isInteger(batch_size) || batch_size < 1 || batch_size > MAX_BATCH) {
-    throw Object.assign(new Error(`batch_size must be integer 1..${MAX_BATCH}`), { code: 'bad_request', status: 400 });
+  if (!Number.isFinite(batch_size) || !Number.isInteger(batch_size) || batch_size < 1 || batch_size > batchCap) {
+    throw Object.assign(new Error(modelPreset
+      ? `batch_size must be integer 1..${batchCap} for preset '${modelPreset.id}'`
+      : `batch_size must be integer 1..${batchCap}`), { code: 'bad_request', status: 400 });
   }
   if (!Number.isFinite(learning_rate) || learning_rate < 1e-6 || learning_rate > 1e-2) {
     throw Object.assign(new Error('learning_rate must be between 1e-6 and 1e-2'), { code: 'bad_request', status: 400 });
   }
   if (max_steps !== null && max_steps !== undefined && String(max_steps).trim() !== '') {
     max_steps = Number(max_steps);
-    if (!Number.isFinite(max_steps) || !Number.isInteger(max_steps) || max_steps < 1 || max_steps > MAX_STEPS_LIMIT) {
-      throw Object.assign(new Error(`max_steps must be integer 1..${MAX_STEPS_LIMIT} or empty`), { code: 'bad_request', status: 400 });
+    if (!Number.isFinite(max_steps) || !Number.isInteger(max_steps) || max_steps < 1 || max_steps > stepsCap) {
+      throw Object.assign(new Error(modelPreset
+        ? `max_steps must be integer 1..${stepsCap} for preset '${modelPreset.id}' or empty`
+        : `max_steps must be integer 1..${stepsCap} or empty`), { code: 'bad_request', status: 400 });
     }
   } else {
     max_steps = null;
@@ -181,17 +229,24 @@ function validateTrainingRequest(body) {
     if (!Number.isFinite(lora_dropout) || lora_dropout < 0) lora_dropout = 0.05;
   }
 
+  // Preset-supported training modes (checked after auto-resolution).
+  if (modelPreset && !modelPreset.trainingMethods.includes(training_method)) {
+    throw Object.assign(new Error(`Training method '${training_method}' is not supported by preset '${modelPreset.id}' (${modelPreset.name}). Supported: ${modelPreset.trainingMethods.join(', ')}`), { code: 'bad_request', status: 400 });
+  }
+
   return {
     model_id,
     dataset_id,
     task_type,
+    model_preset: modelPresetKey,
+    dataset_preset: datasetPresetKey,
     epochs,
     batch_size,
     learning_rate,
     max_steps,
     validation_split,
     provider: (body.provider || process.env.TRAINING_PROVIDER || 'local').toLowerCase(),
-    max_samples: MAX_SAMPLES,
+    max_samples: samplesCap,
     max_time_sec: MAX_TIME_SEC,
     training_method,
     lora_r,

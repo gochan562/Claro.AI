@@ -50,6 +50,200 @@ const LIMITS = {
   lora_dropout: { min: 0, max: 0.5 },
 };
 
+
+// ── Curated Model + Dataset catalog ─────────────────────────────────────
+// Stable preset IDs are the trust anchor: the backend resolves preset IDs
+// server-side and ignores any frontend-supplied model/dataset IDs or limits.
+// The UI keeps raw model_id/dataset_id in sync for display/validation, but
+// /api/train/start must never trust them when a preset is present.
+const CUSTOM_PRESET = 'custom';
+
+const MODEL_PRESETS = {
+  'distilbert-base': {
+    id: 'distilbert-base',
+    name: 'DistilBERT (base)',
+    description: 'Compact 66M-parameter text model. Fast to fine-tune; great for sentiment and topic classification.',
+    taskTypes: ['text-classification'],
+    modelId: 'distilbert-base-uncased',
+    datasets: ['imdb', 'ag-news'],
+    trainingMethods: ['full', 'lora'],
+    maxEpochs: 3,
+    maxBatchSize: 16,
+    maxSamples: 5000,
+    maxSteps: 2000,
+    resourceClass: 'small',
+  },
+  'mobilenet-v2': {
+    id: 'mobilenet-v2',
+    name: 'MobileNetV2',
+    description: 'Lightweight vision model built for efficiency. Good default for small image classification.',
+    taskTypes: ['image-classification'],
+    modelId: 'google/mobilenet_v2_1.0_224',
+    datasets: ['beans'],
+    trainingMethods: ['full'],
+    maxEpochs: 5,
+    maxBatchSize: 16,
+    maxSamples: 2000,
+    maxSteps: 2000,
+    resourceClass: 'small',
+  },
+  'resnet-18': {
+    id: 'resnet-18',
+    name: 'ResNet-18',
+    description: 'Classic 18-layer residual network. Slightly heavier than MobileNetV2, strong on small image datasets.',
+    taskTypes: ['image-classification'],
+    modelId: 'microsoft/resnet-18',
+    datasets: ['beans'],
+    trainingMethods: ['full'],
+    maxEpochs: 5,
+    maxBatchSize: 16,
+    maxSamples: 2000,
+    maxSteps: 2000,
+    resourceClass: 'small',
+  },
+};
+
+const DATASET_PRESETS = {
+  'imdb': {
+    id: 'imdb',
+    name: 'IMDb Movie Reviews',
+    description: '25,000 movie reviews labeled positive/negative. Binary sentiment classification.',
+    taskTypes: ['text-classification'],
+    datasetId: 'stanfordnlp/imdb',
+  },
+  'ag-news': {
+    id: 'ag-news',
+    name: 'AG News',
+    description: '120,000+ news headlines in 4 topic classes: World, Sports, Business, Sci/Tech.',
+    taskTypes: ['text-classification'],
+    datasetId: 'fancyzhx/ag_news',
+  },
+  'beans': {
+    id: 'beans',
+    name: 'Beans (leaf images)',
+    description: '1,296 bean leaf photos in 3 classes: healthy, angular leaf spot, bean rust.',
+    taskTypes: ['image-classification'],
+    datasetId: 'beans',
+  },
+};
+
+// Known raw IDs migrate to presets (lower-cased, trimmed before lookup).
+const MODEL_ID_ALIASES = {
+  'distilbert-base-uncased': 'distilbert-base',
+  'distilbert/distilbert-base-uncased': 'distilbert-base',
+  'google/mobilenet_v2_1.0_224': 'mobilenet-v2',
+  'mobilenet_v2_1.0_224': 'mobilenet-v2',
+  'microsoft/resnet-18': 'resnet-18',
+  'resnet-18': 'resnet-18',
+};
+const DATASET_ID_ALIASES = {
+  'stanfordnlp/imdb': 'imdb',
+  'imdb': 'imdb',
+  'fancyzhx/ag_news': 'ag-news',
+  'ag_news': 'ag-news',
+  'ag-news': 'ag-news',
+  'beans': 'beans',
+};
+
+function normPresetId(v) {
+  if (v === undefined || v === null) return null;
+  const s = String(v).trim();
+  return s === '' ? null : s;
+}
+function getModelPreset(id) {
+  const k = normPresetId(id);
+  return (k && k !== CUSTOM_PRESET && MODEL_PRESETS[k]) ? MODEL_PRESETS[k] : null;
+}
+function getDatasetPreset(id) {
+  const k = normPresetId(id);
+  return (k && k !== CUSTOM_PRESET && DATASET_PRESETS[k]) ? DATASET_PRESETS[k] : null;
+}
+function modelsForTaskType(taskType) {
+  const t = String(taskType || '').trim().toLowerCase();
+  return Object.values(MODEL_PRESETS).filter((m) => m.taskTypes.includes(t));
+}
+function datasetsForModelPreset(modelPresetId) {
+  const mp = getModelPreset(modelPresetId);
+  if (!mp) return Object.values(DATASET_PRESETS);
+  return mp.datasets.map((d) => DATASET_PRESETS[d]).filter(Boolean);
+}
+function inferModelPresetId(modelId) {
+  const k = String(modelId || '').trim().toLowerCase();
+  return MODEL_ID_ALIASES[k] || CUSTOM_PRESET;
+}
+function inferDatasetPresetId(datasetId) {
+  const k = String(datasetId || '').trim().toLowerCase();
+  return DATASET_ID_ALIASES[k] || CUSTOM_PRESET;
+}
+// Pure compatibility check shared by frontend validation and the backend.
+// Either side may be 'custom'/missing (legacy raw mode) — only real preset
+// IDs are verified. Returns { ok, error }.
+function checkPresetCompatibility({ modelPreset, datasetPreset, taskType } = {}) {
+  const mpId = normPresetId(modelPreset);
+  const dpId = normPresetId(datasetPreset);
+  const task = String(taskType || '').trim().toLowerCase();
+  let mp = null;
+  let dp = null;
+  if (mpId && mpId !== CUSTOM_PRESET) {
+    mp = getModelPreset(mpId);
+    if (!mp) return { ok: false, error: `Unknown model preset: ${mpId}` };
+  }
+  if (dpId && dpId !== CUSTOM_PRESET) {
+    dp = getDatasetPreset(dpId);
+    if (!dp) return { ok: false, error: `Unknown dataset preset: ${dpId}` };
+  }
+  if (mp && task && !mp.taskTypes.includes(task)) {
+    return { ok: false, error: `Model preset '${mp.id}' (${mp.name}) does not support task '${task}'` };
+  }
+  if (dp && task && !dp.taskTypes.includes(task)) {
+    return { ok: false, error: `Dataset preset '${dp.id}' (${dp.name}) does not support task '${task}'` };
+  }
+  if (mp && dp && !mp.datasets.includes(dp.id)) {
+    return { ok: false, error: `Dataset preset '${dp.id}' (${dp.name}) is not compatible with model preset '${mp.id}' (${mp.name})` };
+  }
+  return { ok: true, error: null };
+}
+// Migrate legacy notebook state (raw model_id/dataset_id) to preset IDs.
+// Never destroys information: unknown values become 'custom' with raw IDs
+// kept; an incompatible migrated pair is repaired toward the model preset's
+// first dataset so the cell stays in a valid, startable state.
+function migrateLegacyTrainingToPresets(t) {
+  if (!t || typeof t !== 'object') return t;
+  if (!normPresetId(t.model_preset)) {
+    t.model_preset = inferModelPresetId(t.model_id);
+  }
+  if (!normPresetId(t.dataset_preset)) {
+    t.dataset_preset = inferDatasetPresetId(t.dataset_id);
+  }
+  let mp = getModelPreset(t.model_preset);
+  let dp = getDatasetPreset(t.dataset_preset);
+  const task = String(t.task_type || '').trim().toLowerCase();
+  // Task wins over presets: a preset that cannot do the task becomes custom.
+  if (mp && task && !mp.taskTypes.includes(task)) {
+    t.model_preset = CUSTOM_PRESET;
+    mp = null;
+  }
+  if (dp && task && !dp.taskTypes.includes(task)) {
+    t.dataset_preset = CUSTOM_PRESET;
+    dp = null;
+  }
+  // Sync canonical underlying IDs for real presets.
+  if (mp && String(t.model_id || '').trim().toLowerCase() !== mp.modelId.toLowerCase()) {
+    t.model_id = mp.modelId;
+  }
+  if (mp && dp && !mp.datasets.includes(dp.id)) {
+    const first = getDatasetPreset(mp.datasets[0]);
+    if (first) {
+      t.dataset_preset = first.id;
+      t.dataset_id = first.datasetId;
+      dp = first;
+    }
+  } else if (dp && String(t.dataset_id || '').trim().toLowerCase() !== dp.datasetId.toLowerCase()) {
+    t.dataset_id = dp.datasetId;
+  }
+  return t;
+}
+
 function isLargeModelFrontend(modelId) {
   const m = String(modelId||'').toLowerCase();
   const mm = m.match(/(\d+(?:\.\d+)?)\s*b\b/);
@@ -155,6 +349,13 @@ function validateTrainingConfigFrontend(t) {
         if (!/^[A-Za-z0-9_\.]+$/.test(mod)) { errors.target_modules = `Invalid target_modules entry: ${mod}`; break; }
       }
     }
+  }
+
+  // preset compatibility (the selectors normally prevent invalid combos;
+  // this is defense-in-depth — the backend re-checks authoritatively)
+  if (normPresetId(t.model_preset) || normPresetId(t.dataset_preset)) {
+    const chk = checkPresetCompatibility({ modelPreset: t.model_preset, datasetPreset: t.dataset_preset, taskType: t.task_type });
+    if (!chk.ok) errors.dataset_id = chk.error;
   }
 
   // max_steps optional
@@ -287,10 +488,18 @@ function getPreviewData(t) {
     resourceUsage = eff === 'lora' ? 'LoRA — efficient (updates <20% params)' : 'Full fine-tuning';
   }
   const maxStepsSet = t.max_steps !== '' && t.max_steps != null && String(t.max_steps).trim() !== '' && Number.isFinite(Number(t.max_steps));
+  const pvModelPreset = getModelPreset(t.model_preset);
+  const pvDatasetPreset = getDatasetPreset(t.dataset_preset);
+  const pvModelName = pvModelPreset ? pvModelPreset.name : t.model_id;
+  const pvDatasetName = pvDatasetPreset ? pvDatasetPreset.name : t.dataset_id;
+  const pvModelId = pvModelPreset ? pvModelPreset.modelId : String(t.model_id || '');
+  const pvDatasetId = pvDatasetPreset ? pvDatasetPreset.datasetId : String(t.dataset_id || '');
+  const pvAdvanced = `Model ID ${pvModelId || '(none)'} · Dataset ID ${pvDatasetId || '(none)'} · presets ${normPresetId(t.model_preset) || 'custom'} / ${normPresetId(t.dataset_preset) || 'custom'}`;
   return {
     task: getTaskDisplayName(t.task_type),
-    model: t.model_id,
-    dataset: t.dataset_id,
+    model: pvModelName,
+    dataset: pvDatasetName,
+    advancedDetails: pvAdvanced,
     maxSteps: maxStepsSet ? String(Number(t.max_steps)) : 'Auto',
     method: eff === 'lora' ? 'LoRA' : eff === 'full' ? 'Full fine-tuning' : TRAINING_METHOD_DISPLAY[t.training_method] || effDisplay,
     effectiveMethod: eff,
@@ -313,6 +522,7 @@ if (typeof module !== 'undefined' && module.exports) {
     TASK_TYPES, TASK_DISPLAY, TASK_EXPLANATIONS, TRAINING_METHOD_DISPLAY, TRAINING_METHOD_EXPLANATIONS, EDUCATIONAL_HINTS, LIMITS,
     isLargeModelFrontend, getEffectiveTrainingMethod, getTaskDisplayName, getTaskExplanation, getTrainingMethodDisplay, getTrainingMethodExplanation,
     validateModelIdFrontend, validateDatasetIdFrontend, validateTrainingConfigFrontend, getTrainingSummary, getCompatibilityInfo, translateBackendError, getPreviewData, getFieldHelp, estimateStepsFromSamples, resolveDisplayLabel,
+    CUSTOM_PRESET, MODEL_PRESETS, DATASET_PRESETS, normPresetId, getModelPreset, getDatasetPreset, modelsForTaskType, datasetsForModelPreset, inferModelPresetId, inferDatasetPresetId, checkPresetCompatibility, migrateLegacyTrainingToPresets,
   };
 }
 if (typeof window !== 'undefined') {
@@ -320,5 +530,6 @@ if (typeof window !== 'undefined') {
     TASK_TYPES, TASK_DISPLAY, TASK_EXPLANATIONS, TRAINING_METHOD_DISPLAY, TRAINING_METHOD_EXPLANATIONS, EDUCATIONAL_HINTS, LIMITS,
     isLargeModelFrontend, getEffectiveTrainingMethod, getTaskDisplayName, getTaskExplanation, getTrainingMethodDisplay, getTrainingMethodExplanation,
     validateModelIdFrontend, validateDatasetIdFrontend, validateTrainingConfigFrontend, getTrainingSummary, getCompatibilityInfo, translateBackendError, getPreviewData, getFieldHelp, estimateStepsFromSamples, resolveDisplayLabel,
+    CUSTOM_PRESET, MODEL_PRESETS, DATASET_PRESETS, normPresetId, getModelPreset, getDatasetPreset, modelsForTaskType, datasetsForModelPreset, inferModelPresetId, inferDatasetPresetId, checkPresetCompatibility, migrateLegacyTrainingToPresets,
   };
 }

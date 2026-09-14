@@ -1459,26 +1459,46 @@ let notebookRegistry = {
       const el = document.getElementById(`tr-${cellId}-test-result`);
       const clearBtn = document.getElementById(`tr-${cellId}-clear-test`);
       if (!el) return;
-      const task = data.task || (getActiveNotebook()?.cells.find(cc=>cc.id===cellId)?.training?.task_type) || '';
+      const cellTraining = getActiveNotebook()?.cells.find(cc=>cc.id===cellId)?.training;
+      const task = data.task || cellTraining?.task_type || '';
+      // Display-only label resolution: raw model labels stay in `data`
+      // (prediction/scores/testResult) for debugging and compatibility.
+      const resolveLabel = (s) => {
+        const raw = (s && (s.raw_label ?? s.label)) ?? '';
+        if (typeof TrainingUI !== 'undefined' && TrainingUI.resolveDisplayLabel) {
+          const r = TrainingUI.resolveDisplayLabel({
+            label: raw,
+            labelId: s?.label_id,
+            taskType: data.task || cellTraining?.task_type || '',
+            modelId: cellTraining?.model_id || '',
+            datasetId: cellTraining?.dataset_id || '',
+            numLabels: Array.isArray(data.scores) ? data.scores.length : null,
+          });
+          return { display: r.display, raw: r.raw };
+        }
+        return { display: String(raw), raw: String(raw) };
+      };
+      const escLabel = (v) => String(v).replace(/</g,'&lt;');
+      const renderClassificationScores = (pred) => {
+        const predR = resolveLabel(pred);
+        let out = `<div class="test-result-main">${escLabel(predR.display)} <span style="font-size:12px;color:#94a3b8;">${(pred.score*100).toFixed(1)}%</span></div>`;
+        if (predR.display !== predR.raw) {
+          out += `<div style="font-size:11px;color:#64748b;margin-top:4px;">Raw label: ${escLabel(predR.raw)}</div>`;
+        }
+        out += '<div class="test-result-scores">';
+        for (const s of data.scores.slice(0,5)) {
+          const r = resolveLabel(s);
+          const isBest = (s.raw_label ?? s.label) === (pred.raw_label ?? pred.label);
+          out += `<div class="test-score-row ${isBest?'best':''}"><span>${escLabel(r.display)}</span><span>${(s.score*100).toFixed(1)}%</span></div>`;
+        }
+        out += '</div>';
+        return out;
+      };
       let html = '<div class="test-result-label">Result</div>';
       if (task === 'text-classification' && data.scores) {
-        const pred = data.prediction || data.scores[0];
-        html += `<div class="test-result-main">${pred.label} <span style="font-size:12px;color:#94a3b8;">${(pred.score*100).toFixed(1)}%</span></div>`;
-        html += '<div class="test-result-scores">';
-        for (const s of data.scores.slice(0,5)) {
-          const isBest = s.label === pred.label;
-          html += `<div class="test-score-row ${isBest?'best':''}"><span>${s.label}</span><span>${(s.score*100).toFixed(1)}%</span></div>`;
-        }
-        html += '</div>';
+        html += renderClassificationScores(data.prediction || data.scores[0]);
       } else if (task === 'image-classification' && data.scores) {
-        const pred = data.prediction || data.scores[0];
-        html += `<div class="test-result-main">${pred.label} <span style="font-size:12px;color:#94a3b8;">${(pred.score*100).toFixed(1)}%</span></div>`;
-        html += '<div class="test-result-scores">';
-        for (const s of data.scores.slice(0,5)) {
-          const isBest = s.label === pred.label;
-          html += `<div class="test-score-row ${isBest?'best':''}"><span>${s.label}</span><span>${(s.score*100).toFixed(1)}%</span></div>`;
-        }
-        html += '</div>';
+        html += renderClassificationScores(data.prediction || data.scores[0]);
       } else if (task === 'token-classification' && data.tokens) {
         html += '<table class="test-token-table"><tr><th>Token</th><th>Label</th></tr>';
         for (const tok of data.tokens) {

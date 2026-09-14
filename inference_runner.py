@@ -24,6 +24,19 @@ def _fail(msg, code=1):
     print(json.dumps({"error": msg, "code": "inference_error"}))
     sys.exit(code)
 
+def _lookup_label(id2label, idx):
+    """Raw model label for a class id (HF id2label, int or str keys).
+
+    Returns the untouched config label (e.g. "LABEL_0", "NEGATIVE") or the
+    generic fallback f"Label {idx}". Human-readable mapping is display-only
+    and lives in the UI (training_ui.resolveDisplayLabel) — this stays raw
+    for debugging and compatibility.
+    """
+    if id2label:
+        return id2label.get(idx, id2label.get(str(idx), f"Label {idx}"))
+    return f"Label {idx}"
+
+
 def load_trained_model(job_id, artifact_dir, training_method, base_model_id, task_type):
     """
     Load a trained model for inference.
@@ -311,19 +324,19 @@ def main():
                 # Use id2label mapping if available, else Label <id>
                 id2label = getattr(model.config, "id2label", None) or {}
                 # Sometimes id2label keys are ints, sometimes strings
-                label = id2label.get(idx, id2label.get(str(idx), f"Label {idx}")) if id2label else f"Label {idx}"
+                label = _lookup_label(id2label, idx)
                 conf = float(probs[idx].item())
                 # Build scores array sorted descending
                 scores = []
                 for i in range(len(probs)):
-                    lab = id2label.get(i, id2label.get(str(i), f"Label {i}")) if id2label else f"Label {i}"
-                    scores.append({"label": lab, "label_id": i, "score": float(probs[i].item())})
+                    lab = _lookup_label(id2label, i)
+                    scores.append({"label": lab, "raw_label": lab, "label_id": i, "score": float(probs[i].item())})
                 scores_sorted = sorted(scores, key=lambda x: x["score"], reverse=True)
                 best = scores_sorted[0] if scores_sorted else {"label": label, "score": conf}
                 print(json.dumps({
                     "task": "text-classification",
                     "output": best["label"],
-                    "prediction": {"label": best["label"], "label_id": best["label_id"], "score": best["score"]},
+                    "prediction": {"label": best["label"], "raw_label": best["label"], "label_id": best["label_id"], "score": best["score"]},
                     "scores": scores_sorted,
                     "label": best["label"],
                     "confidence": best["score"]
@@ -403,17 +416,17 @@ def main():
                 probs = torch.softmax(logits, dim=-1)[0]
                 idx = int(logits.argmax(-1).item())
                 id2label = getattr(model.config, "id2label", None) or {}
-                label = id2label.get(idx, id2label.get(str(idx), f"Label {idx}")) if id2label else f"Label {idx}"
+                label = _lookup_label(id2label, idx)
                 conf = float(probs[idx].item())
                 scores = []
                 for i in range(len(probs)):
-                    lab = id2label.get(i, id2label.get(str(i), f"Label {i}")) if id2label else f"Label {i}"
-                    scores.append({"label": lab, "label_id": i, "score": float(probs[i].item())})
+                    lab = _lookup_label(id2label, i)
+                    scores.append({"label": lab, "raw_label": lab, "label_id": i, "score": float(probs[i].item())})
                 scores_sorted = sorted(scores, key=lambda x: x["score"], reverse=True)
                 print(json.dumps({
                     "task": "image-classification",
                     "output": label,
-                    "prediction": {"label": label, "label_id": idx, "score": conf},
+                    "prediction": {"label": label, "raw_label": label, "label_id": idx, "score": conf},
                     "scores": scores_sorted,
                     "label": label,
                     "confidence": conf

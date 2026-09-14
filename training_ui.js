@@ -242,6 +242,33 @@ function estimateStepsFromSamples({ trainRows, batchSize, epochs, maxSteps } = {
   return Math.max(1, Math.ceil(tr / Math.floor(bs)) * Math.floor(ep));
 }
 
+// Human-readable classification labels (display only — never mutates model output).
+// Priority: 1) meaningful config id2label values (normalized casing),
+// 2) generic LABEL_X mapped ONLY when model/task metadata confirms a known
+// classifier (currently: binary IMDb sentiment). Generic labels from any other
+// model pass through unchanged. Returns { display, raw }; raw is always the
+// untouched model label for debugging/compatibility.
+function resolveDisplayLabel({ label, labelId, taskType, modelId, datasetId, numLabels } = {}) {
+  const raw = label == null ? '' : String(label);
+  const generic = /^LABEL_\d+$/i.test(raw.trim());
+  if (generic) {
+    const id = Number(labelId);
+    const imdb = /imdb/i.test(String(datasetId || '')) || /imdb/i.test(String(modelId || ''));
+    const binary = numLabels == null || Number(numLabels) === 2;
+    if (String(taskType).toLowerCase() === 'text-classification' && imdb && binary && (id === 0 || id === 1)) {
+      return { display: id === 0 ? 'Negative' : 'Positive', raw };
+    }
+    return { display: raw, raw };
+  }
+  // Meaningful label: clean up uniform casing only (NEGATIVE -> Negative);
+  // mixed-case labels (Sci/Tech) are already human-readable — leave them.
+  if (/^[A-Z][A-Z0-9_]*$/.test(raw) || /^[a-z][a-z0-9_]*$/.test(raw)) {
+    const lowered = raw.toLowerCase();
+    return { display: lowered.charAt(0).toUpperCase() + lowered.slice(1), raw };
+  }
+  return { display: raw, raw };
+}
+
 function getPreviewData(t) {
   const eff = getEffectiveTrainingMethod(t);
   const effDisplay = eff === 'lora' ? 'LoRA' : eff === 'full' ? 'Full fine-tuning' : 'Recommended';
@@ -285,13 +312,13 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     TASK_TYPES, TASK_DISPLAY, TASK_EXPLANATIONS, TRAINING_METHOD_DISPLAY, TRAINING_METHOD_EXPLANATIONS, EDUCATIONAL_HINTS, LIMITS,
     isLargeModelFrontend, getEffectiveTrainingMethod, getTaskDisplayName, getTaskExplanation, getTrainingMethodDisplay, getTrainingMethodExplanation,
-    validateModelIdFrontend, validateDatasetIdFrontend, validateTrainingConfigFrontend, getTrainingSummary, getCompatibilityInfo, translateBackendError, getPreviewData, getFieldHelp, estimateStepsFromSamples,
+    validateModelIdFrontend, validateDatasetIdFrontend, validateTrainingConfigFrontend, getTrainingSummary, getCompatibilityInfo, translateBackendError, getPreviewData, getFieldHelp, estimateStepsFromSamples, resolveDisplayLabel,
   };
 }
 if (typeof window !== 'undefined') {
   window.TrainingUI = {
     TASK_TYPES, TASK_DISPLAY, TASK_EXPLANATIONS, TRAINING_METHOD_DISPLAY, TRAINING_METHOD_EXPLANATIONS, EDUCATIONAL_HINTS, LIMITS,
     isLargeModelFrontend, getEffectiveTrainingMethod, getTaskDisplayName, getTaskExplanation, getTrainingMethodDisplay, getTrainingMethodExplanation,
-    validateModelIdFrontend, validateDatasetIdFrontend, validateTrainingConfigFrontend, getTrainingSummary, getCompatibilityInfo, translateBackendError, getPreviewData, getFieldHelp, estimateStepsFromSamples,
+    validateModelIdFrontend, validateDatasetIdFrontend, validateTrainingConfigFrontend, getTrainingSummary, getCompatibilityInfo, translateBackendError, getPreviewData, getFieldHelp, estimateStepsFromSamples, resolveDisplayLabel,
   };
 }

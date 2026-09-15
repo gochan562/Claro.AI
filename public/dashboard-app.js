@@ -2531,11 +2531,39 @@ print(f"Loaded trained model from {MODEL_DIR}")
           console.log(`[TRAIN-DIAG] UI CLASS cell=${cellId} kind=log (backend event label) line=${JSON.stringify(l && l.line).slice(0, 160)}`);
           const nb = getActiveNotebook();
           const cell = nb?.cells.find(c => c.id === cellId);
+          // TEMP-DIAG items 1-4: lookup outcome + BEFORE state.
+          console.log(`[TRAIN-DIAG] UI LOGTRACE cell=${cellId} cellFound=${!!(cell && cell.training)} cellIdType=${cell ? typeof cell.id : 'n/a'} jobId=${cell && cell.training ? cell.training.job_id : 'n/a'}`);
           if (cell && cell.training) {
+            const t = cell.training;
+            console.log(`[TRAIN-DIAG] UI BEFORE cell=${cellId} status=${t.status} error=${t.error || 'none'} logs.length=${(t.logs || []).length} latestLog=${JSON.stringify((t.logs || []).slice(-1)[0] || null).slice(0, 160)}`);
             cell.training.logs.push(l.line);
             if (cell.training.logs.length > 200) cell.training.logs.shift();
+            // TEMP-DIAG items 5-6: AFTER state.
+            console.log(`[TRAIN-DIAG] UI AFTER cell=${cellId} logs.length=${cell.training.logs.length} latestLog=${JSON.stringify(cell.training.logs.slice(-1)[0]).slice(0, 160)}`);
+            // TEMP-DIAG items 9+12: element identity — duplicates mean updates hit a stale node.
+            const dupes = document.querySelectorAll(`[id="tr-${cellId}-logs"]`);
             const logsEl = document.getElementById(`tr-${cellId}-logs`);
-            if (logsEl) { logsEl.style.display = ''; logsEl.textContent = cell.training.logs.slice(-40).join('\n'); logsEl.scrollTop = logsEl.scrollHeight; }
+            console.log(`[TRAIN-DIAG] UI EL cell=${cellId} idCount=${dupes.length} selected=${logsEl ? logsEl.tagName : 'NULL'} inDOM=${logsEl ? logsEl.isConnected : false}`);
+            if (logsEl) {
+              logsEl.style.display = '';
+              logsEl.textContent = cell.training.logs.slice(-40).join('\n');
+              logsEl.scrollTop = logsEl.scrollHeight;
+              // TEMP-DIAG items 7,8,10,11: no renderTrainingStatus() runs on this
+              // path by design; verify the DOM write landed and is visible.
+              try {
+                const cs = window.getComputedStyle(logsEl);
+                console.log(`[TRAIN-DIAG] UI RENDER cell=${cellId} renderTrainingStatusCalled=false path=log-handler-direct-write textLen=${logsEl.textContent.length} textHead=${JSON.stringify(logsEl.textContent.slice(0, 120))} display=${cs.display} visibility=${cs.visibility} height=${logsEl.offsetHeight}`);
+              } catch (_) {}
+              // TEMP-DIAG item 12: detect a later render overwriting this write.
+              try {
+                const snapshot = logsEl.textContent;
+                const elRef = logsEl;
+                setTimeout(() => {
+                  const sameNode = document.getElementById(`tr-${cellId}-logs`) === elRef;
+                  console.log(`[TRAIN-DIAG] UI OVERWRITE-CHECK cell=${cellId} +500ms sameNodeSelected=${sameNode} stillThere=${elRef.isConnected} textUnchanged=${elRef.textContent === snapshot} idCount=${document.querySelectorAll(`[id="tr-${cellId}-logs"]`).length}`);
+                }, 500);
+              } catch (_) {}
+            }
             updateNotebook();
           }
         } catch(_) {}

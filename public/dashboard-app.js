@@ -2338,6 +2338,9 @@ print(f"Loaded trained model from {MODEL_DIR}")
           target_modules: t.target_modules,
         };
         console.log(`[TRAIN-DIAG] POST ${startUrl} body=`, startBody, ` href=${window.location.href}`);
+        // TEMP-DIAG: the Training Cell sends no provider field — the server's
+        // environment alone decides local vs ZeroGPU (see backend diagnostics).
+        console.log(`[TRAIN-DIAG] provider field in request: ${('provider' in startBody) ? JSON.stringify(startBody.provider) : '(absent — server env decides)'}`);
         const res = await fetch(startUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },

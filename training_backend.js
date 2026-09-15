@@ -234,6 +234,15 @@ function validateTrainingRequest(body) {
     throw Object.assign(new Error(`Training method '${training_method}' is not supported by preset '${modelPreset.id}' (${modelPreset.name}). Supported: ${modelPreset.trainingMethods.join(', ')}`), { code: 'bad_request', status: 400 });
   }
 
+  // TEMP-DIAG: provider provenance — requested (body) vs env vs resolved.
+  // The Training Cell never sends `provider`; resolution is env-driven here.
+  try {
+    console.error(`[TRAIN-DIAG] validate requested provider=${body && body.provider !== undefined ? JSON.stringify(body.provider) : '(absent from request)'} TRAINING_PROVIDER=${process.env.TRAINING_PROVIDER || '(unset)'} GPU_PROVIDER=${process.env.GPU_PROVIDER || '(unset)'}`);
+  } catch (_) {}
+  const validatedProvider = (body.provider || process.env.TRAINING_PROVIDER || 'local').toLowerCase();
+  try {
+    console.error(`[TRAIN-DIAG] validate resolved provider=${validatedProvider}`);
+  } catch (_) {}
   return {
     model_id,
     dataset_id,
@@ -245,7 +254,7 @@ function validateTrainingRequest(body) {
     learning_rate,
     max_steps,
     validation_split,
-    provider: (body.provider || process.env.TRAINING_PROVIDER || 'local').toLowerCase(),
+    provider: validatedProvider,
     max_samples: samplesCap,
     max_time_sec: MAX_TIME_SEC,
     training_method,
@@ -580,6 +589,8 @@ function _findPythonWithDeps() {
 
 function _startPythonTraining(job) {
   const cfg = job.config;
+  // TEMP-DIAG: proves the LOCAL Python path executed (spawns training_runner.py).
+  console.error(`[TRAIN-DIAG] _startPythonTraining CALLED job=${job.job_id} (local training_runner.py will spawn)`);
   // Prefer env, but verify it has deps; otherwise try to find one that does
   let pythonBin = process.env.PYTHON_BIN || 'python3';
   // Quick check: if the requested bin doesn't have torch, try to find one that does
@@ -1274,6 +1285,8 @@ function _finishZeroGpuJob(job, manifest, file) {
 
 function _startZeroGPUTraining(job) {
   const cfg = job.config;
+  // TEMP-DIAG: proves the REMOTE path executed (no local Python spawn on this path).
+  console.error(`[TRAIN-DIAG] _startZeroGPUTraining CALLED job=${job.job_id} (remote Space, never spawns local Python)`);
   let remote;
   try {
     remote = _zeroGpuTrainConfig(process.env);
@@ -1452,6 +1465,11 @@ async function refreshTotalStepsEstimate(job) {
 
 function startJob(job) {
   const provider = resolveTrainingProvider(process.env);
+  // TEMP-DIAG: full branch trace — config value in, branch out. There is no
+  // fallback: exactly one of the three branches below always runs.
+  try {
+    console.error(`[TRAIN-DIAG] startJob job=${job.job_id} config.provider=${job.config.provider} resolved provider=${provider} branch=${provider === 'zerogpu' ? '_startZeroGPUTraining' : provider === 'modal' ? 'modal-fail' : '_startPythonTraining'}`);
+  } catch (_) {}
   job.config.provider = provider;
   if (provider === 'zerogpu') {
     // Remote execution on the ZeroGPU Space — NEVER spawns local Python.

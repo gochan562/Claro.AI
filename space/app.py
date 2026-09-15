@@ -76,6 +76,20 @@ def _startup_diagnostics():
         print(f"[CLARO] runtime spaces={getattr(spaces, '__version__', 'unknown')}", flush=True)
     except Exception as e:
         print(f"[CLARO] runtime spaces import failed: {e}", flush=True)
+    # TEMPORARY startup diagnostics (web-framework stack versions).
+    # Uses getattr: some of these packages may not expose __version__.
+    # Remove once the current environment issue is resolved.
+    try:
+        import sys
+        print(f"[CLARO] runtime python={sys.version.split()[0]}", flush=True)
+    except Exception as e:
+        print(f"[CLARO] runtime python version unknown: {e}", flush=True)
+    for _mod_name in ("gradio", "gradio_client", "spaces", "fastapi", "starlette", "anyio"):
+        try:
+            _mod = __import__(_mod_name)
+            print(f"[CLARO] runtime {_mod_name}={getattr(_mod, '__version__', 'unknown')}", flush=True)
+        except Exception as e:
+            print(f"[CLARO] runtime {_mod_name} import failed: {e}", flush=True)
 
 
 _startup_diagnostics()

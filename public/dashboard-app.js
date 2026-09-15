@@ -2349,6 +2349,8 @@ print(f"Loaded trained model from {MODEL_DIR}")
         if (!res.ok) throw new Error(data.error || 'Failed to start training');
 
         t.job_id = data.job_id;
+        // TEMP-DIAG: the created job_id is the correlation key for every later line.
+        console.log(`[TRAIN-DIAG] job created cell=${cellId} job_id=${data.job_id} status=${data.status}`);
         t.status = data.status || 'queued';
         updateNotebook();
         renderTrainingStatus(cellId);
@@ -2367,7 +2369,11 @@ print(f"Loaded trained model from {MODEL_DIR}")
         attachTrainingSSE(cellId, data.job_id);
       } catch (err) {
         t.status = 'failed';
-        t.logs.push('❌ ' + err.message);
+        // Surface start failures in the error box immediately (not just the
+        // log box): with zero prior log frames the log section alone may read
+        // as an unexplained failure.
+        t.error = err.message || 'Failed to start training';
+        t.logs.push('❌ ' + t.error);
         renderTrainingStatus(cellId);
         const logsEl = document.getElementById(`tr-${cellId}-logs`);
         if (logsEl) { logsEl.style.display = ''; logsEl.textContent = t.logs.slice(-40).join('\n'); logsEl.scrollTop = logsEl.scrollHeight; }
@@ -2459,12 +2465,16 @@ print(f"Loaded trained model from {MODEL_DIR}")
 
       es.addEventListener('metrics', (e) => {
         try {
+          // TEMP-DIAG: every frame receipt is logged so a lost update is visible.
+          console.log(`[TRAIN-DIAG] UI metrics event cell=${cellId} bytes=${e.data.length}`);
           const m = JSON.parse(e.data);
           handleTrainingMetric(cellId, m);
         } catch(_) {}
       });
       es.addEventListener('progress', (e) => {
         try {
+          // TEMP-DIAG
+          console.log(`[TRAIN-DIAG] UI progress event cell=${cellId} bytes=${e.data.length}`);
           const p = JSON.parse(e.data);
           const nb = getActiveNotebook();
           const cell = nb?.cells.find(c => c.id === cellId);
@@ -2478,6 +2488,8 @@ print(f"Loaded trained model from {MODEL_DIR}")
       });
       es.addEventListener('status', (e) => {
         try {
+          // TEMP-DIAG
+          console.log(`[TRAIN-DIAG] UI status event cell=${cellId} data=${e.data.slice(0, 200)}`);
           const s = JSON.parse(e.data);
           const nb = getActiveNotebook();
           const cell = nb?.cells.find(c => c.id === cellId);
@@ -2490,6 +2502,8 @@ print(f"Loaded trained model from {MODEL_DIR}")
       });
       es.addEventListener('log', (e) => {
         try {
+          // TEMP-DIAG
+          console.log(`[TRAIN-DIAG] UI log event cell=${cellId} data=${e.data.slice(0, 160)}`);
           const l = JSON.parse(e.data);
           const nb = getActiveNotebook();
           const cell = nb?.cells.find(c => c.id === cellId);
@@ -2504,12 +2518,26 @@ print(f"Loaded trained model from {MODEL_DIR}")
       });
       es.addEventListener('done', (e) => {
         try {
+          // TEMP-DIAG: terminal frame — never lose it silently.
+          console.log(`[TRAIN-DIAG] UI done event cell=${cellId} data=${e.data.slice(0, 300)}`);
           const d = JSON.parse(e.data);
           const nb = getActiveNotebook();
           const cell = nb?.cells.find(c => c.id === cellId);
           if (cell && cell.training) {
             cell.training.status = d.status || cell.training.status;
+            // Never drop the backend's error: it drives the visible error box.
+            // A failed job with no prior log frames must still explain itself.
+            if (d.error) cell.training.error = d.error;
+            if ((d.status || cell.training.status) === 'failed' && !(cell.training.logs || []).length) {
+              cell.training.logs.push(`❌ Training failed${d.error ? ': ' + d.error : ''}${d.message && d.message !== d.error ? ' — ' + d.message : ''}`);
+            }
             renderTrainingStatus(cellId);
+            const logsEl = document.getElementById(`tr-${cellId}-logs`);
+            if (logsEl && (cell.training.logs || []).length) {
+              logsEl.style.display = '';
+              logsEl.textContent = cell.training.logs.slice(-40).join('\n');
+              logsEl.scrollTop = logsEl.scrollHeight;
+            }
             updateNotebook();
             if (d.status === 'finished') {
               setTimeout(() => renderTrainingComplete(cellId), 500);
@@ -2566,9 +2594,18 @@ print(f"Loaded trained model from {MODEL_DIR}")
             return;
           }
           const data = await res.json();
+          // TEMP-DIAG: every poll response is logged so silent stalls are visible.
+          console.log(`[TRAIN-DIAG] poll status cell=${cellId} job=${jobId} status=${data.status} error=${data.error || 'none'}`);
           cell.training.status = data.status;
           cell.training.progress = data.progress;
           cell.training.logs = cell.training.logs || [];
+          // Never drop the backend's error (drives the visible error box).
+          if (data.error) cell.training.error = data.error;
+          if (['failed'].includes(data.status) && !cell.training.logs.length) {
+            cell.training.logs.push(`❌ Training failed${data.error ? ': ' + data.error : ''}`);
+            const logsEl = document.getElementById(`tr-${cellId}-logs`);
+            if (logsEl) { logsEl.style.display = ''; logsEl.textContent = cell.training.logs.slice(-40).join('\n'); }
+          }
           renderTrainingStatus(cellId);
           // fetch new metrics
           const metricsUrl = new URL(`/api/train/metrics/${encodeURIComponent(jobId)}?limit=20`, window.location.href).toString();

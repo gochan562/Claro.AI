@@ -875,7 +875,10 @@ function _zeroGpuSpaceOrigin(apiBase) {
 async function _postZeroGpuFn(apiBase, fnName, body, signal, token, timeoutMs = 30000) {
   const url = `${apiBase}/call/v2/${fnName}`;
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  // TEMP-DIAG: distinguish our own timeout abort from an outer (user/stop)
+  // abort so timeouts are never misreported as user cancellation.
+  let ownTimeoutFired = false;
+  const timer = setTimeout(() => { ownTimeoutFired = true; ctrl.abort(); }, timeoutMs);
   const onAbort = () => ctrl.abort();
   if (signal) {
     if (signal.aborted) onAbort();
@@ -910,7 +913,12 @@ async function _postZeroGpuFn(apiBase, fnName, body, signal, token, timeoutMs = 
     return eventId;
   } catch (err) {
     if (err instanceof ZeroGpuTrainError) throw err;
-    if (err.name === 'AbortError') throw new ZeroGpuTrainError(`ZeroGPU ${fnName} request was cancelled.`, 'cancelled', 499);
+    if (err.name === 'AbortError') {
+      if (ownTimeoutFired && !(signal && signal.aborted)) {
+        throw new ZeroGpuTrainError(`ZeroGPU ${fnName} request timed out after ${timeoutMs}ms (no event_id received).`, 'timeout', 504);
+      }
+      throw new ZeroGpuTrainError(`ZeroGPU ${fnName} request was cancelled.`, 'cancelled', 499);
+    }
     throw new ZeroGpuTrainError(`Could not reach ZeroGPU training API ${url}: ${err.message}`, 'space_unavailable', 504);
   } finally {
     clearTimeout(timer);
@@ -951,12 +959,24 @@ async function _fetchZeroGpuSse(apiBase, fnName, eventId, signal, token, onGener
   const handleFrame = () => {
     if (!eventType) return null;
     if (eventType === 'complete') {
-      try { return { done: true, data: JSON.parse(dataBuf) }; }
+      try {
+        const parsed = JSON.parse(dataBuf);
+        // TEMP-DIAG: every terminal frame, with manifest status + artifact presence.
+        try {
+          const arr = Array.isArray(parsed) ? parsed : [parsed];
+          let man = null;
+          try { man = typeof arr[0] === 'string' ? JSON.parse(arr[0]) : arr[0]; } catch (_) {}
+          console.error(`[TRAIN-DIAG] ZeroGPU complete frame event=${eventId} manifest=${man ? man.status : 'unparseable'} hasFile=${!!(arr[1] && typeof arr[1] === 'object')}`);
+        } catch (_) {}
+        return { done: true, data: parsed };
+      }
       catch { throw new ZeroGpuTrainError(`ZeroGPU returned malformed complete frame: ${dataBuf.slice(0, 200)}`, 'malformed_response', 502); }
     }
     if (eventType === 'error') {
       hadError = true;
       errMsg = dataBuf;
+      // TEMP-DIAG: error frames are terminal for the stream — log immediately.
+      console.error(`[TRAIN-DIAG] ZeroGPU error frame event=${eventId} body=${String(dataBuf).slice(0, 300)}`);
       return null;
     }
     if (eventType === 'generating' && onGenerating) {
@@ -1022,6 +1042,16 @@ function _classifyZeroGpuErrorFrame(errMsg) {
 // (markers + metric lines) so both providers drive identical UI updates.
 function _applyRemoteTrainEvent(job, ev) {
   if (!ev || typeof ev !== 'object') return;
+  // TEMP-DIAG: log every remote event as it is applied to the job, so a
+  // failure can never pass through this layer without a server-side trace.
+  try {
+    const summary = ev.type === 'metric' && ev.metric ? `step=${ev.metric.step}`
+      : ev.type === 'progress' && ev.progress ? `total_steps=${ev.progress.total_steps}`
+      : ev.type === 'status' ? String(ev.status)
+      : ev.type === 'error' ? String(ev.error || '').slice(0, 120)
+      : String(ev.line || '').slice(0, 120);
+    console.error(`[TRAIN-DIAG] remote event job=${job.job_id} type=${ev.type} ${summary}`);
+  } catch (_) {}
   if (ev.type === 'metric' && ev.metric) {
     _applyTrainerMetric(job, ev.metric);
     return;
@@ -1174,6 +1204,8 @@ function _extractZipBuffer(buf, destDir) {
 
 function _failZeroGpuJob(job, message, code = 'training_error') {
   if (job.end_time) return; // already terminal
+  // TEMP-DIAG: every backend failure finalization gets a server-side trace.
+  console.error(`[TRAIN-DIAG] job failed job=${job.job_id} code=${code} message=${String(message).slice(0, 300)}`);
   _log(job, `[TRAIN] training_error: ${message}`);
   _setStatus(job, 'failed');
   _updateProgress(job, { gpu_status: 'idle', eta: 0 });
@@ -1543,6 +1575,22 @@ function attachSSE(job_id, res) {
   for (const m of job.metrics.slice(-20)) {
     res.write(`event: metrics\ndata: ${JSON.stringify(m)}\n\n`);
   }
+  // Replay recent logs + terminal state to late attachers, but ONLY for
+  // already-terminal jobs. Without this, a job that fails before the UI's
+  // EventSource connects (fast failures: no event_id, instant Space errors)
+  // is observed as status=failed with an empty log box and no reason — a
+  // silent failure. Terminal jobs never receive further live events, so this
+  // replay cannot duplicate anything; running jobs stream live as before.
+  // Event shapes are unchanged.
+  const terminal = job.end_time && (job.status === 'finished' || job.status === 'failed');
+  try {
+    if (terminal) {
+      for (const line of job.logs.slice(-20)) {
+        res.write(`event: log\ndata: ${JSON.stringify({ line })}\n\n`);
+      }
+      res.write(`event: done\ndata: ${JSON.stringify({ status: job.status, error: job.error || null })}\n\n`);
+    }
+  } catch (_) {}
   res.on('close', () => { job.sseClients.delete(res); });
   return true;
 }
@@ -1587,6 +1635,7 @@ module.exports = {
   _extractZipBuffer,
   _zeroGpuTrainConfig,
   _classifyZeroGpuErrorFrame,
+  _postZeroGpuFn,
   estimateTrainingSteps,
   refreshTotalStepsEstimate,
   ZeroGpuTrainError,

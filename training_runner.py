@@ -307,6 +307,13 @@ def run_training(args):
                 tokenizer = getattr(preprocessor, 'tokenizer', None)
                 _log("loaded AutoProcessor fallback")
     except Exception as e:
+        msg = str(e)
+        # Name the missing Space dependency explicitly instead of surfacing a
+        # bare ImportError: image-classification needs torchvision (see
+        # space/requirements.txt torch/torchvision lockstep comment).
+        if "requires the torchvision library" in msg.lower():
+            _fail(f"preprocessor load failed for {args.model_id}: torchvision is missing in the Space environment. "
+                  f"Add a torch-compatible torchvision to space/requirements.txt and redeploy. Original error: {e}")
         _fail(f"preprocessor load failed for {args.model_id}: {e}\n{traceback.format_exc()}")
 
     # ── Preprocessing ──

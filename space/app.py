@@ -55,6 +55,23 @@ def _startup_diagnostics():
     except Exception as e:
         print(f"[CLARO] runtime transformers import failed: {e}", flush=True)
     try:
+        # Import-only check (no model download): proves the exact chain from
+        # "AutoImageProcessor requires the Torchvision library" is present.
+        import torchvision
+        print(f"[CLARO] runtime torchvision={torchvision.__version__}", flush=True)
+    except Exception as e:
+        print(f"[CLARO] runtime torchvision MISSING ({e}) — image-classification will fail", flush=True)
+    try:
+        from transformers import AutoImageProcessor  # noqa: F401
+        print("[CLARO] runtime AutoImageProcessor import ok", flush=True)
+    except Exception as e:
+        print(f"[CLARO] runtime AutoImageProcessor import failed: {e}", flush=True)
+    try:
+        import PIL
+        print(f"[CLARO] runtime pillow={PIL.__version__}", flush=True)
+    except Exception as e:
+        print(f"[CLARO] runtime pillow import failed: {e}", flush=True)
+    try:
         import spaces
         print(f"[CLARO] runtime spaces={getattr(spaces, '__version__', 'unknown')}", flush=True)
     except Exception as e:

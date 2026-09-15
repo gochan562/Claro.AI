@@ -419,5 +419,64 @@ class BackendRoutingTest(unittest.TestCase):
         backend._logits_diag("TEST", MagicMock())
 
 
+class ImageDependencyEnvironmentTest(unittest.TestCase):
+    """Guards the image-classification dependency path.
+
+    Regression coverage for: "ImportError: AutoImageProcessor requires the
+    Torchvision library but it was not found in your environment."
+    """
+
+    @staticmethod
+    def _requirement_floors():
+        req_path = os.path.join(os.path.dirname(__file__), "requirements.txt")
+        floors = {}
+        with open(req_path) as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                m = __import__("re").match(r"^(torchvision|torch)\s*([=<>!~]+)\s*([\d.]+)", line)
+                if m and m.group(2).startswith(">"):
+                    parts = m.group(3).split(".")
+                    floors[m.group(1)] = (int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
+        return floors
+
+    def test_requirements_torchvision_lockstep_with_torch(self):
+        # torch X.Y pairs with torchvision 0.(Y+15) (e.g. torch 2.8.x with
+        # torchvision 0.23.x, torch 2.14.x with 0.29.x). The torchvision floor
+        # must match the torch floor so pip resolves a consistent pair instead
+        # of upgrading torchvision independently of torch.
+        floors = self._requirement_floors()
+        self.assertIn("torch", floors, "requirements.txt must pin a torch floor")
+        self.assertIn("torchvision", floors, "requirements.txt must pin a torchvision floor")
+        torch_major, torch_minor = floors["torch"]
+        tv_major, tv_minor = floors["torchvision"]
+        self.assertEqual(tv_major, 0, "torchvision major version must be 0")
+        self.assertEqual(
+            tv_minor, torch_minor + 15,
+            f"torchvision floor 0.{tv_minor} does not match torch floor {torch_major}.{torch_minor} "
+            f"(expected torchvision 0.{torch_minor + 15}.x)",
+        )
+
+    def test_image_import_chain(self):
+        # Verifies the exact chain from the reported ImportError, in order:
+        # torch -> torchvision -> transformers AutoImageProcessor.
+        # Skipped where the GPU stack is not installed (e.g. local checkout);
+        # runs for real on CI/Space environments that install requirements.
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch not installed in this environment")
+        try:
+            import torchvision  # noqa: F401
+        except ImportError:
+            self.fail("torch is installed but torchvision is missing — "
+                      "add a torch-compatible torchvision to space/requirements.txt")
+        try:
+            from transformers import AutoImageProcessor  # noqa: F401
+        except ImportError as e:
+            self.fail(f"torchvision present but AutoImageProcessor import failed: {e}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -3,6 +3,12 @@ transformers>=5.0.0
 # torch floats across CUDA major builds between rebuilds, which is exactly how
 # "worked yesterday, CUDA failure today" happens — keep the documented floor.
 torch>=2.8.0
+# torchvision is REQUIRED by transformers' AutoImageProcessor (image-
+# classification training/inference fails without it). torch/torchvision must
+# stay in lockstep: torch X.Y pairs with torchvision 0.(Y+15), so the floor
+# 0.23.0 matches torch>=2.8.0. pip then resolves the newest consistent pair
+# (e.g. torch 2.14.x + torchvision 0.29.x) — never upgraded independently.
+torchvision>=0.23.0
 accelerate
 spaces
 diffusers>=0.30.0

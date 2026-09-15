@@ -8,6 +8,7 @@ on any specific Hugging Face model.  No model names are hard-coded — only
 config-shape probes simulated via mocks.
 """
 import importlib
+import json
 import os
 import sys
 import types
@@ -476,6 +477,60 @@ class ImageDependencyEnvironmentTest(unittest.TestCase):
             from transformers import AutoImageProcessor  # noqa: F401
         except ImportError as e:
             self.fail(f"torchvision present but AutoImageProcessor import failed: {e}")
+
+
+class TrainGpuDurationTest(unittest.TestCase):
+    """Regression tests for the @spaces.GPU duration sizing (train_api).
+
+    Guards the "requested GPU duration (810s) is larger than the maximum
+    allowed" failure class: explicit max_steps must size the window from the
+    step count (never epochs*100), and the request must stay within the
+    hard bound. train_api is stdlib-only, so no mocks are needed.
+    """
+
+    def _dur(self, *args, **kwargs):
+        import train_api
+        return train_api._train_gpu_duration(*args, **kwargs)
+
+    def test_explicit_max_steps_sizes_window(self):
+        cfg = {"model_id": "distilbert-base-uncased", "dataset_id": "stanfordnlp/imdb",
+               "task_type": "text-classification", "epochs": 2, "max_steps": 100}
+        # All v2/UI packing shapes must agree: 90 + 100*1.5 = 240.
+        self.assertEqual(self._dur(cfg), 240)
+        self.assertEqual(self._dur(train_request_json=cfg), 240)
+        self.assertEqual(self._dur(None, cfg), 240)
+        self.assertEqual(self._dur(json.dumps(cfg)), 240)
+
+    def test_string_max_steps_parsed(self):
+        cfg = {"epochs": 2, "max_steps": "100"}
+        self.assertEqual(self._dur(cfg), 240)
+
+    def test_blank_max_steps_falls_back_to_epochs(self):
+        self.assertEqual(self._dur({"epochs": 2, "max_steps": None}), 390)   # 90 + 200*1.5
+        self.assertEqual(self._dur({"epochs": 2, "max_steps": ""}), 390)
+        self.assertEqual(self._dur({"epochs": 3}), 540)
+
+    def test_large_request_clamped_by_hard_max(self):
+        import train_api
+        # 480 steps would request 810s -> must be clamped, never sent raw.
+        d = self._dur({"epochs": 2, "max_steps": 480})
+        self.assertEqual(d, train_api._TRAIN_GPU_HARD_MAX)
+        self.assertLess(d, 810)
+
+    def test_hard_max_env_override_respected(self):
+        import train_api
+        old = train_api._TRAIN_GPU_HARD_MAX
+        train_api._TRAIN_GPU_HARD_MAX = 300
+        try:
+            self.assertEqual(self._dur({"epochs": 2, "max_steps": 480}), 300)
+            self.assertEqual(self._dur({"epochs": 2, "max_steps": 100}), 240)  # under cap: untouched
+        finally:
+            train_api._TRAIN_GPU_HARD_MAX = old
+
+    def test_garbage_input_uses_safe_default(self):
+        self.assertEqual(self._dur(None), 540)          # epochs default 3
+        self.assertEqual(self._dur("not-json{{{"), 540)
+        self.assertEqual(self._dur({"epochs": "xx", "max_steps": "yy"}), 540)
 
 
 if __name__ == "__main__":

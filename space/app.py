@@ -318,36 +318,9 @@ def show_cache():
 # code).  It is a generator: intermediate yields stream as SSE `generating`
 # frames (JSON log/metric/progress events) and the final return value arrives
 # as the `complete` frame together with a zip of the output dir.
-import os as _os
-
-_TRAIN_GPU_MAX = max(120, int(_os.environ.get("CLARO_TRAIN_GPU_DURATION_MAX", "1800")))
-
-
-def _train_gpu_duration(train_request_json=None, *args, **_kwargs):
-    """Size the @spaces.GPU kill-switch window from the request.
-
-    ~90s base (dataset/model download + init) + ~1.5s per expected optimizer
-    step, clamped to [120, CLARO_TRAIN_GPU_DURATION_MAX].  This is a ceiling,
-    not a reservation: ZeroGPU bills actual compute time.
-    """
-    obj = _unpack_request(train_request_json, args, _kwargs)
-    try:
-        obj = json.loads(obj) if isinstance(obj, str) else (obj or {})
-    except Exception:
-        obj = {}
-    if not isinstance(obj, dict):
-        obj = {}
-    try:
-        epochs = max(1, int(obj.get("epochs", 3)))
-    except Exception:
-        epochs = 3
-    try:
-        raw_max = obj.get("max_steps", obj.get("maxSteps"))
-        max_steps = int(raw_max) if raw_max not in (None, "") else None
-    except Exception:
-        max_steps = None
-    steps = max_steps if max_steps else epochs * 100
-    return max(120, min(_TRAIN_GPU_MAX, int(90 + steps * 1.5)))
+# Duration sizing lives in train_api (import-safe, unit-tested); the
+# decorator below only wires it in.
+from train_api import _train_gpu_duration
 
 
 @spaces.GPU(duration=_train_gpu_duration)

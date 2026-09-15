@@ -62,6 +62,59 @@ def _clear_cancel(job_id: str) -> None:
         _CANCELLED.discard(str(job_id))
 
 
+# ── GPU duration sizing (used by @spaces.GPU(duration=...) in app.py) ──
+# Kill-switch window only — ZeroGPU bills actual compute, and the Trainer
+# still stops exactly at max_steps/epochs. Two ceilings apply:
+#   CLARO_TRAIN_GPU_DURATION_MAX       soft ceiling for the estimate (1800s)
+#   CLARO_TRAIN_GPU_DURATION_HARD_MAX  hard bound for what we REQUEST from HF.
+# The hard bound exists because Hugging Face rejects calls whose requested
+# duration exceeds the account/tier maximum (e.g. "requested GPU duration
+# (810s) is larger than the maximum allowed"). If HF rejects even a clamped
+# request, read the true maximum from that error and set HARD_MAX at or
+# below it in the Space's Settings → Variables (no code change needed).
+_TRAIN_GPU_MAX = max(120, int(os.environ.get("CLARO_TRAIN_GPU_DURATION_MAX", "1800")))
+_TRAIN_GPU_HARD_MAX = max(120, int(os.environ.get("CLARO_TRAIN_GPU_DURATION_HARD_MAX", "600")))
+
+
+def _train_gpu_duration(train_request_json=None, *args, **_kwargs):
+    """Size the @spaces.GPU kill-switch window from the request.
+
+    ~90s base (dataset/model download + init) + ~1.5s per expected optimizer
+    step, clamped to [120, HARD_MAX]. Accepts every packing shape via
+    unpack_request (v2 gateway passes kwargs, Gradio UI passes positionally).
+    """
+    obj = unpack_request(train_request_json, args, _kwargs)
+    try:
+        obj = json.loads(obj) if isinstance(obj, str) else (obj or {})
+    except Exception:
+        obj = {}
+    if not isinstance(obj, dict):
+        obj = {}
+    try:
+        epochs = max(1, int(obj.get("epochs", 3)))
+    except Exception:
+        epochs = 3
+    raw_max = None
+    try:
+        raw_max = obj.get("max_steps", obj.get("maxSteps"))
+        max_steps = int(raw_max) if raw_max not in (None, "") else None
+    except Exception:
+        max_steps = None
+    steps = max_steps if max_steps else epochs * 100
+    requested = int(90 + steps * 1.5)
+    final = max(120, min(_TRAIN_GPU_MAX, _TRAIN_GPU_HARD_MAX, requested))
+    # TEMP-DIAG: full duration provenance for every scheduled call.
+    print(f"[TRAIN-DIAG] duration requested max_steps={raw_max!r} epochs={epochs} "
+          f"computed total_steps={steps} requested={requested}s "
+          f"caps=[soft {_TRAIN_GPU_MAX}s, hard {_TRAIN_GPU_HARD_MAX}s] final={final}s",
+          flush=True)
+    if final < requested:
+        print(f"[TRAIN-DIAG] duration CLAMPED {requested}s -> {final}s by hard max "
+              f"(training semantics unchanged: Trainer still stops at max_steps/epochs; "
+              f"raise CLARO_TRAIN_GPU_DURATION_HARD_MAX only if HF allows more)", flush=True)
+    return final
+
+
 def unpack_request(train_request_json=None, args=(), kwargs=None):
     """Extract the training request regardless of how the caller packed it.
 

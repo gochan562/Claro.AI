@@ -941,7 +941,7 @@ let notebookRegistry = {
             <span class="training-gpu-badge"><span class="training-gpu-dot ${t.status}" id="tr-${cell.id}-gpudot"></span><span id="tr-${cell.id}-gputext">${t.progress?.gpu_status || 'idle'}</span></span>
             ${t.job_id ? `<span style="font-size:11px;color:#64748b;font-family:monospace;">${t.job_id}</span>` : ''}
           </div>
-          ${t.status==='failed' && t.error ? `<div id="tr-${cell.id}-errorbox" style="background:rgba(239,68,68,0.12);border:1px solid #dc2626;border-radius:8px;padding:10px 12px;color:#fecaca;font-size:12px;font-family:Consolas,monospace;white-space:pre-wrap;word-break:break-word;">${(typeof TrainingUI!=='undefined'&&TrainingUI.translateBackendError) ? TrainingUI.translateBackendError(t.error) : t.error}<br><span style="color:#fca5a5;font-size:11px;">${(t.logs||[]).slice(-2).join('<br>').slice(0,600)}</span><div style="margin-top:8px;"><a href="#" onclick="event.preventDefault(); toggleTrainingLogs(${cell.id})" style="color:#60a5fa;font-size:11px;">Training Logs</a></div></div>` : `<div id="tr-${cell.id}-errorbox" style="display:none;"></div>`}
+          ${t.status==='failed' && t.error ? `<div id="tr-${cell.id}-errorbox" style="background:rgba(239,68,68,0.12);border:1px solid #dc2626;border-radius:8px;padding:10px 12px;color:#fecaca;font-size:12px;font-family:Consolas,monospace;white-space:pre-wrap;word-break:break-word;">${escHtml((typeof TrainingUI!=='undefined'&&TrainingUI.translateBackendError) ? TrainingUI.translateBackendError(t.error) : t.error)}<br><span style="color:#fca5a5;font-size:11px;">${(t.logs||[]).slice(-2).map(escHtml).join('<br>').slice(0,600)}</span><div style="margin-top:8px;"><a href="#" onclick="event.preventDefault(); toggleTrainingLogs(${cell.id})" style="color:#60a5fa;font-size:11px;">Training Logs</a></div></div>` : `<div id="tr-${cell.id}-errorbox" style="display:none;"></div>`}
 
           <div class="training-metrics-grid" id="tr-${cell.id}-metrics">
             <div class="training-metric-card"><div class="training-metric-label">Epoch</div><div class="training-metric-value" id="tr-${cell.id}-epoch">${t.progress?.current_epoch ?? 0}</div></div>
@@ -979,7 +979,7 @@ let notebookRegistry = {
             <canvas id="tr-${cell.id}-chart" height="180"></canvas>
           </div>
 
-          <div class="training-logs" id="tr-${cell.id}-logs" style="${t.logs && t.logs.length ? '' : 'display:none;'}">${(t.logs || []).slice(-40).join('\n')}</div>
+          <div class="training-logs" id="tr-${cell.id}-logs" style="${t.logs && t.logs.length ? '' : 'display:none;'}">${(t.logs || []).slice(-40).map(escHtml).join('\n')}</div>
           <div style="font-size:11px;color:#475569;margin-top:-8px;display:${t.logs && t.logs.length ? 'block' : 'none'};" id="tr-${cell.id}-logs-toggle"><a href="#" onclick="event.preventDefault(); toggleTrainingLogs(${cell.id})" style="color:#64748b;">Training Logs</a> — click to expand/collapse</div>
         </div>
       `;
@@ -2611,6 +2611,8 @@ print(f"Loaded trained model from {MODEL_DIR}")
     window.stopTrainingCell = stopTrainingCell;
     window.updateTrainingField = updateTrainingField;
     window.updateTrainingMethod = updateTrainingMethod;
+    window.updateModelPreset = updateModelPreset;
+    window.updateDatasetPreset = updateDatasetPreset;
     window.attachTrainingSSE = attachTrainingSSE;
     window.toggleCustomizeSettings = toggleCustomizeSettings;
     window.toggleAdvancedSettings = toggleAdvancedSettings;

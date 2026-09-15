@@ -2465,23 +2465,36 @@ print(f"Loaded trained model from {MODEL_DIR}")
 
       es.addEventListener('metrics', (e) => {
         try {
-          // TEMP-DIAG: every frame receipt is logged so a lost update is visible.
-          console.log(`[TRAIN-DIAG] UI metrics event cell=${cellId} bytes=${e.data.length}`);
+          // TEMP-DIAG: full parse trace — RAW, PARSED, CLASS, STATE, RENDER.
+          console.log(`[TRAIN-DIAG] UI RAW metrics event cell=${cellId} data=${e.data.slice(0, 500)}`);
           const m = JSON.parse(e.data);
+          console.log(`[TRAIN-DIAG] UI PARSED metrics event cell=${cellId}`, JSON.stringify(m).slice(0, 300));
+          console.log(`[TRAIN-DIAG] UI CLASS cell=${cellId} kind=metrics (backend event label) hasLog=${!!(m && m.line)} hasError=${!!(m && m.error)}`);
           handleTrainingMetric(cellId, m);
+          console.log(`[TRAIN-DIAG] UI RENDER cell=${cellId} after=metrics handled`);
         } catch(_) {}
       });
       es.addEventListener('progress', (e) => {
         try {
           // TEMP-DIAG
-          console.log(`[TRAIN-DIAG] UI progress event cell=${cellId} bytes=${e.data.length}`);
+          console.log(`[TRAIN-DIAG] UI RAW progress event cell=${cellId} bytes=${e.data.length} data=${e.data.slice(0, 500)}`);
           const p = JSON.parse(e.data);
+          console.log(`[TRAIN-DIAG] UI PARSED progress event cell=${cellId}`, JSON.stringify(Object.keys(p || {})));
+          console.log(`[TRAIN-DIAG] UI CLASS cell=${cellId} kind=progress (backend event label) hasLog=${!!(p && p.line)} hasMessage=${!!(p && p.message)} hasError=${!!(p && p.error)} hasTrainingError=${/training_error/.test(e.data)} hasStatus=${!!(p && p.status)}`);
           const nb = getActiveNotebook();
           const cell = nb?.cells.find(c => c.id === cellId);
           if (cell && cell.training) {
             cell.training.progress = p;
             cell.training.status = cell.training.status; // keep
             renderTrainingStatus(cellId);
+            // TEMP-DIAG: exact post-update state + which render branch ran.
+            try {
+              const t = cell.training;
+              console.log(`[TRAIN-DIAG] UI STATE cell=${cellId} status=${t.status} error=${t.error || 'none'} logs.length=${(t.logs || []).length} latestLog=${JSON.stringify((t.logs || []).slice(-1)[0] || null).slice(0, 160)}`);
+              const logsEl = document.getElementById(`tr-${cellId}-logs`);
+              const errBox = document.getElementById(`tr-${cellId}-errorbox`);
+              console.log(`[TRAIN-DIAG] UI RENDER cell=${cellId} branch=progress-handler logsEl=${logsEl ? (logsEl.style.display === 'none' ? 'hidden' : 'shown') : 'MISSING'} errBox=${errBox ? (errBox.style.display === 'none' ? 'hidden' : 'shown') : 'MISSING'} logContainerUpdated=false (progress handler never touches it)`);
+            } catch (_) {}
             updateNotebook();
           }
         } catch(_) {}
@@ -2489,13 +2502,20 @@ print(f"Loaded trained model from {MODEL_DIR}")
       es.addEventListener('status', (e) => {
         try {
           // TEMP-DIAG
-          console.log(`[TRAIN-DIAG] UI status event cell=${cellId} data=${e.data.slice(0, 200)}`);
+          console.log(`[TRAIN-DIAG] UI RAW status event cell=${cellId} data=${e.data.slice(0, 200)}`);
           const s = JSON.parse(e.data);
+          console.log(`[TRAIN-DIAG] UI CLASS cell=${cellId} kind=status (backend event label) hasLog=false hasError=${!!(s && s.error)}`);
           const nb = getActiveNotebook();
           const cell = nb?.cells.find(c => c.id === cellId);
           if (cell && cell.training) {
             cell.training.status = s.status;
             renderTrainingStatus(cellId);
+            // TEMP-DIAG
+            try {
+              const t = cell.training;
+              console.log(`[TRAIN-DIAG] UI STATE cell=${cellId} status=${t.status} error=${t.error || 'none'} logs.length=${(t.logs || []).length}`);
+              console.log(`[TRAIN-DIAG] UI RENDER cell=${cellId} branch=status-handler errBox=${(() => { const b = document.getElementById(`tr-${cellId}-errorbox`); return b ? (b.style.display === 'none' ? 'hidden(no t.error)' : 'shown') : 'MISSING'; })()} logContainerUpdated=false (status handler never touches it)`);
+            } catch (_) {}
             updateNotebook();
           }
         } catch(_) {}
@@ -2503,8 +2523,9 @@ print(f"Loaded trained model from {MODEL_DIR}")
       es.addEventListener('log', (e) => {
         try {
           // TEMP-DIAG
-          console.log(`[TRAIN-DIAG] UI log event cell=${cellId} data=${e.data.slice(0, 160)}`);
+          console.log(`[TRAIN-DIAG] UI RAW log event cell=${cellId} data=${e.data.slice(0, 200)}`);
           const l = JSON.parse(e.data);
+          console.log(`[TRAIN-DIAG] UI CLASS cell=${cellId} kind=log (backend event label) line=${JSON.stringify(l && l.line).slice(0, 160)}`);
           const nb = getActiveNotebook();
           const cell = nb?.cells.find(c => c.id === cellId);
           if (cell && cell.training) {

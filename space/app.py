@@ -349,6 +349,13 @@ def _gpu_train(train_request_json=None, *args, **kwargs):
     yield from train_fn(_unpack_request(train_request_json, args, kwargs))
 
 
+# DIAGNOSTIC (item 3): the exact object supplied as duration= above.
+# The scheduler receives this callable's per-call RETURN value, not a number.
+print(f"[CLARO-DURATION] duration= object for _gpu_train: {getattr(_train_gpu_duration_traced, '__qualname__', repr(_train_gpu_duration_traced))} "
+      f"module={getattr(_train_gpu_duration_traced, '__module__', '?')} id={id(_train_gpu_duration_traced)} "
+      f"delegates_to=train_api._train_gpu_duration", flush=True)
+
+
 TRAIN_REQUEST_EXAMPLE = json.dumps({
     "model_id": "distilbert-base-uncased",
     "dataset_id": "stanfordnlp/imdb",

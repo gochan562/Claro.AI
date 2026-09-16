@@ -83,6 +83,16 @@ def _train_gpu_duration(train_request_json=None, *args, **_kwargs):
     step, clamped to [120, HARD_MAX]. Accepts every packing shape via
     unpack_request (v2 gateway passes kwargs, Gradio UI passes positionally).
     """
+    # DIAGNOSTIC (item 4): exact dynamic inputs on every invocation.
+    try:
+        _in = repr(train_request_json)
+        if args:
+            _in += f" +args[{len(args)}]"
+        if _kwargs:
+            _in += f" +kwargs{sorted(_kwargs.keys())}"
+        print(f"[CLARO-DURATION] dynamic inputs={_in[:600]}", flush=True)
+    except Exception as _e:
+        print(f"[CLARO-DURATION] dynamic inputs=<unprintable: {_e}>", flush=True)
     obj = unpack_request(train_request_json, args, _kwargs)
     try:
         obj = json.loads(obj) if isinstance(obj, str) else (obj or {})
@@ -102,11 +112,17 @@ def _train_gpu_duration(train_request_json=None, *args, **_kwargs):
         max_steps = None
     steps = max_steps if max_steps else epochs * 100
     requested = int(90 + steps * 1.5)
-    final = max(120, min(_TRAIN_GPU_MAX, _TRAIN_GPU_HARD_MAX, requested))
+    # DIAGNOSTIC MODE (temporary, per instruction: do NOT clamp yet): the
+    # HARD_MAX bound is BYPASSED so the raw computed value observably reaches
+    # the scheduler. would_clamp_to shows what the bound would have produced.
+    # Restore min(..., _TRAIN_GPU_HARD_MAX, ...) here after diagnosis.
+    would_clamp_to = max(120, min(_TRAIN_GPU_MAX, _TRAIN_GPU_HARD_MAX, requested))
+    final = max(120, min(_TRAIN_GPU_MAX, requested))
     # TEMP-DIAG: full duration provenance for every scheduled call.
     print(f"[TRAIN-DIAG] duration requested max_steps={raw_max!r} epochs={epochs} "
           f"computed total_steps={steps} requested={requested}s "
-          f"caps=[soft {_TRAIN_GPU_MAX}s, hard {_TRAIN_GPU_HARD_MAX}s] final={final}s",
+          f"caps=[soft {_TRAIN_GPU_MAX}s, hard {_TRAIN_GPU_HARD_MAX}s BYPASSED] final={final}s "
+          f"would_clamp_to={would_clamp_to}s",
           flush=True)
     # REQUIRED source-of-truth block: exact values feeding @spaces.GPU.
     try:
@@ -127,10 +143,12 @@ def _train_gpu_duration(train_request_json=None, *args, **_kwargs):
           f"caps_soft={_TRAIN_GPU_MAX}\n"
           f"caps_hard={_TRAIN_GPU_HARD_MAX}",
           flush=True)
-    if final < requested:
-        print(f"[TRAIN-DIAG] duration CLAMPED {requested}s -> {final}s by hard max "
-              f"(training semantics unchanged: Trainer still stops at max_steps/epochs; "
-              f"raise CLARO_TRAIN_GPU_DURATION_HARD_MAX only if HF allows more)", flush=True)
+    if would_clamp_to < requested:
+        print(f"[TRAIN-DIAG] duration WOULD-CLAMP {requested}s -> {would_clamp_to}s under hard max "
+              f"(clamp currently BYPASSED for diagnosis; training semantics unchanged: "
+              f"Trainer still stops at max_steps/epochs)", flush=True)
+    # DIAGNOSTIC (item 4): exact value returned to the Spaces scheduler.
+    print(f"[CLARO-DURATION] dynamic result={final}", flush=True)
     return final
 
 
@@ -449,6 +467,27 @@ def train(train_request_json: str):
     Each intermediate yield is (json_event_string, None); the final return is
     (manifest_json_string, zip_path_or_None).
     """
+    # DIAGNOSTIC (items 2-3): immediately before endpoint work begins — the
+    # exact max_steps/epochs the worker sees (compare with what the duration
+    # callable saw; any mismatch means packing divergence between the two).
+    try:
+        _dbg = json.loads(train_request_json) if isinstance(train_request_json, str) else train_request_json
+        if not isinstance(_dbg, dict):
+            _dbg = {}
+        print(f"[CLARO-DURATION] request max_steps={_dbg.get('max_steps', _dbg.get('maxSteps', '(absent)'))!r}", flush=True)
+        _dbg_steps = _dbg.get("max_steps", _dbg.get("maxSteps"))
+        try:
+            _dbg_steps = int(_dbg_steps) if _dbg_steps not in (None, "") else None
+        except Exception:
+            _dbg_steps = None
+        try:
+            _dbg_epochs = max(1, int(_dbg.get("epochs", 3)))
+        except Exception:
+            _dbg_epochs = 3
+        print(f"[CLARO-DURATION] total_steps={_dbg_steps if _dbg_steps else _dbg_epochs * 100}", flush=True)
+        print(f"[CLARO-DURATION] computed_duration={int(90 + (_dbg_steps if _dbg_steps else _dbg_epochs * 100) * 1.5)}", flush=True)
+    except Exception as _e:
+        print(f"[CLARO-DURATION] endpoint-entry inspect failed: {_e}", flush=True)
     try:
         obj = json.loads(train_request_json) if isinstance(train_request_json, str) else train_request_json
     except Exception:

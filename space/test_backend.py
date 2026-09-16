@@ -512,29 +512,70 @@ class TrainGpuDurationTest(unittest.TestCase):
 
     def test_large_request_clamped_by_hard_max(self):
         import train_api
-        # DIAGNOSTIC MODE: the hard-max clamp is TEMPORARILY BYPASSED so the
-        # raw computed value observably reaches the scheduler. 480 steps must
-        # therefore come back as the raw 810 (the reported rejection value) —
-        # proving the chain request -> max_steps -> duration -> scheduler.
-        # Restore the clamp assertion (== _TRAIN_GPU_HARD_MAX) after diagnosis.
+        # 480 steps would request 810s -> must be clamped, never sent raw.
         d = self._dur({"epochs": 2, "max_steps": 480})
-        self.assertEqual(d, 810)
-        # ...while the would-clamp math still holds for restoration:
-        self.assertEqual(max(120, min(1800, train_api._TRAIN_GPU_HARD_MAX, 810)), 600)
+        self.assertEqual(d, train_api._TRAIN_GPU_HARD_MAX)
+        self.assertLess(d, 810)
 
     def test_hard_max_env_override_respected(self):
         import train_api
-        # DIAGNOSTIC MODE: bypass active — override has no effect on the
-        # returned value right now; the would-clamp math is checked instead.
-        # Restore direct assertions after diagnosis.
         old = train_api._TRAIN_GPU_HARD_MAX
         train_api._TRAIN_GPU_HARD_MAX = 300
         try:
-            self.assertEqual(self._dur({"epochs": 2, "max_steps": 480}), 810)
-            self.assertEqual(max(120, min(1800, 300, 810)), 300)
+            self.assertEqual(self._dur({"epochs": 2, "max_steps": 480}), 300)
             self.assertEqual(self._dur({"epochs": 2, "max_steps": 100}), 240)  # under cap: untouched
         finally:
             train_api._TRAIN_GPU_HARD_MAX = old
+
+    def test_envelope_shape_uses_inner_values_not_defaults(self):
+        # REGRESSION: the v2 gateway hands the duration callable the RAW body
+        # envelope {"train_request_json": {...}}. Reading .get() off the
+        # envelope silently fell back to epochs=3 / max_steps=None (540s).
+        # Full runtime shape, all three packings -> 90 + 100*1.5 = 240,
+        # and explicitly NOT the 540s default fallback.
+        import json as _json
+        full = {"model_id": "distilbert-base-uncased", "dataset_id": "stanfordnlp/imdb",
+                "task_type": "text-classification", "epochs": 2, "batch_size": 8,
+                "learning_rate": 0.00002, "validation_split": 10, "max_samples": 5000,
+                "max_steps": 100, "training_method": "full",
+                "lora_r": 8, "lora_alpha": 16, "lora_dropout": 0.05,
+                "target_modules": "auto", "job_id": "train_0123456789ab"}
+        self.assertEqual(self._dur(train_request_json={"train_request_json": full}), 240)
+        self.assertEqual(self._dur(None, {"train_request_json": full}), 240)
+        self.assertEqual(self._dur(_json.dumps({"train_request_json": full})), 240)
+        self.assertEqual(self._dur({"train_request_json": _json.dumps(full)}), 240)
+        self.assertEqual(self._dur({"data": [full]}), 240)
+
+    def test_duration_matrix_max_steps_by_epochs(self):
+        # max_steps x epochs matrix over the full runtime shape.
+        # 5 -> floor 120; 100 -> 240; None -> epochs*100 fallback.
+        def cfg(ms, ep):
+            return {"model_id": "m", "dataset_id": "d", "task_type": "text-classification",
+                    "epochs": ep, "batch_size": 8, "learning_rate": 0.00002,
+                    "validation_split": 10, "max_samples": 5000, "max_steps": ms,
+                    "training_method": "full", "lora_r": 8, "lora_alpha": 16,
+                    "lora_dropout": 0.05, "target_modules": "auto",
+                    "job_id": "train_0123456789ab"}
+        for ep in (1, 2, 3):
+            self.assertEqual(self._dur(cfg(5, ep)), 120, f"max_steps=5 epochs={ep}")
+            self.assertEqual(self._dur(cfg(100, ep)), 240, f"max_steps=100 epochs={ep}")
+            self.assertEqual(self._dur({"train_request_json": cfg(100, ep)}), 240,
+                             f"envelope max_steps=100 epochs={ep}")
+        self.assertEqual(self._dur(cfg(None, 1)), 240)   # 90 + 100*1.5
+        self.assertEqual(self._dur(cfg(None, 2)), 390)   # 90 + 200*1.5
+        self.assertEqual(self._dur(cfg(None, 3)), 540)   # 90 + 300*1.5
+        self.assertEqual(self._dur(cfg("", 2)), 390)     # blank == auto
+
+    def test_normalize_never_mutates_input(self):
+        import copy
+        import train_api
+        full = {"train_request_json": {"epochs": 2, "max_steps": 100, "job_id": "x"}}
+        snap = copy.deepcopy(full)
+        out = train_api.normalize_duration_request(full)
+        self.assertEqual(full, snap, "input must not be mutated")
+        self.assertIsNot(out, full.get("train_request_json"))
+        self.assertEqual(out.get("max_steps"), 100)
+        self.assertEqual(out.get("epochs"), 2)
 
     def test_garbage_input_uses_safe_default(self):
         self.assertEqual(self._dur(None), 540)          # epochs default 3

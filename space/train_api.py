@@ -76,12 +76,86 @@ _TRAIN_GPU_MAX = max(120, int(os.environ.get("CLARO_TRAIN_GPU_DURATION_MAX", "18
 _TRAIN_GPU_HARD_MAX = max(120, int(os.environ.get("CLARO_TRAIN_GPU_DURATION_HARD_MAX", "600")))
 
 
+# Keys that identify a flat training config (the exact runtime shape carries
+# model_id, dataset_id, task_type, epochs, batch_size, learning_rate,
+# validation_split, max_samples, max_steps, training_method, LoRA fields,
+# job_id — plus camelCase aliases accepted by the backend validator).
+_DURATION_CONFIG_KEYS = frozenset({
+    "model_id", "dataset_id", "task_type", "task",
+    "epochs", "batch_size", "batchSize",
+    "learning_rate", "learningRate",
+    "validation_split", "validationSplit",
+    "max_samples", "max_steps", "maxSteps",
+    "training_method", "trainingMethod", "method",
+    "lora_r", "lora_alpha", "lora_dropout", "target_modules",
+    "job_id",
+})
+
+
+def _looks_like_config(d):
+    return isinstance(d, dict) and any(k in d for k in _DURATION_CONFIG_KEYS)
+
+
+def _try_parse_json(v):
+    if isinstance(v, str):
+        try:
+            return json.loads(v)
+        except Exception:
+            return v
+    return v
+
+
+def normalize_duration_request(raw):
+    """Fold every observed packing into ONE flat config dict.
+
+    Never mutates its input (only reads + shallow-copies). Shapes handled:
+      * flat config {...} — the exact runtime request shape
+      * JSON string of any of the below
+      * {"train_request_json": {...}} envelope — the raw v2 body as seen by
+        the duration callable (inner value may itself be a JSON string)
+      * {"data": [{...}]} Gradio predict-style payload
+    Returns {} when nothing config-like is found (caller falls back to
+    epochs=3 / max_steps=None, exactly as before).
+    """
+    cur = _try_parse_json(raw)
+    for _ in range(4):  # bounded: envelope nesting is never deep
+        if isinstance(cur, (list, tuple)):
+            for item in cur:
+                item = _try_parse_json(item)
+                if _looks_like_config(item):
+                    return dict(item)
+            return {}
+        if not isinstance(cur, dict):
+            return {}
+        if _looks_like_config(cur):
+            return dict(cur)
+        # Envelope: scan one level deeper for a config-like value.
+        nxt = None
+        for value in cur.values():
+            cand = _try_parse_json(value)
+            if isinstance(cand, (list, tuple)):
+                for item in cand:
+                    item = _try_parse_json(item)
+                    if _looks_like_config(item):
+                        return dict(item)
+                continue
+            if _looks_like_config(cand):
+                return dict(cand)
+            if nxt is None and isinstance(cand, dict) and cand:
+                nxt = cand
+        if nxt is None:
+            return {}
+        cur = nxt
+    return {}
+
+
 def _train_gpu_duration(train_request_json=None, *args, **_kwargs):
     """Size the @spaces.GPU kill-switch window from the request.
 
     ~90s base (dataset/model download + init) + ~1.5s per expected optimizer
-    step, clamped to [120, HARD_MAX]. Accepts every packing shape via
-    unpack_request (v2 gateway passes kwargs, Gradio UI passes positionally).
+    step, clamped to [120, HARD_MAX]. Incoming args are normalized FIRST into
+    one flat config via normalize_duration_request (v2 gateway passes kwargs,
+    Gradio UI passes positionally, raw bodies arrive enveloped).
     """
     # DIAGNOSTIC (item 4): exact dynamic inputs on every invocation.
     try:
@@ -93,13 +167,26 @@ def _train_gpu_duration(train_request_json=None, *args, **_kwargs):
         print(f"[CLARO-DURATION] dynamic inputs={_in[:600]}", flush=True)
     except Exception as _e:
         print(f"[CLARO-DURATION] dynamic inputs=<unprintable: {_e}>", flush=True)
-    obj = unpack_request(train_request_json, args, _kwargs)
+    # Normalize FIRST: one flat config dict from any packing shape.
+    # (The v2 gateway hands this callable the raw body envelope, not the
+    # parameter-mapped endpoint args — reading .get() off the raw object is
+    # what silently fell back to epochs=3 / max_steps=None.)
+    if train_request_json is not None:
+        _raw_in = train_request_json
+    elif _kwargs:
+        _raw_in = _kwargs
+    elif args:
+        _raw_in = args[0] if len(args) == 1 else list(args)
+    else:
+        _raw_in = None
+    obj = normalize_duration_request(_raw_in)
+    # TEMP-DIAG (item 10): normalized values BEFORE any calculation.
     try:
-        obj = json.loads(obj) if isinstance(obj, str) else (obj or {})
+        print(f"[CLARO-DURATION] normalized keys={sorted(obj.keys())} "
+              f"epochs={obj.get('epochs', '(default 3)')!r} "
+              f"max_steps={obj.get('max_steps', obj.get('maxSteps', '(default None)'))!r}", flush=True)
     except Exception:
-        obj = {}
-    if not isinstance(obj, dict):
-        obj = {}
+        pass
     try:
         epochs = max(1, int(obj.get("epochs", 3)))
     except Exception:
@@ -112,17 +199,14 @@ def _train_gpu_duration(train_request_json=None, *args, **_kwargs):
         max_steps = None
     steps = max_steps if max_steps else epochs * 100
     requested = int(90 + steps * 1.5)
-    # DIAGNOSTIC MODE (temporary, per instruction: do NOT clamp yet): the
-    # HARD_MAX bound is BYPASSED so the raw computed value observably reaches
-    # the scheduler. would_clamp_to shows what the bound would have produced.
-    # Restore min(..., _TRAIN_GPU_HARD_MAX, ...) here after diagnosis.
-    would_clamp_to = max(120, min(_TRAIN_GPU_MAX, _TRAIN_GPU_HARD_MAX, requested))
-    final = max(120, min(_TRAIN_GPU_MAX, requested))
+    # HARD_MAX clamp RESTORED (diagnosis complete): never request above the
+    # ZeroGPU allowance. Training semantics untouched — Trainer still stops
+    # at exactly max_steps/epochs; this is only the GPU kill-switch window.
+    final = max(120, min(_TRAIN_GPU_MAX, _TRAIN_GPU_HARD_MAX, requested))
     # TEMP-DIAG: full duration provenance for every scheduled call.
     print(f"[TRAIN-DIAG] duration requested max_steps={raw_max!r} epochs={epochs} "
           f"computed total_steps={steps} requested={requested}s "
-          f"caps=[soft {_TRAIN_GPU_MAX}s, hard {_TRAIN_GPU_HARD_MAX}s BYPASSED] final={final}s "
-          f"would_clamp_to={would_clamp_to}s",
+          f"caps=[soft {_TRAIN_GPU_MAX}s, hard {_TRAIN_GPU_HARD_MAX}s] final={final}s",
           flush=True)
     # REQUIRED source-of-truth block: exact values feeding @spaces.GPU.
     try:
@@ -143,10 +227,10 @@ def _train_gpu_duration(train_request_json=None, *args, **_kwargs):
           f"caps_soft={_TRAIN_GPU_MAX}\n"
           f"caps_hard={_TRAIN_GPU_HARD_MAX}",
           flush=True)
-    if would_clamp_to < requested:
-        print(f"[TRAIN-DIAG] duration WOULD-CLAMP {requested}s -> {would_clamp_to}s under hard max "
-              f"(clamp currently BYPASSED for diagnosis; training semantics unchanged: "
-              f"Trainer still stops at max_steps/epochs)", flush=True)
+    if final < requested:
+        print(f"[TRAIN-DIAG] duration CLAMPED {requested}s -> {final}s by hard max "
+              f"(training semantics unchanged: Trainer still stops at max_steps/epochs; "
+              f"raise CLARO_TRAIN_GPU_DURATION_HARD_MAX only if HF allows more)", flush=True)
     # DIAGNOSTIC (item 4): exact value returned to the Spaces scheduler.
     print(f"[CLARO-DURATION] dynamic result={final}", flush=True)
     return final

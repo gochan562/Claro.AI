@@ -108,6 +108,25 @@ def _train_gpu_duration(train_request_json=None, *args, **_kwargs):
           f"computed total_steps={steps} requested={requested}s "
           f"caps=[soft {_TRAIN_GPU_MAX}s, hard {_TRAIN_GPU_HARD_MAX}s] final={final}s",
           flush=True)
+    # REQUIRED source-of-truth block: exact values feeding @spaces.GPU.
+    try:
+        _batch = obj.get("batch_size", obj.get("batchSize", "?"))
+    except Exception:
+        _batch = "?"
+    print("[CLARO] train GPU duration:\n"
+          f"requested_steps={raw_max!r}\n"
+          f"computed_steps={steps}\n"
+          f"computed_duration={requested}\n"
+          f"final_spaces_gpu_duration={final}\n"
+          f"max_steps={raw_max!r}\n"
+          f"total_steps={steps}\n"
+          f"epochs={epochs}\n"
+          f"batch_size={_batch}\n"
+          f"estimated_seconds_per_step=1.5\n"
+          f"calculated_duration={requested}\n"
+          f"caps_soft={_TRAIN_GPU_MAX}\n"
+          f"caps_hard={_TRAIN_GPU_HARD_MAX}",
+          flush=True)
     if final < requested:
         print(f"[TRAIN-DIAG] duration CLAMPED {requested}s -> {final}s by hard max "
               f"(training semantics unchanged: Trainer still stops at max_steps/epochs; "

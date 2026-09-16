@@ -323,7 +323,28 @@ def show_cache():
 from train_api import _train_gpu_duration
 
 
-@spaces.GPU(duration=_train_gpu_duration)
+def _train_gpu_duration_traced(train_request_json=None, *args, **_kwargs):
+    # TEMP-DIAG: logs the EXACT inputs spaces hands the duration callable and
+    # the EXACT value returned to the scheduler. Behavior-preserving: the
+    # return value is passed through untouched.
+    try:
+        in_repr = repr(train_request_json)
+        if args:
+            in_repr += f" args={len(args)}x"
+        if _kwargs:
+            in_repr += f" kwargs={sorted(_kwargs.keys())}"
+        print(f"[TRAIN-DIAG] duration callable inputs: {in_repr[:400]}", flush=True)
+    except Exception:
+        pass
+    final = _train_gpu_duration(train_request_json, *args, **_kwargs)
+    try:
+        print(f"[TRAIN-DIAG] duration callable returning final_spaces_gpu_duration={final} to scheduler", flush=True)
+    except Exception:
+        pass
+    return final
+
+
+@spaces.GPU(duration=_train_gpu_duration_traced)
 def _gpu_train(train_request_json=None, *args, **kwargs):
     yield from train_fn(_unpack_request(train_request_json, args, kwargs))
 

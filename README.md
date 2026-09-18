@@ -117,7 +117,7 @@ The backend uses a provider abstraction so the notebook workflow does not need t
 Claro.AI is split into several cooperating layers:
 
 <p align="center">
-  <img src="docs/architecture-overview.png" alt="Claro.AI architecture overview" width="900">
+  <img src="docs/diagram.png" alt="Claro.AI architecture overview" width="900">
 </p>
 
 Detailed Architecture ↓
@@ -125,7 +125,7 @@ Detailed Architecture ↓
 The detailed diagram shows the current relationships between the browser workbench, gateway/composition layer, training and artifact system, Python runtimes, Hugging Face, and remote GPU providers.
 
 <p align="center">
-  <img src="docs/architecture-detailed.png" alt="Claro.AI detailed architecture" width="900">
+  <img src="docs/diagram-2.png" alt="Claro.AI detailed architecture" width="900">
 </p>
 
 

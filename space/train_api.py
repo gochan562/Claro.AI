@@ -589,8 +589,11 @@ def train_worker(cfg: dict, out_dir: Path, line_q: "queue.Queue", stop_flag: thr
 def train(train_request_json: str):
     """Gradio endpoint (api_name="train"). Generator yielding (event_json, file).
 
-    Each intermediate yield is (json_event_string, None); the final return is
-    (manifest_json_string, zip_path_or_None).
+    Each intermediate yield is (json_event_string, None); the FINAL yield is
+    (manifest_json_string, zip_path_or_None) and becomes Gradio's `complete`
+    frame [manifestJsonString, fileObj]. The generator then terminates
+    normally (bare `return`): never `return (tuple)`, whose StopIteration
+    value Gradio's iterator handling discards.
     """
     # DIAGNOSTIC (items 2-3): immediately before endpoint work begins — the
     # exact max_steps/epochs the worker sees (compare with what the duration
@@ -618,14 +621,22 @@ def train(train_request_json: str):
     except Exception:
         manifest = {"job_id": None, "status": "failed", "error": "training_error",
                     "message": "request is not valid JSON"}
-        return json.dumps(manifest), None
+        # Terminal output MUST be yielded (not returned): Gradio emits each
+        # yield as a `generating` frame and the LAST yield as the `complete`
+        # frame. A generator's `return value` becomes StopIteration.value,
+        # which `yield from` (app.py _gpu_train) and Gradio's iteration both
+        # discard — so `return (manifest, file)` loses the manifest.
+        yield json.dumps(manifest), None
+        return
 
     cfg, err = validate_train_request(obj if isinstance(obj, dict) else {})
     if err:
         manifest = {"job_id": (obj.get('job_id') if isinstance(obj, dict) else None),
                     "status": "failed", "error": "training_error", "message": err}
         yield json.dumps({"type": "log", "line": f"[TRAIN] training_error: {err}"}), None
-        return json.dumps(manifest), None
+        # Final yield (not return) — this tuple becomes the `complete` frame.
+        yield json.dumps(manifest), None
+        return
 
     job_id = cfg['job_id']
     _clear_cancel(job_id)
@@ -700,7 +711,9 @@ def train(train_request_json: str):
         manifest = {"job_id": job_id, "status": "failed", "error": "stopped_by_user",
                     "message": "cancelled by user"}
         yield json.dumps({"type": "log", "line": "[TRAIN] cancelled by user"}), None
-        return json.dumps(manifest), None
+        # Final yield (not return) — this tuple becomes the `complete` frame.
+        yield json.dumps(manifest), None
+        return
 
     if worker_exc:
         e = worker_exc[0]
@@ -711,21 +724,29 @@ def train(train_request_json: str):
         if not isinstance(e, SystemExit):
             yield json.dumps({"type": "log", "line": f"[TRAIN] training_error: worker exception{msg}"}), None
             traceback.print_exc()
-        return json.dumps(manifest), None
+        # Final yield (not return) — this tuple becomes the `complete` frame.
+        yield json.dumps(manifest), None
+        return
 
     try:
         files = _zip_dir(out_dir, zip_path)
     except Exception as e:
         manifest = {"job_id": job_id, "status": "failed", "error": "training_error",
                     "message": f"artifact packaging failed: {e}"}
-        return json.dumps(manifest), None
+        # Final yield (not return) — this tuple becomes the `complete` frame.
+        yield json.dumps(manifest), None
+        return
 
     hub_path = _maybe_upload_to_hub(zip_path, job_id, cfg)
     manifest = {"job_id": job_id, "status": "finished",
                 "metrics_count": result.get('metrics_count', 0),
                 "files": files, "hub_path": hub_path}
     yield json.dumps({"type": "log", "line": f"[TRAIN] finished artifacts={len(files)}"}), None
-    return json.dumps(manifest), str(zip_path)
+    # Successful terminal output MUST be the final yield (not a return):
+    # Gradio maps the last yielded tuple to the `complete` frame
+    # [manifestJsonString, fileObj]. A bare `return` then ends the generator.
+    yield json.dumps(manifest), str(zip_path)
+    return
 
 
 def cancel_train(job_id: str) -> str:

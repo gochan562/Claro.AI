@@ -883,6 +883,34 @@ function _zeroGpuSpaceOrigin(apiBase) {
   return String(apiBase).replace(/\/+$/, '');
 }
 
+// ── [TRAIN-HTTP] response-parsing diagnostics ─────────────────────────────
+// Treats `Unexpected token '<'` as a response-parsing failure, never as a
+// model/training failure. Every ZeroGPU fetch below reads the body as TEXT
+// first, logs method + URL + status + content-type + first 500 chars of the
+// raw body, and only then attempts JSON parsing. Secrets/tokens are NEVER
+// logged: the Authorization header is never printed and URLs never carry it.
+function _trainHttpSnippet(raw) {
+  return String(raw || '').slice(0, 500);
+}
+
+function _logTrainHttp(method, url, status, contentType, raw) {
+  try {
+    const ct = contentType || 'unknown';
+    console.error(`[TRAIN-HTTP] method=${method}`);
+    console.error(`[TRAIN-HTTP] URL=${url}`);
+    console.error(`[TRAIN-HTTP] status=${status}`);
+    console.error(`[TRAIN-HTTP] content-type=${ct}`);
+    console.error(`[TRAIN-HTTP] raw body=${_trainHttpSnippet(raw)}`);
+  } catch (_) {}
+}
+
+function _looksLikeHtml(raw, contentType) {
+  const ct = String(contentType || '').toLowerCase();
+  if (ct.includes('text/html')) return true;
+  const s = String(raw || '').trimStart();
+  return s.startsWith('<');
+}
+
 async function _postZeroGpuFn(apiBase, fnName, body, signal, token, timeoutMs = 30000) {
   const url = `${apiBase}/call/v2/${fnName}`;
   const ctrl = new AbortController();
@@ -897,26 +925,45 @@ async function _postZeroGpuFn(apiBase, fnName, body, signal, token, timeoutMs = 
   }
   try {
     const res = await fetch(url, { method: 'POST', headers: _zeroGpuHeaders(token), body: JSON.stringify(body), signal: ctrl.signal });
+    // Diagnostic: read as TEXT first, log before any JSON parsing.
+    // (Authorization header is never logged.)
+    const contentType = (res.headers && typeof res.headers.get === 'function' && res.headers.get('content-type')) || 'unknown';
+    let raw = '';
+    try { raw = await res.text(); }
+    catch (_) { raw = ''; }
+    _logTrainHttp('POST', url, res.status, contentType, raw);
+    const snippet = _trainHttpSnippet(raw);
     if (res.status === 404) {
       throw new ZeroGpuTrainError(
-        `ZeroGPU endpoint not found at ${url}. Deploy the latest space/app.py (with the /${fnName} endpoint) to the Space.`,
+        `ZeroGPU endpoint not found at ${url} (HTTP 404, content-type=${contentType}, body=${snippet}). ` +
+        `Deploy the latest space/app.py (with the /${fnName} endpoint) to the Space. ` +
+        `An HTML body here usually means a Gradio endpoint/path mismatch (D) or a 404 page (B).`,
         'space_unavailable', 502);
     }
     if (res.status === 502 || res.status === 503 || res.status === 429) {
-      const detail = await res.text().catch(() => '');
+      const detail = raw;
       const sleepy = /sleeping|paused|building|loading/i.test(detail);
       throw new ZeroGpuTrainError(
-        sleepy ? `ZeroGPU Space is unavailable (HTTP ${res.status}). It may be sleeping or building.`
-               : `ZeroGPU Space rejected the request (HTTP ${res.status}): ${detail.slice(0, 200)}`,
+        sleepy ? `ZeroGPU Space is unavailable (HTTP ${res.status}, content-type=${contentType}, body=${snippet}). It may be sleeping or building.`
+               : `ZeroGPU Space rejected the request (HTTP ${res.status}, content-type=${contentType}): ${snippet}`,
         'space_unavailable', res.status);
     }
     if (!res.ok) {
-      const detail = await res.text().catch(() => '');
-      throw new ZeroGpuTrainError(`ZeroGPU call failed (HTTP ${res.status}): ${detail.slice(0, 200)}`, 'space_unavailable', res.status);
+      const detail = raw;
+      throw new ZeroGpuTrainError(
+        `ZeroGPU call failed (HTTP ${res.status}, content-type=${contentType}): ${snippet || detail.slice(0, 500)}`,
+        'space_unavailable', res.status);
     }
     let payload;
-    try { payload = JSON.parse(await res.text()); }
-    catch (err) { throw new ZeroGpuTrainError(`ZeroGPU returned non-JSON response: ${err.message}`, 'malformed_response', 502); }
+    try { payload = JSON.parse(raw); }
+    catch (err) {
+      const htmlHint = _looksLikeHtml(raw, contentType)
+        ? ' Response looks like HTML (starts with \'<\'). Possible sources: (A) HF Space page, (B) 404/405/500/502 page, (C) Replit/proxy page, (D) Gradio endpoint/path mismatch, (E) app startup/restart page.'
+        : '';
+      throw new ZeroGpuTrainError(
+        `ZeroGPU returned non-JSON response (HTTP ${res.status}, content-type=${contentType}, body=${snippet}): ${err.message}.${htmlHint}`,
+        'malformed_response', 502);
+    }
     const eventId = payload && payload.event_id;
     if (!eventId || typeof eventId !== 'string') {
       throw new ZeroGpuTrainError(`ZeroGPU did not return an event_id: ${JSON.stringify(payload).slice(0, 200)}`, 'malformed_response', 502);
@@ -953,19 +1000,33 @@ async function _fetchZeroGpuSse(apiBase, fnName, eventId, signal, token, onGener
     if (err.name === 'AbortError') throw new ZeroGpuTrainError('ZeroGPU stream was cancelled.', 'cancelled', 499);
     throw new ZeroGpuTrainError(`Lost connection to ZeroGPU stream: ${err.message}`, 'space_unavailable', 504);
   }
+  const sseContentType = (res.headers && typeof res.headers.get === 'function' && res.headers.get('content-type')) || 'unknown';
   if (res.status === 404) {
-    throw new ZeroGpuTrainError('ZeroGPU event was not found (event expired or Space restarted).', 'space_unavailable', 502);
+    const detail404 = await res.text().catch(() => '');
+    _logTrainHttp('GET', url, res.status, sseContentType, detail404);
+    throw new ZeroGpuTrainError(
+      `ZeroGPU event was not found (event expired or Space restarted) (HTTP 404, content-type=${sseContentType}, body=${_trainHttpSnippet(detail404)}).`,
+      'space_unavailable', 502);
   }
   if (!res.ok || !res.body) {
     const detail = await res.text().catch(() => '');
-    throw new ZeroGpuTrainError(`ZeroGPU stream open failed (HTTP ${res.status}): ${detail.slice(0, 200)}`, 'space_unavailable', res.status || 502);
+    _logTrainHttp('GET', url, res.status, sseContentType, detail);
+    throw new ZeroGpuTrainError(
+      `ZeroGPU stream open failed (HTTP ${res.status}, content-type=${sseContentType}): ${_trainHttpSnippet(detail)}`,
+      'space_unavailable', res.status || 502);
   }
+  // SSE streams cannot be read fully as text first without breaking the
+  // stream, so log the response head now and the first-chunk raw body below.
+  // (Authorization header is never logged.)
+  _logTrainHttp('GET', url, res.status, sseContentType, '(SSE stream open — first-chunk raw body follows)');
   const nodeStream = Readable.fromWeb(res.body);
   let buffer = '';
   let eventType = '';
   let dataBuf = '';
   let hadError = false;
   let errMsg = '';
+  let streamHead = '';
+  let streamHeadLogged = false;
 
   const handleFrame = () => {
     if (!eventType) return null;
@@ -981,7 +1042,14 @@ async function _fetchZeroGpuSse(apiBase, fnName, eventId, signal, token, onGener
         } catch (_) {}
         return { done: true, data: parsed };
       }
-      catch { throw new ZeroGpuTrainError(`ZeroGPU returned malformed complete frame: ${dataBuf.slice(0, 200)}`, 'malformed_response', 502); }
+      catch (parseErr) {
+        const htmlHint = _looksLikeHtml(dataBuf, sseContentType)
+          ? ' Complete frame looks like HTML (starts with \'<\'). Possible sources: (A) HF Space page, (B) 404/405/500/502 page, (C) Replit/proxy page, (D) Gradio endpoint/path mismatch, (E) app startup/restart page.'
+          : '';
+        throw new ZeroGpuTrainError(
+          `ZeroGPU returned malformed complete frame (HTTP ${res.status}, content-type=${sseContentType}, body=${_trainHttpSnippet(dataBuf)}): ${parseErr.message}.${htmlHint}`,
+          'malformed_response', 502);
+      }
     }
     if (eventType === 'error') {
       hadError = true;
@@ -992,13 +1060,39 @@ async function _fetchZeroGpuSse(apiBase, fnName, eventId, signal, token, onGener
     }
     if (eventType === 'generating' && onGenerating) {
       try { onGenerating(JSON.parse(dataBuf)); }
-      catch { /* ignore malformed progress frame */ }
+      catch (genErr) {
+        // Diagnostic only — behavior unchanged (malformed progress frames are ignored).
+        try {
+          if (_looksLikeHtml(dataBuf, sseContentType)) {
+            console.error(`[TRAIN-HTTP] method=GET (SSE generating frame non-JSON)`);
+            console.error(`[TRAIN-HTTP] URL=${url}`);
+            console.error(`[TRAIN-HTTP] status=${res.status}`);
+            console.error(`[TRAIN-HTTP] content-type=${sseContentType}`);
+            console.error(`[TRAIN-HTTP] raw body=${_trainHttpSnippet(dataBuf)}`);
+          }
+        } catch (_) {}
+      }
     }
     return null;
   };
 
   for await (const chunk of nodeStream) {
-    buffer += chunk.toString('utf8');
+    const text = chunk.toString('utf8');
+    // Capture the first 500 chars of the raw stream for the diagnostic.
+    if (!streamHeadLogged) {
+      streamHead += text;
+      if (streamHead.length >= 500) {
+        streamHeadLogged = true;
+        _logTrainHttp('GET', url, res.status, sseContentType, streamHead);
+        if (_looksLikeHtml(streamHead, sseContentType) && !streamHead.includes('event:')) {
+          throw new ZeroGpuTrainError(
+            `ZeroGPU stream returned non-SSE HTML (HTTP ${res.status}, content-type=${sseContentType}, body=${_trainHttpSnippet(streamHead)}). ` +
+            `Possible sources: (A) HF Space page, (B) 404/405/500/502 page, (C) Replit/proxy page, (D) Gradio endpoint/path mismatch, (E) app startup/restart page.`,
+            'malformed_response', 502);
+        }
+      }
+    }
+    buffer += text;
     let idx;
     while ((idx = buffer.indexOf('\n')) >= 0) {
       const line = buffer.slice(0, idx).replace(/\r$/, '');
@@ -1020,8 +1114,20 @@ async function _fetchZeroGpuSse(apiBase, fnName, eventId, signal, token, onGener
     const r = handleFrame();
     if (r && r.done) return r.data;
   }
+  // Short streams (<500 chars) never triggered the head log above — log what we saw.
+  if (!streamHeadLogged) {
+    _logTrainHttp('GET', url, res.status, sseContentType, streamHead || buffer);
+  }
   if (hadError) throw _classifyZeroGpuErrorFrame(errMsg);
-  throw new ZeroGpuTrainError('ZeroGPU stream closed without a complete frame.', 'malformed_response', 502);
+  {
+    const tailSnippet = _trainHttpSnippet(streamHead || buffer || dataBuf);
+    const htmlHint = _looksLikeHtml(streamHead || buffer || dataBuf, sseContentType)
+      ? ' Body looks like HTML (starts with \'<\'). Possible sources: (A) HF Space page, (B) 404/405/500/502 page, (C) Replit/proxy page, (D) Gradio endpoint/path mismatch, (E) app startup/restart page.'
+      : '';
+    throw new ZeroGpuTrainError(
+      `ZeroGPU stream closed without a complete frame (HTTP ${res.status}, content-type=${sseContentType}, body=${tailSnippet}).${htmlHint}`,
+      'malformed_response', 502);
+  }
 }
 
 function _classifyZeroGpuErrorFrame(errMsg) {
@@ -1138,12 +1244,20 @@ async function _downloadZeroGpuFile(apiBase, file, signal, token) {
   const candidates = _zeroGpuFileCandidates(apiBase, file);
   if (!candidates.length) throw new ZeroGpuTrainError('ZeroGPU finished but returned no downloadable artifact file.', 'missing_artifact', 502);
   let lastErr = null;
+  let lastHttp = '';
   for (const url of candidates) {
     try {
       const headers = {};
       if (token) headers['Authorization'] = `Bearer ${token}`;
       const res = await fetch(url, { signal, headers });
-      if (!res.ok || !res.body) { lastErr = new Error(`HTTP ${res.status}`); continue; }
+      const dlContentType = (res.headers && typeof res.headers.get === 'function' && res.headers.get('content-type')) || 'unknown';
+      if (!res.ok || !res.body) {
+        const detail = await res.text().catch(() => '');
+        _logTrainHttp('GET', url, res.status, dlContentType, detail);
+        lastHttp = `HTTP ${res.status}, content-type=${dlContentType}, body=${_trainHttpSnippet(detail)}`;
+        lastErr = new Error(`HTTP ${res.status} content-type=${dlContentType} body=${_trainHttpSnippet(detail)}`);
+        continue;
+      }
       const chunks = [];
       let total = 0;
       for await (const chunk of res.body) {
@@ -1152,14 +1266,31 @@ async function _downloadZeroGpuFile(apiBase, file, signal, token) {
         chunks.push(Buffer.from(chunk));
       }
       const buf = Buffer.concat(chunks);
-      if (!buf.length) { lastErr = new Error('empty file'); continue; }
+      if (!buf.length) {
+        _logTrainHttp('GET', url, res.status, dlContentType, '');
+        lastHttp = `HTTP ${res.status}, content-type=${dlContentType}, empty file`;
+        lastErr = new Error('empty file');
+        continue;
+      }
+      // Diagnostic: text-first peek (first 500 bytes decoded) before treating as zip.
+      const headText = buf.subarray(0, 500).toString('utf8');
+      _logTrainHttp('GET', url, res.status, dlContentType, `${headText} (… ${total} bytes total)`);
+      if (_looksLikeHtml(headText, dlContentType)) {
+        lastHttp = `HTTP ${res.status}, content-type=${dlContentType}, body=${_trainHttpSnippet(headText)}`;
+        lastErr = new Error(
+          `Artifact URL returned HTML instead of zip (HTTP ${res.status}, content-type=${dlContentType}, body=${_trainHttpSnippet(headText)}). ` +
+          `Possible sources: (A) HF Space page, (B) 404/405/500/502 page, (C) Replit/proxy page, (D) Gradio endpoint/path mismatch, (E) app startup/restart page.`);
+        continue;
+      }
       return buf;
     } catch (err) {
       if (err instanceof ZeroGpuTrainError) throw err;
       lastErr = err;
     }
   }
-  throw new ZeroGpuTrainError(`Could not download ZeroGPU artifacts: ${lastErr ? lastErr.message : 'unknown'}`, 'artifact_error', 502);
+  throw new ZeroGpuTrainError(
+    `Could not download ZeroGPU artifacts: ${lastErr ? lastErr.message : 'unknown'}${lastHttp ? ` [last HTTP: ${lastHttp}]` : ''}`,
+    'artifact_error', 502);
 }
 
 // Minimal dependency-free ZIP reader (stored + deflate). Archive paths are
@@ -1301,6 +1432,20 @@ function _startZeroGPUTraining(job) {
     _log(job, `[TRAIN] lora r=${cfg.lora_r} alpha=${cfg.lora_alpha} dropout=${cfg.lora_dropout} target_modules=${cfg.target_modules}`);
   }
   _log(job, `[TRAIN] config epochs=${cfg.epochs} batch_size=${cfg.batch_size} lr=${cfg.learning_rate} max_steps=${cfg.max_steps || 'auto'} validation_split=${cfg.validation_split}%`);
+  // Verify the exact final hostname and path before any HF Space request.
+  // No pre-flight request is made on this path: the first Space request is
+  // POST {apiBase}/call/v2/train, followed by GET {apiBase}/call/train/{event_id}.
+  try {
+    const origin = _zeroGpuSpaceOrigin(remote.apiBase);
+    let hostname = '(unparseable)';
+    try { hostname = new URL(remote.apiBase).hostname; } catch (_) {}
+    console.error(`[TRAIN-HTTP] resolved spaceId=${remote.spaceId}`);
+    console.error(`[TRAIN-HTTP] resolved apiBase=${remote.apiBase}`);
+    console.error(`[TRAIN-HTTP] resolved origin=${origin} hostname=${hostname}`);
+    console.error(`[TRAIN-HTTP] POST URL=${remote.apiBase}/call/v2/train`);
+    console.error(`[TRAIN-HTTP] GET template=${remote.apiBase}/call/train/{event_id} (GET has no /v2 by Gradio convention; POST has /v2)`);
+    console.error(`[TRAIN-HTTP] pre-flight requests before POST: none (direct POST)`);
+  } catch (_) {}
   _updateProgress(job, { gpu_status: 'zerogpu', total_steps: cfg.max_steps || (cfg.epochs * 100) });
 
   // Structured training parameters only — never arbitrary code.
@@ -1343,20 +1488,47 @@ function _startZeroGPUTraining(job) {
       if (job._aborted) return;
       job._remote.eventId = eventId;
       _log(job, `[TRAIN] ZeroGPU event=${eventId}; streaming progress`);
+      try {
+        console.error(`[TRAIN-HTTP] method=GET`);
+        console.error(`[TRAIN-HTTP] URL=${remote.apiBase}/call/train/${encodeURIComponent(eventId)}`);
+        console.error(`[TRAIN-HTTP] note=opening SSE stream (headers + first-chunk body logged inside _fetchZeroGpuSse)`);
+      } catch (_) {}
       const data = await _fetchZeroGpuSse(remote.apiBase, 'train', eventId, controller.signal, remote.token, (frame) => {
         if (job._aborted) return;
         const first = Array.isArray(frame) ? frame[0] : frame;
         if (typeof first !== 'string') return;
         let ev;
         try { ev = JSON.parse(first); }
-        catch { _log(job, first); return; }
+        catch (frameErr) {
+          // Diagnostic only — behavior unchanged (non-JSON progress text is logged as-is).
+          try {
+            if (String(first).trimStart().startsWith('<')) {
+              console.error(`[TRAIN-HTTP] method=GET (SSE generating frame non-JSON)`);
+              console.error(`[TRAIN-HTTP] URL=${remote.apiBase}/call/train/${encodeURIComponent(eventId)}`);
+              console.error(`[TRAIN-HTTP] status=(stream)`);
+              console.error(`[TRAIN-HTTP] content-type=(stream)`);
+              console.error(`[TRAIN-HTTP] raw body=${String(first).slice(0, 500)}`);
+            }
+          } catch (_) {}
+          _log(job, first); return;
+        }
         _applyRemoteTrainEvent(job, ev);
       });
       // complete frame: [manifestJson, fileObj|null]
       const arr = Array.isArray(data) ? data : [data];
       let manifest = null;
       try { manifest = typeof arr[0] === 'string' ? JSON.parse(arr[0]) : arr[0]; }
-      catch { manifest = null; }
+      catch (manErr) {
+        // Diagnostic only — behavior unchanged (null manifest still fails as before).
+        try {
+          console.error(`[TRAIN-HTTP] method=GET (SSE complete-frame manifest non-JSON)`);
+          console.error(`[TRAIN-HTTP] URL=${remote.apiBase}/call/train/${encodeURIComponent(eventId)}`);
+          console.error(`[TRAIN-HTTP] status=(stream complete)`);
+          console.error(`[TRAIN-HTTP] content-type=(stream)`);
+          console.error(`[TRAIN-HTTP] raw body=${String(arr[0]).slice(0, 500)}`);
+        } catch (_) {}
+        manifest = null;
+      }
       const file = arr.length > 1 && arr[1] && typeof arr[1] === 'object' ? arr[1] : null;
       await _finishZeroGpuJob(job, manifest, file);
     } catch (err) {
@@ -1385,8 +1557,43 @@ async function _fetchJson(url, fetchImpl, timeoutMs = 8000) {
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const res = await f(url, { signal: ctrl.signal });
+    // Diagnostic: text-first when the response supports it (never res.json()
+    // directly on real fetch, so an HTML error page surfaces as a clear log
+    // instead of `Unexpected token '<'`). Test mocks that only implement
+    // .json() fall back to the legacy path with identical return semantics.
+    const hasText = res && typeof res.text === 'function';
+    let contentType = 'unknown';
+    try { contentType = (res.headers && typeof res.headers.get === 'function' && res.headers.get('content-type')) || 'unknown'; } catch (_) {}
+    if (hasText) {
+      let raw = '';
+      try { raw = await res.text(); } catch (_) { raw = ''; }
+      try {
+        console.error(`[TRAIN-HTTP] method=GET`);
+        console.error(`[TRAIN-HTTP] URL=${url}`);
+        console.error(`[TRAIN-HTTP] status=${res.status}`);
+        console.error(`[TRAIN-HTTP] content-type=${contentType}`);
+        console.error(`[TRAIN-HTTP] raw body=${String(raw).slice(0, 500)}`);
+      } catch (_) {}
+      if (!res.ok) return null;
+      try { return JSON.parse(raw); }
+      catch {
+        try { console.error(`[TRAIN-HTTP] non-JSON response (HTTP ${res.status}, content-type=${contentType}, body=${String(raw).slice(0, 500)})`); } catch (_) {}
+        return null;
+      }
+    }
+    // Legacy/mock path: no .text() available (e.g. unit-test fakeFetch).
     if (!res.ok) return null;
-    return await res.json().catch(() => null);
+    try {
+      const data = await res.json();
+      try {
+        console.error(`[TRAIN-HTTP] method=GET`);
+        console.error(`[TRAIN-HTTP] URL=${url}`);
+        console.error(`[TRAIN-HTTP] status=${res.status}`);
+        console.error(`[TRAIN-HTTP] content-type=${contentType}`);
+        console.error(`[TRAIN-HTTP] raw body=${JSON.stringify(data).slice(0, 500)}`);
+      } catch (_) {}
+      return data;
+    } catch { return null; }
   } catch {
     return null;
   } finally {

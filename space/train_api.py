@@ -27,6 +27,7 @@ Uploaded to the Space together with ``training_runner.py`` and the
 """
 from __future__ import annotations
 
+import ast
 import contextlib
 import io
 import json
@@ -96,13 +97,28 @@ def _looks_like_config(d):
     return isinstance(d, dict) and any(k in d for k in _DURATION_CONFIG_KEYS)
 
 
-def _try_parse_json(v):
-    if isinstance(v, str):
+def _deep_parse_json(v, _depth=0):
+    """Parse a string payload into a value (bounded, side-effect free).
+
+    Tries JSON first, then a Python-dict representation via ast.literal_eval
+    (the runtime delivers the whole request as a single-quoted dict repr,
+    which is not valid JSON). NEVER uses eval(). Returns the original value
+    when nothing parses; callers only accept Mapping results.
+    """
+    cur = v
+    for _ in range(3):
+        if not isinstance(cur, str):
+            break
         try:
-            return json.loads(v)
+            cur = json.loads(cur)
+            continue
         except Exception:
-            return v
-    return v
+            pass
+        try:
+            cur = ast.literal_eval(cur)
+        except Exception:
+            break
+    return cur
 
 
 def normalize_duration_request(raw):
@@ -117,11 +133,11 @@ def normalize_duration_request(raw):
     Returns {} when nothing config-like is found (caller falls back to
     epochs=3 / max_steps=None, exactly as before).
     """
-    cur = _try_parse_json(raw)
+    cur = _deep_parse_json(raw)
     for _ in range(4):  # bounded: envelope nesting is never deep
         if isinstance(cur, (list, tuple)):
             for item in cur:
-                item = _try_parse_json(item)
+                item = _deep_parse_json(item)
                 if _looks_like_config(item):
                     return dict(item)
             return {}
@@ -132,10 +148,10 @@ def normalize_duration_request(raw):
         # Envelope: scan one level deeper for a config-like value.
         nxt = None
         for value in cur.values():
-            cand = _try_parse_json(value)
+            cand = _deep_parse_json(value)
             if isinstance(cand, (list, tuple)):
                 for item in cand:
-                    item = _try_parse_json(item)
+                    item = _deep_parse_json(item)
                     if _looks_like_config(item):
                         return dict(item)
                 continue
@@ -157,7 +173,7 @@ def _train_gpu_duration(train_request_json=None, *args, **_kwargs):
     one flat config via normalize_duration_request (v2 gateway passes kwargs,
     Gradio UI passes positionally, raw bodies arrive enveloped).
     """
-    # DIAGNOSTIC (item 4): exact dynamic inputs on every invocation.
+    # DIAGNOSTIC: exact dynamic inputs on every invocation (named value).
     try:
         _in = repr(train_request_json)
         if args:
@@ -167,19 +183,44 @@ def _train_gpu_duration(train_request_json=None, *args, **_kwargs):
         print(f"[CLARO-DURATION] dynamic inputs={_in[:600]}", flush=True)
     except Exception as _e:
         print(f"[CLARO-DURATION] dynamic inputs=<unprintable: {_e}>", flush=True)
+    # DIAGNOSTIC: raw call shape BEFORE normalization (proves whether the
+    # request arrives as Mapping, JSON string, or Python-dict repr string).
+    try:
+        print(f"[CLARO-DURATION] raw args type={type(args).__name__}", flush=True)
+        print(f"[CLARO-DURATION] raw args repr={repr(args)[:600]}", flush=True)
+        print(f"[CLARO-DURATION] kwargs={sorted(_kwargs.keys()) if _kwargs else []}", flush=True)
+        if args:
+            print(f"[CLARO-DURATION] first positional type={type(args[0]).__name__}", flush=True)
+            print(f"[CLARO-DURATION] first positional repr={repr(args[0])[:600]}", flush=True)
+        else:
+            print("[CLARO-DURATION] first positional type=<none>", flush=True)
+            print("[CLARO-DURATION] first positional repr=<none>", flush=True)
+    except Exception as _e:
+        print(f"[CLARO-DURATION] raw shape inspect failed: {_e}", flush=True)
     # Normalize FIRST: one flat config dict from any packing shape.
     # (The v2 gateway hands this callable the raw body envelope, not the
     # parameter-mapped endpoint args — reading .get() off the raw object is
     # what silently fell back to epochs=3 / max_steps=None.)
+    # Candidate scan, in historical priority order: an explicitly passed
+    # value first, then each positional in order, then the kwargs mapping.
+    # A single positional Mapping/dict is normalized DIRECTLY
+    # (normalized = dict(args[0])). The first candidate yielding a non-empty
+    # config wins; anything unusable is skipped, never fatal.
+    _candidates = []
     if train_request_json is not None:
-        _raw_in = train_request_json
-    elif _kwargs:
-        _raw_in = _kwargs
-    elif args:
-        _raw_in = args[0] if len(args) == 1 else list(args)
-    else:
-        _raw_in = None
-    obj = normalize_duration_request(_raw_in)
+        _candidates.append(train_request_json)
+    _candidates.extend(args)
+    if _kwargs:
+        _candidates.append(_kwargs)
+    obj = {}
+    for _cand in _candidates:
+        try:
+            _cfg = normalize_duration_request(_cand)
+        except Exception:
+            continue
+        if _cfg:
+            obj = _cfg
+            break
     # TEMP-DIAG (item 10): normalized values BEFORE any calculation.
     try:
         print(f"[CLARO-DURATION] normalized keys={sorted(obj.keys())} "

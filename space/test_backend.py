@@ -546,6 +546,73 @@ class TrainGpuDurationTest(unittest.TestCase):
         self.assertEqual(self._dur({"train_request_json": _json.dumps(full)}), 240)
         self.assertEqual(self._dur({"data": [full]}), 240)
 
+    def test_single_positional_dict_is_used_directly(self):
+        # REGRESSION for the observed runtime shape: Spaces invokes the
+        # duration callable with ONE positional Mapping argument. It must be
+        # normalized directly — never skipped in favor of defaults.
+        # _train_gpu_duration({
+        #     "epochs": 2, "max_steps": 100, ...
+        # }) must use those values (240s), NOT max_steps=None / epochs=3 (540s).
+        full = {"model_id": "distilbert-base-uncased", "dataset_id": "stanfordnlp/imdb",
+                "task_type": "text-classification", "epochs": 2, "batch_size": 8,
+                "learning_rate": 0.00002, "validation_split": 10, "max_samples": 5000,
+                "max_steps": 100, "training_method": "full",
+                "lora_r": 8, "lora_alpha": 16, "lora_dropout": 0.05,
+                "target_modules": "auto", "job_id": "train_0123456789ab"}
+        self.assertEqual(self._dur(dict(full)), 240)
+        # ...including when further junk channels are also present: the usable
+        # positional mapping still wins over empty/absence elsewhere.
+        import train_api
+        cfg = train_api.normalize_duration_request(dict(full))
+        self.assertEqual(cfg.get("epochs"), 2)
+        self.assertEqual(cfg.get("max_steps"), 100)
+
+    def test_python_dict_repr_string_uses_values(self):
+        # REGRESSION for the observed runtime shape: the whole request arrives
+        # as a SINGLE-QUOTED Python-dict representation (not JSON, not a
+        # Mapping). json.loads can never parse it; ast.literal_eval must.
+        # Observed: "{'model_id': ..., 'epochs': 2, 'max_steps': 100, ...}"
+        # must yield epochs=2 / max_steps=100 (240s), never defaults (540s).
+        full = {"model_id": "distilbert-base-uncased", "dataset_id": "stanfordnlp/imdb",
+                "task_type": "text-classification", "epochs": 2, "batch_size": 8,
+                "learning_rate": 0.00002, "validation_split": 10, "max_samples": 5000,
+                "max_steps": 100, "training_method": "full",
+                "lora_r": 8, "lora_alpha": 16, "lora_dropout": 0.05,
+                "target_modules": "auto", "job_id": "train_0123456789ab"}
+        s = repr(full)
+        self.assertIn("'", s)
+        self.assertNotIn('"', s.replace("train_", ""))
+        # every channel carrying the repr string resolves identically
+        self.assertEqual(self._dur(s), 240)
+        self.assertEqual(self._dur(None, s), 240)
+        self.assertEqual(self._dur(train_request_json=s), 240)
+        self.assertEqual(self._dur({"train_request_json": s}), 240)
+        # double-encoded JSON string also resolves
+        import json as _json
+        self.assertEqual(self._dur(_json.dumps(_json.dumps(full))), 240)
+
+    def test_malformed_strings_fall_back_safely(self):
+        self.assertEqual(self._dur("not a dict {{{{"), 540)
+        self.assertEqual(self._dur(""), 540)
+        self.assertEqual(self._dur("['just', 'a', 'list']"), 540)
+        self.assertEqual(self._dur("{'epochs': }"), 540)
+
+    def test_none_max_steps_in_repr_uses_epochs(self):
+        none_cfg = {"model_id": "m", "dataset_id": "d", "task_type": "text-classification",
+                    "epochs": 2, "max_steps": None}
+        self.assertEqual(self._dur(repr(none_cfg)), 390)
+        self.assertEqual(self._dur(none_cfg), 390)
+
+    def test_positional_junk_falls_through_to_usable_kwargs(self):        # A non-config first positional (e.g. a request-context object) must
+        # not poison extraction: scanning continues to kwargs. (Note: passing
+        # the SAME parameter both positionally and by keyword is a TypeError
+        # in Python itself, so the junk case necessarily uses other key names
+        # for kwargs — exactly the shape this guards.)
+        import train_api
+        gold = {"epochs": 2, "max_steps": 100}
+        self.assertEqual(
+            train_api._train_gpu_duration(object(), **dict(gold)), 240)
+
     def test_duration_matrix_max_steps_by_epochs(self):
         # max_steps x epochs matrix over the full runtime shape.
         # 5 -> floor 120; 100 -> 240; None -> epochs*100 fallback.
@@ -561,6 +628,9 @@ class TrainGpuDurationTest(unittest.TestCase):
             self.assertEqual(self._dur(cfg(100, ep)), 240, f"max_steps=100 epochs={ep}")
             self.assertEqual(self._dur({"train_request_json": cfg(100, ep)}), 240,
                              f"envelope max_steps=100 epochs={ep}")
+            # The exact observed Spaces shape: single positional full dict.
+            self.assertEqual(self._dur(dict(cfg(100, ep))), 240,
+                             f"positional max_steps=100 epochs={ep}")
         self.assertEqual(self._dur(cfg(None, 1)), 240)   # 90 + 100*1.5
         self.assertEqual(self._dur(cfg(None, 2)), 390)   # 90 + 200*1.5
         self.assertEqual(self._dur(cfg(None, 3)), 540)   # 90 + 300*1.5

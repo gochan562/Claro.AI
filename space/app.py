@@ -346,6 +346,19 @@ def _train_gpu_duration_traced(train_request_json=None, *args, **_kwargs):
 
 @spaces.GPU(duration=_train_gpu_duration_traced)
 def _gpu_train(train_request_json=None, *args, **kwargs):
+    # TEMP-DIAG [CLARO-TRAIN-REQ]: exact call shape at the Gradio boundary,
+    # BEFORE any parsing/unpacking. Prints only — inputs, outputs, duration
+    # wiring and training behavior are unchanged.
+    try:
+        print("[CLARO-TRAIN-REQ]", flush=True)
+        print(f"args type={type(args).__name__}", flush=True)
+        print(f"args repr={repr(args)[:2000]}", flush=True)
+        print(f"kwargs keys={sorted(kwargs.keys()) if kwargs else []}", flush=True)
+        if len(args) == 1:
+            print(f"single positional arg type={type(args[0]).__name__}", flush=True)
+            print(f"single positional arg repr={repr(args[0])[:2000]}", flush=True)
+    except Exception as _e:
+        print(f"[CLARO-TRAIN-REQ] inspect failed: {_e}", flush=True)
     yield from train_fn(_unpack_request(train_request_json, args, kwargs))
 
 

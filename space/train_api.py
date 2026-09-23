@@ -298,6 +298,51 @@ def unpack_request(train_request_json=None, args=(), kwargs=None):
     return None
 
 
+def _normalize_train_request(raw):
+    """Fold every observed runtime packing into ONE dict, exactly once.
+
+    Accepted (all equivalent — the v2 gateway / Spaces runtime hands the
+    endpoint any of these for the same logical request):
+      * plain config dict, or its JSON string            (shapes A/B)
+      * {"train_request_json": {...}} envelope, as a dict, a JSON string,
+        or a single-quoted Python-dict repr string        (shape D)
+      * {"data": [{...}]} Gradio predict-style payload
+      * a list/tuple containing a config-like dict
+    Returns the dict on success (``{}`` only when the input itself is
+    absent/None, preserving the legacy ``validate({})`` path), or None when
+    the input is present but fundamentally unparseable (caller reports
+    "request is not valid JSON").
+
+    Never uses eval(): strings go through json.loads first, then the bounded
+    ast.literal_eval fallback in _deep_parse_json. Envelope/data wrappers
+    unfold only when they yield a dict; otherwise the original dict is kept
+    so validation reports the same field error as before.
+    """
+    if raw is None:
+        return {}
+    cur = _deep_parse_json(raw)
+    if isinstance(cur, dict):
+        if "train_request_json" in cur:
+            inner = _deep_parse_json(cur["train_request_json"])
+            if isinstance(inner, dict):
+                return inner
+            # else: fall through — validate reports the field error as before
+        if "data" in cur and isinstance(cur["data"], (list, tuple)):
+            for item in cur["data"]:
+                cand = _deep_parse_json(item)
+                if isinstance(cand, dict):
+                    return cand
+            # else: fall through — validate reports the field error as before
+        return cur
+    if isinstance(cur, (list, tuple)):
+        for item in cur:
+            cand = _deep_parse_json(item)
+            if isinstance(cand, dict):
+                return cand
+        return None
+    return None
+
+
 # ── Request validation (mirrors training_backend.validateTrainingRequest) ──
 _ID_RE = re.compile(r'^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?$')
 _JOB_RE = re.compile(r'^train_[a-f0-9]{12}$')
@@ -595,30 +640,20 @@ def train(train_request_json: str):
     normally (bare `return`): never `return (tuple)`, whose StopIteration
     value Gradio's iterator handling discards.
     """
-    # DIAGNOSTIC (items 2-3): immediately before endpoint work begins — the
-    # exact max_steps/epochs the worker sees (compare with what the duration
-    # callable saw; any mismatch means packing divergence between the two).
+    # TEMP-DIAG [CLARO-TRAIN-REQ]: exact value received by train() BEFORE
+    # request parsing. Prints only.
     try:
-        _dbg = json.loads(train_request_json) if isinstance(train_request_json, str) else train_request_json
-        if not isinstance(_dbg, dict):
-            _dbg = {}
-        print(f"[CLARO-DURATION] request max_steps={_dbg.get('max_steps', _dbg.get('maxSteps', '(absent)'))!r}", flush=True)
-        _dbg_steps = _dbg.get("max_steps", _dbg.get("maxSteps"))
-        try:
-            _dbg_steps = int(_dbg_steps) if _dbg_steps not in (None, "") else None
-        except Exception:
-            _dbg_steps = None
-        try:
-            _dbg_epochs = max(1, int(_dbg.get("epochs", 3)))
-        except Exception:
-            _dbg_epochs = 3
-        print(f"[CLARO-DURATION] total_steps={_dbg_steps if _dbg_steps else _dbg_epochs * 100}", flush=True)
-        print(f"[CLARO-DURATION] computed_duration={int(90 + (_dbg_steps if _dbg_steps else _dbg_epochs * 100) * 1.5)}", flush=True)
+        print("[CLARO-TRAIN-REQ]", flush=True)
+        print(f"request_json type={type(train_request_json).__name__}", flush=True)
+        print(f"request_json repr={repr(train_request_json)[:2000]}", flush=True)
     except Exception as _e:
-        print(f"[CLARO-DURATION] endpoint-entry inspect failed: {_e}", flush=True)
-    try:
-        obj = json.loads(train_request_json) if isinstance(train_request_json, str) else train_request_json
-    except Exception:
+        print(f"[CLARO-TRAIN-REQ] inspect failed: {_e}", flush=True)
+    # Normalize EXACTLY ONCE into the dict the worker validates: plain dict
+    # and JSON-string shapes behave exactly as before; envelope / "data" /
+    # Python-repr packings from the live v2 runtime now fold to the same dict
+    # instead of failing with "request is not valid JSON". Never eval().
+    obj = _normalize_train_request(train_request_json)
+    if obj is None:
         manifest = {"job_id": None, "status": "failed", "error": "training_error",
                     "message": "request is not valid JSON"}
         # Terminal output MUST be yielded (not returned): Gradio emits each
@@ -628,6 +663,25 @@ def train(train_request_json: str):
         # discard — so `return (manifest, file)` loses the manifest.
         yield json.dumps(manifest), None
         return
+
+    # Worker-seen max_steps/epochs from the NORMALIZED dict (compare with what
+    # the duration callable saw; any mismatch means packing divergence between
+    # the two). Prints only — duration calculation itself is untouched.
+    try:
+        print(f"[CLARO-DURATION] request max_steps={obj.get('max_steps', obj.get('maxSteps', '(absent)'))!r}", flush=True)
+        _dbg_steps = obj.get("max_steps", obj.get("maxSteps"))
+        try:
+            _dbg_steps = int(_dbg_steps) if _dbg_steps not in (None, "") else None
+        except Exception:
+            _dbg_steps = None
+        try:
+            _dbg_epochs = max(1, int(obj.get("epochs", 3)))
+        except Exception:
+            _dbg_epochs = 3
+        print(f"[CLARO-DURATION] total_steps={_dbg_steps if _dbg_steps else _dbg_epochs * 100}", flush=True)
+        print(f"[CLARO-DURATION] computed_duration={int(90 + (_dbg_steps if _dbg_steps else _dbg_epochs * 100) * 1.5)}", flush=True)
+    except Exception as _e:
+        print(f"[CLARO-DURATION] endpoint-entry inspect failed: {_e}", flush=True)
 
     cfg, err = validate_train_request(obj if isinstance(obj, dict) else {})
     if err:

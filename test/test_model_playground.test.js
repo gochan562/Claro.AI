@@ -124,9 +124,9 @@ test('9. Run Test does NOT send an arbitrary artifact_path', () => {
   assert(!bodySnippet.includes('adapter_path'), 'must not send adapter_path in body');
   assert(!bodySnippet.includes('model_path'), 'must not send model_path in body');
   assert(!bodySnippet.includes('artifact_dir'), 'must not send artifact_dir in body');
-  // server must derive from job_id
+  // server must derive from job_id (durably: async rehydration from Hub reference)
   const serverContent = fs.readFileSync(serverPath, 'utf8');
-  assert(serverContent.includes("trainingBackend.getArtifactMetadata(String(job_id).trim())"));
+  assert(serverContent.includes("trainingBackend.getArtifactMetadataAsync(String(job_id).trim())"));
   assert(serverContent.includes("// Use artifact metadata to derive paths — never use client-provided paths"));
 });
 

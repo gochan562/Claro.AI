@@ -499,9 +499,9 @@ app.post('/api/train/stop/:job_id', (req, res) => {
   return res.json({ job_id: stopped.job_id, status: stopped.status, message: 'Job stopped' });
 });
 
-app.get('/api/train/artifacts/:job_id', (req, res) => {
+app.get('/api/train/artifacts/:job_id', async (req, res) => {
   try {
-    const meta = trainingBackend.getArtifactMetadata(req.params.job_id);
+    const meta = await trainingBackend.getArtifactMetadataAsync(req.params.job_id);
     return res.json(meta);
   } catch (err) {
     const status = err.status || 500;
@@ -515,7 +515,7 @@ app.post('/api/inference/trained', strictLimiter, async (req, res) => {
   if (!job_id) return res.status(400).json({ error: 'job_id is required', code: 'bad_request' });
   let meta;
   try {
-    meta = trainingBackend.getArtifactMetadata(String(job_id).trim());
+    meta = await trainingBackend.getArtifactMetadataAsync(String(job_id).trim());
   } catch (err) {
     const status = err.status || 500;
     const code = err.code || 'artifact_error';

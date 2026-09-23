@@ -37,23 +37,27 @@ import train_api
 
 
 def _valid_request(job_id):
-    return json.dumps({
+    return json.dumps(_valid_config(job_id))
+
+
+def _valid_config(job_id):
+    return {
         "model_id": "distilbert-base-uncased",
         "dataset_id": "stanfordnlp/imdb",
         "task_type": "text-classification",
-        "epochs": 1,
+        "epochs": 2,
         "batch_size": 8,
         "learning_rate": 0.00002,
         "validation_split": 10,
         "max_samples": 100,
-        "max_steps": None,
+        "max_steps": 7,
         "training_method": "full",
         "lora_r": 8,
         "lora_alpha": 16,
         "lora_dropout": 0.05,
         "target_modules": "auto",
         "job_id": job_id,
-    })
+    }
 
 
 def _stub_worker_ok(line_q=None, metrics_count=1):
@@ -202,6 +206,131 @@ class TrainTerminalContractTest(unittest.TestCase):
         self.assertEqual(manifest.get("status"), "failed")
         self.assertIn("artifact packaging failed", manifest.get("message", ""))
         self.assertIsNone(f)
+
+
+class TrainRequestShapeTest(unittest.TestCase):
+    """Regression coverage for: "request is not valid JSON".
+
+    The live /call/v2/train client POSTs ``{"train_request_json": {...}}``
+    (training_backend.js payload), but the Spaces runtime hands the endpoint
+    that same logical request in several packings: envelope dict, JSON
+    string, single-quoted Python-repr string, or mapped kwargs. All must fold
+    to one dict via a single normalization (never eval()). Plain dict and
+    JSON-string shapes keep their exact legacy behavior.
+    """
+
+    def tearDown(self):
+        for jid in getattr(self, "_job_ids", []):
+            for p in (os.path.join(tempfile.gettempdir(), f"claro_train_{jid}"),
+                      os.path.join(tempfile.gettempdir(), f"claro_train_{jid}.zip")):
+                shutil.rmtree(p, ignore_errors=True)
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+    def _track(self, job_id):
+        self._job_ids = getattr(self, "_job_ids", []) + [job_id]
+
+    def _run_shapes(self, make_request, job_id, stub=None):
+        """Drive one live packing through the Gradio harness; return
+        (manifest_dict, complete_file, worker_cfg)."""
+        self._track(job_id)
+        seen = {}
+        real_stub = stub or _stub_worker_ok()
+
+        def _capture(cfg, out_dir, line_q, stop_flag):
+            seen.update(cfg)
+            return real_stub(cfg, out_dir, line_q, stop_flag)
+
+        with patch.object(train_api, "train_worker", _capture):
+            _gen, complete, stop_value = collect_gradio(make_request())
+        self.assertIsNone(stop_value, "terminal output must be yielded, not returned")
+        manifest_str, f = complete
+        return json.loads(manifest_str), f, seen
+
+    def _assert_live_success(self, manifest, f, seen, cfg):
+        self.assertEqual(manifest.get("status"), "finished")
+        self.assertEqual(manifest.get("job_id"), cfg["job_id"])
+        self.assertTrue(manifest.get("files"))
+        self.assertIsInstance(f, str)
+        self.assertTrue(os.path.exists(f))
+        # Normalized worker fields match the sent request exactly.
+        for k in ("model_id", "dataset_id", "task_type", "epochs",
+                  "batch_size", "max_steps"):
+            self.assertEqual(seen.get(k), cfg[k], f"normalized field {k}")
+
+    def test_live_envelope_dict_shape(self):
+        # Exact POST body training_backend.js sends, as a positional dict.
+        cfg = _valid_config("train_222222222222")
+        m, f, seen = self._run_shapes(
+            lambda: {"train_request_json": dict(cfg)}, cfg["job_id"])
+        self._assert_live_success(m, f, seen, cfg)
+
+    def test_live_envelope_json_string_shape(self):
+        cfg = _valid_config("train_333333333333")
+        body = json.dumps({"train_request_json": cfg})
+        m, f, seen = self._run_shapes(lambda: body, cfg["job_id"])
+        self._assert_live_success(m, f, seen, cfg)
+
+    def test_live_envelope_repr_string_shape(self):
+        # Observed runtime shape: single-quoted Python-dict repr, which
+        # json.loads alone rejects (the reported "not valid JSON" failure).
+        cfg = _valid_config("train_444444444444")
+        body = repr({"train_request_json": cfg})
+        self.assertIn("'", body)
+        m, f, seen = self._run_shapes(lambda: body, cfg["job_id"])
+        self._assert_live_success(m, f, seen, cfg)
+
+    def test_live_kwargs_shape_via_unpack(self):
+        # v2 gateway fn(**body): unpack_request maps kwargs -> endpoint value.
+        cfg = _valid_config("train_555555555555")
+        unpacked = train_api.unpack_request(
+            None, (), {"train_request_json": dict(cfg)})
+        m, f, seen = self._run_shapes(lambda: unpacked, cfg["job_id"])
+        self._assert_live_success(m, f, seen, cfg)
+
+    def test_plain_shapes_unchanged(self):
+        # Legacy compat: bare config dict and bare JSON config string.
+        for jid in ("train_666666666666", "train_777777777777"):
+            cfg = _valid_config(jid)
+            raw = cfg if jid.endswith("66") else json.dumps(cfg)
+            m, f, seen = self._run_shapes(lambda r=raw: r, jid)
+            self._assert_live_success(m, f, seen, cfg)
+
+    def test_normalize_never_uses_eval(self):
+        import ast as _ast
+        tree = _ast.parse(__import__("inspect").getsource(train_api._normalize_train_request))
+        called = {n.func.id for n in _ast.walk(tree)
+                  if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name)}
+        self.assertTrue(called.isdisjoint({"eval", "exec", "compile"}),
+                        f"forbidden calls: {called & {'eval', 'exec', 'compile'}}")
+        # A hostile repr must not execute: literal_eval rejects calls.
+        self.assertIsNone(train_api._normalize_train_request(
+            "{'x': __import__('os').system('x')}"))
+        # ...and the endpoint turns it into the safe invalid-JSON manifest.
+        _gen, complete, _stop = collect_gradio("{'x': 1}))){{{")
+        manifest = json.loads(complete[0])
+        self.assertEqual(manifest.get("status"), "failed")
+
+    def test_garbage_string_still_invalid_json(self):
+        _gen, complete, stop_value = collect_gradio("{{{not json")
+        self.assertIsNone(stop_value)
+        manifest = json.loads(complete[0])
+        self.assertEqual(manifest.get("status"), "failed")
+        self.assertIn("not valid JSON", manifest.get("message", ""))
+
+    def test_normalized_keys_printed(self):
+        # Prints the normalized keys + confirms the six required fields.
+        cfg = _valid_config("train_888888888888")
+        m, f, seen = self._run_shapes(
+            lambda: {"train_request_json": dict(cfg)}, cfg["job_id"])
+        print(f"\nnormalized request keys={sorted(seen.keys())}", flush=True)
+        for k in ("model_id", "dataset_id", "task_type", "epochs",
+                  "batch_size", "max_steps"):
+            print(f"normalized {k}={seen.get(k)!r}", flush=True)
+            self.assertIn(k, seen)
+        self.assertEqual(m.get("status"), "finished")
 
 
 if __name__ == "__main__":

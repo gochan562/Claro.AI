@@ -297,6 +297,11 @@ function createJob(config, ownerUserId = null) {
     created_at: new Date().toISOString(),
     error: null,
     artifacts_dir: null,
+    // Durable artifact reference (Hub) + last manifest. The local
+    // _safeArtifactDir(job_id) directory is a CACHE; hub_path is the durable
+    // reference used to rehydrate it if the cache disappears.
+    hub_path: null,
+    manifest: null,
     _pythonProc: null,
     _aborted: false,
   };
@@ -367,6 +372,8 @@ function getArtifactMetadata(job_id) {
           config: diskMeta.config,
           artifacts_dir: dir,
           progress: diskMeta.progress || {},
+          hub_path: diskMeta.hub_path || (diskMeta.manifest && diskMeta.manifest.hub_path) || null,
+          manifest: diskMeta.manifest || null,
           user_id: diskMeta.user_id || null,
           owner: diskMeta.user_id || null,
         };
@@ -383,6 +390,13 @@ function getArtifactMetadata(job_id) {
   }
   // Use job.artifacts_dir if set, but verify it matches derived dir (prevent stale)
   const artifactDir = job.artifacts_dir && path.resolve(job.artifacts_dir) === dir ? job.artifacts_dir : dir;
+  // [ARTIFACT-DIAG] item 13-14: exact stored field vs exact checked path.
+  try {
+    console.error(`[ARTIFACT-DIAG] check job_id=${job_id}`);
+    console.error(`[ARTIFACT-DIAG] check job.artifacts_dir=${job.artifacts_dir}`);
+    console.error(`[ARTIFACT-DIAG] check path=${artifactDir}`);
+    console.error(`[ARTIFACT-DIAG] check exists=${fs.existsSync(artifactDir)}`);
+  } catch (_) {}
 
   if (!fs.existsSync(artifactDir) || !fs.statSync(artifactDir).isDirectory()) {
     throw Object.assign(new Error(`Artifact directory not found: ${artifactDir}`), { code: 'missing_artifact', status: 404 });
@@ -458,6 +472,188 @@ function getArtifactMetadata(job_id) {
       status: job.status,
     };
   }
+}
+
+// ── Durable artifact rehydration ──────────────────────────────────────────
+// The local _safeArtifactDir(job_id) directory is a CACHE; the Hub zip
+// referenced by manifest.hub_path ("<repo>:<path>", written by the Space's
+// _maybe_upload_to_hub) is the durable source of truth. If the cache
+// disappears (host restart, ephemeral disk, external deletion) while the
+// completed job still has a hub_path, the inference-ready check rehydrates
+// the cache automatically instead of failing permanently. The job is never
+// marked failed because of a lost cache. Path traversal protections
+// (_safeArtifactDir, hub repo/path validation, _extractZipBuffer) stay intact.
+
+// One in-flight rehydration per job so concurrent inference requests share
+// a single Hub download instead of stampeding it.
+const _rehydrateInflight = new Map();
+
+function _parseHubPath(hubPath) {
+  const s = String(hubPath || '').trim();
+  const i = s.indexOf(':');
+  if (i <= 0) return null;
+  const repo = s.slice(0, i).trim();
+  const file = s.slice(i + 1).trim().replace(/^\/+/, '');
+  if (!repo || !file) return null;
+  if (!/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(repo)) return null;
+  if (file.includes('..')) return null;
+  return { repo, file };
+}
+
+async function _downloadHubArtifact(hubPath, signal, timeoutMs = 120000) {
+  const parsed = _parseHubPath(hubPath);
+  if (!parsed) {
+    throw new ZeroGpuTrainError(`Invalid Hub artifact reference: ${String(hubPath).slice(0, 200)}`, 'missing_artifact', 404);
+  }
+  // Token (when configured) travels only in the Authorization header and is
+  // never logged. Secrets stay out of diagnostics and error strings.
+  const token = process.env.HF_TOKEN || process.env.HUGGING_FACE_HUB_TOKEN || '';
+  const url = `https://huggingface.co/datasets/${parsed.repo}/resolve/main/${parsed.file.split('/').map(encodeURIComponent).join('/')}`;
+  const headers = {};
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => { try { ctrl.abort(); } catch (_) {} }, timeoutMs);
+  const onAbort = () => { try { ctrl.abort(); } catch (_) {} };
+  if (signal) {
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  }
+  try {
+    const maxBytes = Number(process.env.ZEROGPU_TRAIN_MAX_ARTIFACT_BYTES || 2000000000);
+    const res = await fetch(url, { signal: ctrl.signal, headers });
+    const ct = (res.headers && typeof res.headers.get === 'function' && res.headers.get('content-type')) || 'unknown';
+    if (res.status === 404) {
+      const detail = await res.text().catch(() => '');
+      _logTrainHttp('GET', url, res.status, ct, detail);
+      throw new ZeroGpuTrainError(
+        `Hub artifact not found (HTTP 404, content-type=${ct}): ${parsed.repo}:${parsed.file}`,
+        'missing_artifact', 404);
+    }
+    if (!res.ok || !res.body) {
+      const detail = await res.text().catch(() => '');
+      _logTrainHttp('GET', url, res.status, ct, detail);
+      throw new ZeroGpuTrainError(
+        `Hub artifact download failed (HTTP ${res.status}, content-type=${ct}): ${detail.slice(0, 200)}`,
+        'artifact_error', res.status || 502);
+    }
+    const chunks = [];
+    let total = 0;
+    for await (const chunk of res.body) {
+      total += chunk.length;
+      if (total > maxBytes) throw new ZeroGpuTrainError(`Hub artifact exceeds size limit (${maxBytes} bytes).`, 'artifact_error', 502);
+      chunks.push(Buffer.from(chunk));
+    }
+    const buf = Buffer.concat(chunks);
+    if (!buf.length) throw new ZeroGpuTrainError('Hub artifact is empty.', 'artifact_error', 502);
+    const headText = buf.subarray(0, 500).toString('utf8');
+    _logTrainHttp('GET', url, res.status, ct, `${headText} (… ${total} bytes total)`);
+    if (_looksLikeHtml(headText, ct)) {
+      throw new ZeroGpuTrainError(
+        `Hub artifact URL returned HTML instead of a zip (HTTP ${res.status}, content-type=${ct}).`,
+        'artifact_error', 502);
+    }
+    return buf;
+  } catch (err) {
+    if (err instanceof ZeroGpuTrainError) throw err;
+    if (err && err.name === 'AbortError') throw new ZeroGpuTrainError('Hub artifact download timed out.', 'artifact_error', 504);
+    throw new ZeroGpuTrainError(`Hub artifact download failed: ${(err && err.message) || err}`, 'artifact_error', 502);
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onAbort);
+  }
+}
+
+function _hubPathOf(id) {
+  try {
+    const j = jobs.get(id);
+    if (j) return j.hub_path || (j.manifest && j.manifest.hub_path) || null;
+    const p = path.join(_safeArtifactDir(id), 'job.json');
+    if (fs.existsSync(p)) {
+      const d = JSON.parse(fs.readFileSync(p, 'utf8'));
+      return d.hub_path || (d.manifest && d.manifest.hub_path) || null;
+    }
+  } catch (_) {}
+  return null;
+}
+
+function _logArtifactRehydrate(job_id, local_exists, hub_path, attempted, result, final_dir) {
+  try {
+    console.error(`[ARTIFACT-DIAG] rehydrate job_id=${job_id} local_exists=${local_exists} hub_path=${hub_path || 'none'} rehydration_attempted=${attempted} rehydration_result=${result} final_artifact_dir=${final_dir}`);
+  } catch (_) {}
+}
+
+async function _rehydrateJobFromHub(id, dir, hubPath, job) {
+  const zipBuf = await _downloadHubArtifact(hubPath, null);
+  fs.mkdirSync(dir, { recursive: true });
+  const names = _extractZipBuffer(zipBuf, dir);
+  // Durable record only: rewrite job.json (NOT metrics/logs — the extracted
+  // metrics.json from the Space is authoritative and in-memory metrics may
+  // be absent after a restart).
+  try {
+    fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
+      job_id: id,
+      status: job.status,
+      config: job.config,
+      progress: job.progress,
+      error: job.error || null,
+      hub_path: job.hub_path || hubPath,
+      manifest: job.manifest || null,
+      user_id: job.user_id || job.owner || null,
+    }, null, 2));
+  } catch (_) {}
+  job.artifacts_dir = dir;
+  if (!job.hub_path) job.hub_path = hubPath;
+  return names;
+}
+
+// Inference-ready check with durable rehydration. Fast path delegates to the
+// unchanged sync getArtifactMetadata (local cache hit). If the cache is gone
+// but the finished job has a hub_path, the cache is rehydrated from the Hub
+// into _safeArtifactDir(job_id) and the normal check re-runs — so later
+// requests hit the local cache and never download again. The job status is
+// never mutated here: a lost cache is not a training failure.
+async function getArtifactMetadataAsync(job_id) {
+  const id = String(job_id || '').trim();
+  try {
+    const meta = getArtifactMetadata(id);
+    _logArtifactRehydrate(id, true, _hubPathOf(id), false, 'cache-hit', meta.artifact_dir);
+    return meta;
+  } catch (err) {
+    if (!err || err.code !== 'missing_artifact' || !/Artifact directory not found/.test(String((err && err.message) || ''))) throw err;
+  }
+  const dir = _safeArtifactDir(id); // validates job_id format / traversal
+  const job = jobs.get(id) || null;
+  if (!job) {
+    _logArtifactRehydrate(id, false, null, false, 'unavailable-no-record', dir);
+    throw Object.assign(new Error(`Artifact unavailable for job ${id}: local cache missing at ${dir} and no completed job record to rehydrate from.`), { code: 'missing_artifact', status: 404 });
+  }
+  if (job.status !== 'finished') {
+    _logArtifactRehydrate(id, false, _hubPathOf(id), false, 'not-finished', dir);
+    throw Object.assign(new Error(`Job not finished (status=${job.status})`), { code: 'job_not_finished', status: 400 });
+  }
+  const hubPath = job.hub_path || (job.manifest && job.manifest.hub_path) || null;
+  if (!hubPath) {
+    _logArtifactRehydrate(id, false, null, false, 'unavailable-no-hub-path', dir);
+    throw Object.assign(new Error(`Artifact unavailable for job ${id}: local cache missing at ${dir} and no Hub reference (hub_path) to rehydrate from.`), { code: 'missing_artifact', status: 404 });
+  }
+  let inflight = _rehydrateInflight.get(id);
+  let rehErr = null;
+  if (!inflight) {
+    inflight = _rehydrateJobFromHub(id, dir, hubPath, job);
+    _rehydrateInflight.set(id, inflight);
+    try { await inflight; } catch (e) { rehErr = e; } finally { _rehydrateInflight.delete(id); }
+  } else {
+    try { await inflight; } catch (e) { rehErr = e; }
+  }
+  if (rehErr) {
+    const msg = String((rehErr && rehErr.message) || rehErr).slice(0, 300);
+    _logArtifactRehydrate(id, false, hubPath, true, `failed:${msg.slice(0, 120)}`, dir);
+    throw Object.assign(new Error(`Artifact unavailable for job ${id}: local cache missing and Hub rehydration failed: ${msg}`), { code: (rehErr && rehErr.code) || 'artifact_error', status: (rehErr && rehErr.status) || 502 });
+  }
+  // Recheck: full file validation against the rehydrated local cache.
+  const meta = getArtifactMetadata(id);
+  _logArtifactRehydrate(id, false, hubPath, true, 'success', meta.artifact_dir);
+  return meta;
 }
 
 function listJobs() {
@@ -911,6 +1107,21 @@ function _looksLikeHtml(raw, contentType) {
   return s.startsWith('<');
 }
 
+// ── [TRAIN-SSE] per-frame diagnostics ─────────────────────────────────────
+// Prints EVERY SSE frame from the ZeroGPU event stream without consuming or
+// altering it (diagnostic only — parsing behavior is unchanged):
+//   [TRAIN-SSE]
+//   event=<generating|complete|error|heartbeat|unknown>
+//   raw_data=<first 2000 chars of the frame data payload>
+// Secrets/tokens never appear in SSE frames; only length is truncated.
+function _logTrainSse(event, rawData) {
+  try {
+    console.error(`[TRAIN-SSE]`);
+    console.error(`event=${event || 'unknown'}`);
+    console.error(`raw_data=${String(rawData || '').slice(0, 2000)}`);
+  } catch (_) {}
+}
+
 async function _postZeroGpuFn(apiBase, fnName, body, signal, token, timeoutMs = 30000) {
   const url = `${apiBase}/call/v2/${fnName}`;
   const ctrl = new AbortController();
@@ -988,7 +1199,7 @@ async function _postZeroGpuFn(apiBase, fnName, body, signal, token, timeoutMs = 
 // is invoked for every `generating` frame. Resolves with the `complete`
 // frame's data array. Throws ZeroGpuTrainError on `error` frames or a stream
 // that closes without completing.
-async function _fetchZeroGpuSse(apiBase, fnName, eventId, signal, token, onGenerating) {
+async function _fetchZeroGpuSse(apiBase, fnName, eventId, signal, token, onGenerating, sseTrace) {
   const { Readable } = require('stream');
   const url = `${apiBase}/call/${fnName}/${encodeURIComponent(eventId)}`;
   const headers = {};
@@ -1027,9 +1238,27 @@ async function _fetchZeroGpuSse(apiBase, fnName, eventId, signal, token, onGener
   let errMsg = '';
   let streamHead = '';
   let streamHeadLogged = false;
+  // Per-frame trace for [TRAIN-SSE] (diagnostic only — no behavior change).
+  // Optional caller-supplied collector; filled on every frame AND before each
+  // throw/return so the caller can answer: error seen? complete seen? what was
+  // the final complete payload? Caller: _startZeroGPUTraining passes one in;
+  // cancel_train passes none (trace stays local-only).
+  const trace = sseTrace && typeof sseTrace === 'object' ? sseTrace : null;
+  const _sseFlags = { sawGenerating: false, sawComplete: false, sawError: false, sawHeartbeat: false, sawUnknown: false, frameCount: 0, finalCompleteRaw: '', firstErrorRaw: '' };
+  const _commitTrace = () => { if (trace) { try { Object.assign(trace, _sseFlags); } catch (_) {} } };
+  const _knownSse = { generating: 1, complete: 1, error: 1, heartbeat: 1 };
 
   const handleFrame = () => {
     if (!eventType) return null;
+    // [TRAIN-SSE] trace every SSE frame BEFORE handling it.
+    _sseFlags.frameCount++;
+    if (eventType === 'generating') _sseFlags.sawGenerating = true;
+    else if (eventType === 'complete') { _sseFlags.sawComplete = true; _sseFlags.finalCompleteRaw = dataBuf; }
+    else if (eventType === 'error') { _sseFlags.sawError = true; if (!_sseFlags.firstErrorRaw) _sseFlags.firstErrorRaw = dataBuf; }
+    else if (eventType === 'heartbeat') _sseFlags.sawHeartbeat = true;
+    else _sseFlags.sawUnknown = true;
+    _logTrainSse(_knownSse[eventType] ? eventType : 'unknown', dataBuf);
+    _commitTrace();
     if (eventType === 'complete') {
       try {
         const parsed = JSON.parse(dataBuf);
@@ -1085,6 +1314,7 @@ async function _fetchZeroGpuSse(apiBase, fnName, eventId, signal, token, onGener
         streamHeadLogged = true;
         _logTrainHttp('GET', url, res.status, sseContentType, streamHead);
         if (_looksLikeHtml(streamHead, sseContentType) && !streamHead.includes('event:')) {
+          _commitTrace();
           throw new ZeroGpuTrainError(
             `ZeroGPU stream returned non-SSE HTML (HTTP ${res.status}, content-type=${sseContentType}, body=${_trainHttpSnippet(streamHead)}). ` +
             `Possible sources: (A) HF Space page, (B) 404/405/500/502 page, (C) Replit/proxy page, (D) Gradio endpoint/path mismatch, (E) app startup/restart page.`,
@@ -1106,7 +1336,19 @@ async function _fetchZeroGpuSse(apiBase, fnName, eventId, signal, token, onGener
       }
       if (line.startsWith('event:')) eventType = line.slice(6).trim();
       else if (line.startsWith('data:')) dataBuf = line.slice(5).trim();
-      else if (line.endsWith(': heartbeat')) { /* keep-alive, ignored */ }
+      else if (line.endsWith(': heartbeat') || line.startsWith(':')) {
+        // Gradio keep-alive (bare `: heartbeat` comment line) — log, ignore.
+        _sseFlags.frameCount++;
+        _sseFlags.sawHeartbeat = true;
+        _logTrainSse('heartbeat', line);
+        _commitTrace();
+      } else {
+        // Non-SSE line inside the stream (e.g. proxy noise) — log, ignore.
+        _sseFlags.frameCount++;
+        _sseFlags.sawUnknown = true;
+        _logTrainSse('unknown', line);
+        _commitTrace();
+      }
     }
   }
   // Flush a final frame if the stream ended without a trailing blank line.
@@ -1118,6 +1360,7 @@ async function _fetchZeroGpuSse(apiBase, fnName, eventId, signal, token, onGener
   if (!streamHeadLogged) {
     _logTrainHttp('GET', url, res.status, sseContentType, streamHead || buffer);
   }
+  _commitTrace();
   if (hadError) throw _classifyZeroGpuErrorFrame(errMsg);
   {
     const tailSnippet = _trainHttpSnippet(streamHead || buffer || dataBuf);
@@ -1125,7 +1368,7 @@ async function _fetchZeroGpuSse(apiBase, fnName, eventId, signal, token, onGener
       ? ' Body looks like HTML (starts with \'<\'). Possible sources: (A) HF Space page, (B) 404/405/500/502 page, (C) Replit/proxy page, (D) Gradio endpoint/path mismatch, (E) app startup/restart page.'
       : '';
     throw new ZeroGpuTrainError(
-      `ZeroGPU stream closed without a complete frame (HTTP ${res.status}, content-type=${sseContentType}, body=${tailSnippet}).${htmlHint}`,
+      `ZeroGPU stream closed without a complete frame (incomplete_stream: sawComplete=${_sseFlags.sawComplete} sawError=${_sseFlags.sawError} sawGenerating=${_sseFlags.sawGenerating} frames=${_sseFlags.frameCount} HTTP ${res.status}, content-type=${sseContentType}, body=${tailSnippet}).${htmlHint}`,
       'malformed_response', 502);
   }
 }
@@ -1239,9 +1482,12 @@ function _zeroGpuFileCandidates(apiBase, file) {
   return out;
 }
 
-async function _downloadZeroGpuFile(apiBase, file, signal, token) {
+async function _downloadZeroGpuFile(apiBase, file, signal, token, diag) {
   const maxBytes = Number(process.env.ZEROGPU_TRAIN_MAX_ARTIFACT_BYTES || 2000000000);
   const candidates = _zeroGpuFileCandidates(apiBase, file);
+  // [ARTIFACT-DIAG] collector (optional, diagnostic only — no behavior change).
+  const _ad = diag && typeof diag === 'object' ? diag : null;
+  if (_ad) { try { _ad.candidates = candidates.slice(); } catch (_) {} }
   if (!candidates.length) throw new ZeroGpuTrainError('ZeroGPU finished but returned no downloadable artifact file.', 'missing_artifact', 502);
   let lastErr = null;
   let lastHttp = '';
@@ -1282,6 +1528,8 @@ async function _downloadZeroGpuFile(apiBase, file, signal, token) {
           `Possible sources: (A) HF Space page, (B) 404/405/500/502 page, (C) Replit/proxy page, (D) Gradio endpoint/path mismatch, (E) app startup/restart page.`);
         continue;
       }
+      // The URL below is the one whose bytes are actually consumed as the ZIP.
+      if (_ad) { try { _ad.okUrl = url; _ad.status = res.status; _ad.contentType = dlContentType; _ad.bytes = total; } catch (_) {} }
       return buf;
     } catch (err) {
       if (err instanceof ZeroGpuTrainError) throw err;
@@ -1373,14 +1621,31 @@ async function _requestZeroGpuCancel(apiBase, jobId, token) {
   }
 }
 
-function _finishZeroGpuJob(job, manifest, file) {
+function _finishZeroGpuJob(job, manifest, file, sseTrace) {
   if (job._remote && job._remote.timeout) { clearTimeout(job._remote.timeout); job._remote.timeout = null; }
   if (job._aborted) {
     _log(job, '[TRAIN] remote worker finished after cancel; results ignored');
     return Promise.resolve();
   }
   if (!manifest || manifest.status !== 'finished') {
-    _failZeroGpuJob(job, (manifest && manifest.message) || 'remote training failed without a manifest');
+    // The manifest carried a message (e.g. failed validation / worker error)
+    // — surface it verbatim. Otherwise use the [TRAIN-SSE] trace to answer
+    // WHY: actual error frame? rejected complete payload? or incomplete
+    // stream? Never collapse those distinct cases into one bare label.
+    let msg = manifest && manifest.message;
+    if (!msg) {
+      const t = sseTrace && typeof sseTrace === 'object' ? sseTrace : null;
+      if (t && t.sawError && t.firstErrorRaw) {
+        msg = `remote worker error frame: ${String(t.firstErrorRaw).slice(0, 500)}`;
+      } else if (t && t.sawComplete) {
+        msg = `remote training failed without a usable manifest (complete_raw=${String(t.finalCompleteRaw).slice(0, 500)} sawError=${!!t.sawError} frames=${t.frameCount || 0})`;
+      } else if (t && !t.sawComplete && !t.sawError) {
+        msg = `incomplete_stream: Space closed the stream without a complete or error frame (frames=${t.frameCount || 0} sawGenerating=${!!t.sawGenerating})`;
+      } else {
+        msg = 'remote training failed without a manifest';
+      }
+    }
+    _failZeroGpuJob(job, msg);
     return Promise.resolve();
   }
   if (!file) {
@@ -1390,7 +1655,16 @@ function _finishZeroGpuJob(job, manifest, file) {
   const { apiBase, token } = job._remote || {};
   const controller = new AbortController();
   if (job._remote) job._remote.downloadController = controller;
-  return _downloadZeroGpuFile(apiBase, file, controller.signal, token).then(
+  // [ARTIFACT-DIAG] items 1-6 up front (prints only — no behavior change).
+  try {
+    console.error(`[ARTIFACT-DIAG] job_id=${job.job_id}`);
+    console.error(`[ARTIFACT-DIAG] manifest=${JSON.stringify(manifest)}`);
+    console.error(`[ARTIFACT-DIAG] manifest.files=${JSON.stringify(manifest && manifest.files)}`);
+    console.error(`[ARTIFACT-DIAG] manifest.hub_path=${JSON.stringify(manifest && manifest.hub_path)}`);
+    console.error(`[ARTIFACT-DIAG] file=${JSON.stringify(file)}`);
+  } catch (_) {}
+  const adiag = { candidates: [], okUrl: null, status: null, contentType: null, bytes: 0 };
+  return _downloadZeroGpuFile(apiBase, file, controller.signal, token, adiag).then(
     (zipBuf) => {
       if (job._aborted) {
         _log(job, '[TRAIN] artifacts downloaded after cancel; results ignored');
@@ -1401,11 +1675,27 @@ function _finishZeroGpuJob(job, manifest, file) {
       const names = _extractZipBuffer(zipBuf, dir);
       _log(job, `[TRAIN] artifacts downloaded (${names.length} files) -> ${dir}`);
       job.artifacts_dir = dir;
+      // Durable reference: the manifest (incl. hub_path) survives with the
+      // job record and in job.json so a lost local cache can be rehydrated.
+      // Manifest schema itself is unchanged.
+      job.hub_path = (manifest && manifest.hub_path) || null;
+      job.manifest = manifest || null;
       job.end_time = _now();
       _setStatus(job, 'finished');
       _updateProgress(job, { gpu_status: 'idle', eta: 0, percent: 100 });
       _broadcast(job, 'done', { status: 'finished' });
       _saveArtifacts(job); // writes metrics.json / job.json / training_logs.txt alongside model files
+      // [ARTIFACT-DIAG] items 6-13 after extraction (prints only).
+      try {
+        console.error(`[ARTIFACT-DIAG] download_url=${adiag.okUrl}`);
+        console.error(`[ARTIFACT-DIAG] download_status=${adiag.status} content_type=${adiag.contentType}`);
+        console.error(`[ARTIFACT-DIAG] downloaded_bytes=${adiag.bytes}`);
+        console.error(`[ARTIFACT-DIAG] zip_entries=${JSON.stringify(names)}`);
+        console.error(`[ARTIFACT-DIAG] extract_dest=${dir}`);
+        console.error(`[ARTIFACT-DIAG] artifact_dir=${dir}`);
+        console.error(`[ARTIFACT-DIAG] dir_exists=${fs.existsSync(dir)}`);
+        console.error(`[ARTIFACT-DIAG] job.artifacts_dir=${job.artifacts_dir}`);
+      } catch (_) {}
     },
     (err) => {
       if (job._aborted) return;
@@ -1492,7 +1782,12 @@ function _startZeroGPUTraining(job) {
         console.error(`[TRAIN-HTTP] method=GET`);
         console.error(`[TRAIN-HTTP] URL=${remote.apiBase}/call/train/${encodeURIComponent(eventId)}`);
         console.error(`[TRAIN-HTTP] note=opening SSE stream (headers + first-chunk body logged inside _fetchZeroGpuSse)`);
+        console.error(`[TRAIN-HTTP] GET pattern check: uses /call/<endpoint>/<event_id> (no /v2) — matches HF pattern POST /gradio_api/call/v2/<endpoint> + GET /gradio_api/call/<endpoint>/<event_id>; NOT changed`);
       } catch (_) {}
+      // Per-frame trace collector: answers error-seen? complete-seen? what was
+      // the final complete payload? Filled by _fetchZeroGpuSse, read below and
+      // by _finishZeroGpuJob to explain any manifest rejection precisely.
+      const sseTrace = { sawGenerating: false, sawComplete: false, sawError: false, sawHeartbeat: false, sawUnknown: false, frameCount: 0, finalCompleteRaw: '', firstErrorRaw: '' };
       const data = await _fetchZeroGpuSse(remote.apiBase, 'train', eventId, controller.signal, remote.token, (frame) => {
         if (job._aborted) return;
         const first = Array.isArray(frame) ? frame[0] : frame;
@@ -1513,9 +1808,14 @@ function _startZeroGPUTraining(job) {
           _log(job, first); return;
         }
         _applyRemoteTrainEvent(job, ev);
-      });
+      }, sseTrace);
       // complete frame: [manifestJson, fileObj|null]
       const arr = Array.isArray(data) ? data : [data];
+      try {
+        console.error(`[TRAIN-SSE]`);
+        console.error(`event=summary`);
+        console.error(`raw_data=${JSON.stringify({ sawError: !!sseTrace.sawError, sawComplete: !!sseTrace.sawComplete, sawGenerating: !!sseTrace.sawGenerating, sawHeartbeat: !!sseTrace.sawHeartbeat, sawUnknown: !!sseTrace.sawUnknown, frames: sseTrace.frameCount }).slice(0, 2000)}`);
+      } catch (_) {}
       let manifest = null;
       try { manifest = typeof arr[0] === 'string' ? JSON.parse(arr[0]) : arr[0]; }
       catch (manErr) {
@@ -1530,7 +1830,7 @@ function _startZeroGPUTraining(job) {
         manifest = null;
       }
       const file = arr.length > 1 && arr[1] && typeof arr[1] === 'object' ? arr[1] : null;
-      await _finishZeroGpuJob(job, manifest, file);
+      await _finishZeroGpuJob(job, manifest, file, sseTrace);
     } catch (err) {
       if (job._aborted || job.end_time) return;
       if (err && (err.code === 'cancelled' || err.name === 'AbortError')) {
@@ -1773,8 +2073,10 @@ function _saveArtifacts(job) {
     job.artifacts_dir = dir;
     fs.writeFileSync(path.join(dir, 'metrics.json'), JSON.stringify(job.metrics, null, 2));
     fs.writeFileSync(path.join(dir, 'training_logs.txt'), job.logs.join('\n'));
-    // Save job config to job.json to avoid overwriting HF model config.json
-    fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({ job_id: job.job_id, status: job.status, config: job.config, progress: job.progress, error: job.error, user_id: job.user_id || job.owner || null }, null, 2));
+    // Save job config to job.json to avoid overwriting HF model config.json.
+    // hub_path/manifest persist the durable Hub reference alongside the
+    // local cache (backward compatible: older job.json files omit them).
+    fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({ job_id: job.job_id, status: job.status, config: job.config, progress: job.progress, error: job.error, hub_path: job.hub_path || null, manifest: job.manifest || null, user_id: job.user_id || job.owner || null }, null, 2));
     // Also keep trainer_config.json if Python runner saved it; do not overwrite HF config.json
     if (job.status === 'failed' && job.error) {
       fs.writeFileSync(path.join(dir, 'error.json'), JSON.stringify({ error: job.error, logs_tail: job.logs.slice(-20).join('\n') }, null, 2));
@@ -1863,6 +2165,7 @@ module.exports = {
   _postZeroGpuFn,
   estimateTrainingSteps,
   refreshTotalStepsEstimate,
+  getArtifactMetadataAsync,
   ZeroGpuTrainError,
   jobs,
   ALLOWED_TASKS,

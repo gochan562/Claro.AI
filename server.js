@@ -47,6 +47,7 @@ app.use(helmet({
       ...helmet.contentSecurityPolicy.getDefaultDirectives(),
       "script-src": [
         "'self'",
+        "'wasm-unsafe-eval'",      // Pyodide 0.26.4 WebAssembly (narrower than 'unsafe-eval')
         "https://cdn.jsdelivr.net",      // marked, dompurify, xterm, chart.js
         "https://cdnjs.cloudflare.com",  // codemirror
       ],
@@ -57,6 +58,7 @@ app.use(helmet({
       ],
       "connect-src": [
         "'self'",
+        "https://cdn.jsdelivr.net",      // Pyodide 0.26.4 runtime downloads
       ],
       "script-src-attr": ["'unsafe-inline'"],
     },

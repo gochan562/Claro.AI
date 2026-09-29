@@ -24,6 +24,8 @@ import spaces
 
 from backend import (
     ClaroBackendError,
+    _find_libllama,
+    _libllama_requires_musl,
     cache_stats,
     load_model,
     run_inference,
@@ -38,6 +40,93 @@ DEFAULT_TASK = "text-generation"
 
 # Hard limit for max_new_tokens
 MAX_NEW_TOKENS_LIMIT = 2048
+
+
+def _gguf_backend_diagnostics():
+    """TEMPORARY GGUF import diagnostics (Space runtime only).
+
+    Runs in the Gradio app process itself — the SAME Python environment that
+    serves inference, not the pip build step — to determine whether the
+    "not installed" report means: package absent, wrong environment, import
+    failure, native .so failure, or CUDA failure. Prints only
+    environment/import facts (never tokens or model data), and every probe
+    is individually guarded so diagnostics can never crash Space startup.
+    """
+    def _show(label, value):
+        try:
+            print(f"[CLARO-GGUF] {label}={value}", flush=True)
+        except Exception:
+            pass
+
+    import sys as _sys
+    _show("python executable", _sys.executable)
+    try:
+        _show("python version", _sys.version.split()[0])
+    except Exception as _e:
+        _show("python version", f"unknown ({_e})")
+    try:
+        import importlib.metadata as _md
+        try:
+            _show("pip show llama-cpp-python", f"version={_md.version('llama-cpp-python')}")
+        except Exception as _e:
+            _show("pip show llama-cpp-python", f"not-found ({type(_e).__name__}: {_e})")
+        try:
+            _show("llama-cpp-python package location", str(_md.distribution("llama-cpp-python").locate_file("")))
+        except Exception as _e:
+            _show("llama-cpp-python package location", f"unknown ({type(_e).__name__}: {_e})")
+    except Exception as _e:
+        _show("pip show llama-cpp-python", f"metadata-unavailable ({_e})")
+    try:
+        import llama_cpp
+        _show("llama_cpp import", "success")
+        _show("llama_cpp version", getattr(llama_cpp, "__version__", "unknown"))
+        _show("llama_cpp module path", getattr(llama_cpp, "__file__", "unknown"))
+    except Exception as _e:
+        _show("llama_cpp import", f"failure ({type(_e).__name__}: {_e})")
+        _show("llama_cpp version", "unknown (import failed)")
+        _show("llama_cpp module path", "unknown (import failed)")
+        if "musl" in str(_e) or "shared library" in str(_e):
+            _show("abi-hint", "musl-linked libllama on a glibc image — install the manylinux CUDA wheel; do not report this as 'not installed'")
+        try:
+            import traceback as _tb
+            _lines = "".join(_tb.format_exc(limit=6)).strip().splitlines()
+            for _i, _ln in enumerate([ln for ln in _lines if ln.strip()][-8:]):
+                _show(f"import traceback[{_i}]", _ln.strip()[:300])
+        except Exception:
+            pass
+        return
+    try:
+        from llama_cpp import Llama  # noqa: F401
+        _show("Llama import", f"success ({getattr(Llama, '__name__', type(Llama).__name__)})")
+    except Exception as _e:
+        _show("Llama import", f"failure ({type(_e).__name__}: {_e})")
+        try:
+            import traceback as _tb
+            _lines = "".join(_tb.format_exc(limit=6)).strip().splitlines()
+            for _i, _ln in enumerate([ln for ln in _lines if ln.strip()][-8:]):
+                _show(f"Llama traceback[{_i}]", _ln.strip()[:300])
+        except Exception:
+            pass
+    # Native-library verification: the Llama import above already dlopens the
+    # extension (proving the .so loads — not merely that the package directory
+    # exists). Additionally reject a musl-linked libllama outright.
+    try:
+        import os as _os
+        _base = _os.path.dirname(getattr(llama_cpp, "__file__", "") or "")
+        _lib = _find_libllama(_base)
+        if not _lib:
+            _show("libllama musl-linked", "unknown (libllama.so not found under package)")
+        else:
+            _show("libllama path", _lib)
+            _r = _libllama_requires_musl(_lib)
+            if _r is True:
+                _show("libllama musl-linked", "REJECTED (requires libc.musl — need manylinux build)")
+            elif _r is False:
+                _show("libllama musl-linked", "no")
+            else:
+                _show("libllama musl-linked", "unknown (unreadable)")
+    except Exception as _e:
+        _show("libllama musl-linked", f"unknown ({type(_e).__name__}: {_e})")
 
 
 def _startup_diagnostics():
@@ -66,6 +155,8 @@ def _startup_diagnostics():
         print("[CLARO] runtime AutoImageProcessor import ok", flush=True)
     except Exception as e:
         print(f"[CLARO] runtime AutoImageProcessor import failed: {e}", flush=True)
+    # GGUF backend import probe (temporary detailed diagnostics above).
+    _gguf_backend_diagnostics()
     try:
         import PIL
         print(f"[CLARO] runtime pillow={PIL.__version__}", flush=True)

@@ -66,6 +66,14 @@ app.use(helmet({
   },
 }));
 
+// ── TEMP instance marker (diagnostic only — proves which Node process
+// served a response while investigating the stale-header report; remove
+// after the investigation. Does not alter CSP or any route behavior.) ──
+app.use((req, res, next) => {
+  res.setHeader('X-Claro-Server-Version', 'csp-hf-v2');
+  next();
+});
+
 // ── CORS allow-list ────────────────────────────────────────────────────
 const allowedOrigins = (process.env.FRONTEND_ORIGIN || 'http://localhost:5000')
   .split(',').map(s=>s.trim()).filter(Boolean);

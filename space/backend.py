@@ -33,6 +33,7 @@ import importlib
 import io
 import logging
 import os
+import re
 import threading
 import time
 import traceback
@@ -254,6 +255,108 @@ class _GgufPreprocessor:
         return self._llm.detokenize(flat).decode("utf-8", errors="ignore")
 
 
+# ── TEMP-DIAG: GGUF worker diagnostics (prints only — never raises, never ──
+# logs prompts, weights, tokens, or secrets) ───────────────────────────────
+_CUDA_ERR_RE = re.compile(
+    r"cuda|cublas|cudnn|nccl|cuBLAS|cuDNN|\bcu\w+|out of memory|"
+    r"device-side assert|illegal memory access",
+    re.IGNORECASE,
+)
+
+
+def _is_cuda_runtime_error(e) -> bool:
+    """True when an exception looks CUDA-related (type or message)."""
+    try:
+        return bool(_CUDA_ERR_RE.search(f"{type(e).__name__}: {e}"))
+    except Exception:
+        return False
+
+
+def _gguf_setting(llm, attr, env_name=None, default="unknown"):
+    """Read a numeric llama.cpp setting: live llm attribute (or no-arg
+    getter) first, loader env default second, 'unknown' last. Never raises."""
+    try:
+        v = getattr(llm, attr, None)
+        if callable(v):
+            try:
+                v = v()
+            except Exception:
+                v = None
+        if v is not None:
+            return v
+    except Exception:
+        pass
+    if env_name:
+        try:
+            ev = os.environ.get(env_name)
+            if ev not in (None, ""):
+                return ev
+        except Exception:
+            pass
+    return default
+
+
+def _gguf_worker_preflight(llm):
+    """Print GGUF pre-inference facts (import, build, CUDA, model metadata).
+
+    Safe numeric/model metadata only. Every probe is guarded: diagnostics
+    can never raise and never log the prompt or weights.
+    """
+    def _show(label, value):
+        try:
+            print(f"[CLARO-GGUF] {label}={value}", flush=True)
+        except Exception:
+            pass
+    try:
+        import llama_cpp
+        _show("llama_cpp import", "success")
+        _show("llama_cpp version", getattr(llama_cpp, "__version__", "unknown"))
+    except Exception as _e:
+        _show("llama_cpp import", f"failure ({type(_e).__name__}: {_e})")
+        return
+    try:
+        if hasattr(llama_cpp, "llama_supports_gpu_offload"):
+            _show("GPU offload support", llama_cpp.llama_supports_gpu_offload())
+        else:
+            _show("GPU offload support", "unknown")
+    except Exception as _e:
+        _show("GPU offload support", f"unknown ({type(_e).__name__})")
+    try:
+        import torch
+        _show("torch.cuda.is_available()", torch.cuda.is_available())
+        try:
+            _show("torch.cuda.get_device_name(0)",
+                  torch.cuda.get_device_name(0) if torch.cuda.is_available() else "n/a (no cuda)")
+        except Exception as _e:
+            _show("torch.cuda.get_device_name(0)", f"unknown ({type(_e).__name__}: {_e})")
+    except Exception as _e:
+        _show("torch.cuda.is_available()", f"unknown ({type(_e).__name__})")
+    try:
+        if hasattr(llama_cpp, "llama_print_system_info"):
+            _show("llama.cpp build", str(llama_cpp.llama_print_system_info())[:1500])
+        else:
+            _show("llama.cpp build", "unknown")
+    except Exception as _e:
+        _show("llama.cpp build", f"unknown ({type(_e).__name__})")
+    try:
+        _mp = getattr(llm, "model_path", None) or "unknown"
+        _show("model path", _mp)
+        try:
+            _show("model file size",
+                  os.path.getsize(_mp) if isinstance(_mp, str) and os.path.isfile(_mp)
+                  else "unknown (not a local file)")
+        except Exception as _e:
+            _show("model file size", f"unknown ({type(_e).__name__})")
+    except Exception as _e:
+        _show("model path", f"unknown ({type(_e).__name__})")
+    try:
+        _show("n_gpu_layers", _gguf_setting(llm, "n_gpu_layers", "CLARO_GGUF_NGPULAYERS", "0"))
+        _show("n_ctx", _gguf_setting(llm, "n_ctx", "CLARO_GGUF_NCTX", "4096"))
+        _show("n_batch", _gguf_setting(llm, "n_batch", None, "unknown"))
+    except Exception as _e:
+        _show("n_gpu_layers/n_ctx/n_batch", f"unknown ({type(_e).__name__})")
+
+
 class _GgufModel:
     def __init__(self, llm):
         import torch
@@ -279,7 +382,22 @@ class _GgufModel:
             if top_k is not None and int(top_k) > 0: args["top_k"] = int(top_k)
             if repetition_penalty and float(repetition_penalty) != 1.0:
                 args["repeat_penalty"] = float(repetition_penalty)
-        resp = self._llm.create_completion(prompt, **args)
+        # TEMP-DIAG: exact llama_cpp call site (app.py _gpu_infer ->
+        # run_inference -> _generate_text -> here -> create_completion).
+        # Prints only; the original exception is re-raised unchanged so the
+        # ZeroGPU error mapping is intact.
+        _gguf_worker_preflight(self._llm)
+        try:
+            resp = self._llm.create_completion(prompt, **args)
+        except Exception as e:
+            print("[CLARO-GGUF] worker exception type=", type(e).__name__, flush=True)
+            print("[CLARO-GGUF] worker exception=", str(e)[:2000], flush=True)
+            print(traceback.format_exc(), flush=True)
+            if _is_cuda_runtime_error(e):
+                _prev = os.environ.get("CUDA_LAUNCH_BLOCKING")
+                os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+                print(f"[CLARO-GGUF] CUDA_LAUNCH_BLOCKING was={_prev!r} now='1' (diagnostic run; unset to revert)", flush=True)
+            raise
         new_text = resp["choices"][0]["text"]
         new_ids = self._llm.tokenize(new_text.encode("utf-8"), add_bos=False, special=False)
         full = ids + new_ids
@@ -339,6 +457,52 @@ def _load_gguf(model_id, files, device, dtype) -> LoaderResult:
         device=device,
         dtype=dtype,
     )
+
+
+# ── Native-library ABI guard (diagnostic only — loader behavior unchanged) ──
+# Rejects a llama-cpp-python installation whose vendored libllama.so is
+# linked against musl libc (Alpine-style build), which cannot load on the
+# glibc-based Space image ("libc.musl-x86_64.so.1: cannot open shared object
+# file"). Pure stdlib (os only) so it is unit-testable without torch/GPU.
+_MUSL_MARKERS = (b"libc.musl", b"ld-musl")
+_LIBLLAMA_SCAN_BYTES = 8 * 1024 * 1024
+_LIBLLAMA_SCAN_LIMIT = 5000
+
+
+def _find_libllama(package_dir: str) -> str | None:
+    """Locate the vendored libllama shared library under an installed
+    llama_cpp package directory. Returns the path, or None when absent."""
+    base = os.path.join(str(package_dir or ""), "lib", "libllama.so")
+    if base and os.path.isfile(base):
+        return base
+    try:
+        seen = 0
+        for root, _dirs, files in os.walk(str(package_dir or "")):
+            for name in files:
+                seen += 1
+                if seen > _LIBLLAMA_SCAN_LIMIT:
+                    return None
+                if "llama" in name and name.endswith(".so"):
+                    return os.path.join(root, name)
+    except OSError:
+        return None
+    return None
+
+
+def _libllama_requires_musl(lib_path: str) -> bool | None:
+    """Bytes-scan a libllama.so for musl-libc linkage markers.
+
+    Returns True (musl-linked → REJECT), False (no musl marker in the
+    scanned window), or None (unreadable/empty — inconclusive, never a pass).
+    """
+    try:
+        with open(lib_path, "rb") as fh:
+            blob = fh.read(_LIBLLAMA_SCAN_BYTES)
+    except OSError:
+        return None
+    if not blob:
+        return None
+    return any(m in blob for m in _MUSL_MARKERS)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -960,6 +1124,48 @@ def _logits_diag(tag: str, scores) -> None:
         logger.warning("[CLARO-DIAG] %s logits_diag failed: %s", tag, exc)
 
 
+def _generate_text_gguf(result: LoaderResult, prompt: str, max_new_tokens: int,
+                      temperature: float = 0.7, top_p: float = 0.9,
+                      do_sample: bool = True) -> "tuple[str, Optional[int]]":
+    """GGUF text generation via llama.cpp (diagnostic-wrapped).
+
+    The shared _generate_text preamble below (parameters(), forward pass,
+    logits processors) is Transformers-specific and cannot execute for a
+    llama.cpp model; this helper issues the identical model.generate call
+    and decode contract ((text, n_new)) directly. Prints [CLARO-GGUF] worker
+    diagnostics (via _GgufModel.generate) and re-raises the original
+    exception unchanged so the ZeroGPU error mapping is intact.
+    """
+    inputs = result.preprocessor(prompt, return_tensors="pt")
+    gen_kwargs = dict(
+        input_ids=inputs["input_ids"],
+        max_new_tokens=int(max_new_tokens),
+        do_sample=bool(do_sample),
+    )
+    if do_sample:
+        gen_kwargs["temperature"] = temperature
+        gen_kwargs["top_p"] = top_p
+    try:
+        out = result.model.generate(**gen_kwargs)
+    except Exception as e:
+        print("[CLARO-GGUF] gguf generate path exception type=", type(e).__name__, flush=True)
+        print("[CLARO-GGUF] gguf generate path exception=", str(e)[:2000], flush=True)
+        print(traceback.format_exc(), flush=True)
+        raise
+    try:
+        new_ids = out[0][inputs["input_ids"].shape[-1]:]
+    except Exception:
+        try:
+            new_ids = out[0]
+        except Exception:
+            new_ids = []
+    try:
+        n_new = int(new_ids.shape[-1])
+    except Exception:
+        n_new = None
+    return result.preprocessor.decode(new_ids, skip_special_tokens=True), n_new
+
+
 def _generate_text(result: LoaderResult, prompt: str, max_new_tokens: int,
                     temperature: float = 0.7, top_p: float = 0.9,
                     do_sample: bool = True) -> "tuple[str, Optional[int]]":
@@ -969,6 +1175,13 @@ def _generate_text(result: LoaderResult, prompt: str, max_new_tokens: int,
             "This model has no tokenizer/processor for text generation.",
             code="task_model_mismatch",
         )
+    if result.modality == "gguf":
+        # GGUF has no Transformers forward/generate pipeline (no
+        # parameters(), no __call__, no logits); route straight to the
+        # llama.cpp completion call. All other modalities use the shared
+        # path below unchanged.
+        return _generate_text_gguf(result, prompt, max_new_tokens,
+                                   temperature, top_p, do_sample)
     inputs = result.preprocessor(prompt, return_tensors="pt").to(result.model.device)
     is_enc_dec = bool(getattr(result.model.config, "is_encoder_decoder", False))
     on_cuda = torch.cuda.is_available() and next(result.model.parameters()).is_cuda

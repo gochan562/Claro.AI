@@ -12,6 +12,18 @@ torchvision>=0.23.0
 accelerate
 spaces
 diffusers>=0.30.0
+# GGUF inference backend (backend.py _load_gguf): the Space image is glibc
+# Linux x86_64 on CUDA 13.0 / Python 3.12. A musl-linked libllama.so cannot
+# load here ("libc.musl-x86_64.so.1: cannot open shared object file"), so the
+# dependency MUST be the official manylinux CUDA 13.0 prebuilt wheel: never a
+# musl build, never musl-libc installed into the Space, never an Alpine
+# image, and never a cmake source build while the official wheel exists.
+# Pinned so pip cannot substitute the source-only PyPI release or another
+# ABI; --only-binary makes a missing wheel fail loudly instead of silently
+# building (or picking) an incompatible artifact.
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu130
+--only-binary=llama-cpp-python
+llama-cpp-python==0.3.35
 sentencepiece
 protobuf
 # ── Remote training worker (train_api.py reuses training_runner.py) ──

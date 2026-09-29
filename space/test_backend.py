@@ -479,6 +479,255 @@ class ImageDependencyEnvironmentTest(unittest.TestCase):
             self.fail(f"torchvision present but AutoImageProcessor import failed: {e}")
 
 
+class GgufDependencyTest(unittest.TestCase):
+    """Guards the GGUF backend dependency for the Space runtime.
+
+    Regression coverage for: "GGUF backend (llama-cpp-python) is not
+    installed in this Space" caused by a musl-linked libllama.so
+    ("libc.musl-x86_64.so.1: cannot open shared object file") on the
+    glibc-based Space image. The dependency MUST be the official manylinux
+    CUDA 13.0 prebuilt wheel — never a musl build, never musl-libc in the
+    Space, never Alpine, never a source build while the wheel exists.
+    """
+
+    @staticmethod
+    def _requirements_text():
+        req_path = os.path.join(os.path.dirname(__file__), "requirements.txt")
+        with open(req_path) as f:
+            return f.read()
+
+    def test_requirements_pins_gguf_cuda_manylinux_wheel(self):
+        # The CUDA 13.0 extra index must be declared (recent PyPI releases
+        # are source-only; without the index pip falls back to a slow source
+        # build or an incompatible artifact on the Space image).
+        text = self._requirements_text()
+        indexes = [ln.strip() for ln in text.splitlines()
+                   if ln.strip().startswith("--extra-index-url")]
+        self.assertEqual(
+            indexes,
+            ["--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu130"],
+            "requirements must use exactly the official CUDA 13.0 wheel index",
+        )
+        m = __import__("re").search(r"^llama-cpp-python==([0-9.]+)\s*$", text, __import__("re").M)
+        self.assertIsNotNone(m, "llama-cpp-python must be pinned to an exact wheel version")
+        self.assertEqual(m.group(1), "0.3.35", "pin the known-good cu130 manylinux version")
+        self.assertIn(
+            "--only-binary=llama-cpp-python", text,
+            "a missing wheel must fail loudly instead of source-building",
+        )
+
+    def test_llama_cpp_importable(self):
+        # Verifies the GGUF backend dependency is present and importable in
+        # the Space environment. Skipped where it is not installed (e.g.
+        # local checkout); must pass on any Space image built from the
+        # requirements above.
+        try:
+            import llama_cpp  # noqa: F401
+        except ImportError:
+            self.skipTest("llama-cpp-python not installed in this environment")
+        import llama_cpp
+        self.assertTrue(
+            hasattr(llama_cpp, "Llama"),
+            "llama_cpp must expose Llama (GGUF backend entry point)",
+        )
+
+    def _backend(self):
+        _delete_fake_modules()
+        _install_fake_torch()
+        return importlib.import_module("backend")
+
+    def tearDown(self):
+        # Do not leak the fake torch into later suites (e.g. the real
+        # torchvision import probe in ImageDependencyEnvironmentTest).
+        _delete_fake_modules()
+
+    def test_musl_guard_rejects_musl_linked_libllama(self):
+        import tempfile
+        backend = self._backend()
+        with tempfile.TemporaryDirectory() as d:
+            bad = os.path.join(d, "libllama.so")
+            with open(bad, "wb") as f:
+                f.write(b"\x7fELF" + b"\x00" * 64 + b"libllama.so.0: libc.musl-x86_64.so.1: cannot open shared object file")
+            self.assertTrue(backend._libllama_requires_musl(bad))
+
+    def test_musl_guard_accepts_glibc_libllama(self):
+        import tempfile
+        backend = self._backend()
+        with tempfile.TemporaryDirectory() as d:
+            good = os.path.join(d, "libllama.so")
+            with open(good, "wb") as f:
+                f.write(b"\x7fELF" + b"\x00" * 64 + b"libllama.so.0: libc.so.6, libstdc++.so.6, libm.so.6")
+            self.assertFalse(backend._libllama_requires_musl(good))
+            self.assertIsNone(backend._libllama_requires_musl(os.path.join(d, "missing.so")))
+
+    def test_find_libllama(self):
+        import tempfile
+        backend = self._backend()
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(backend._find_libllama(d))
+            libdir = os.path.join(d, "lib")
+            os.makedirs(libdir)
+            want = os.path.join(libdir, "libllama.so")
+            with open(want, "wb") as f:
+                f.write(b"\x7fELF")
+            self.assertEqual(backend._find_libllama(d), want)
+
+
+class GgufWorkerDiagnosticTest(unittest.TestCase):
+    """Regression coverage for the opaque ZeroGPU worker error:
+
+        ZeroGPU model error: unexpected error: 'RuntimeError'
+        (app.py -> _gpu_infer() -> spaces/zero/wrappers.py -> RuntimeError)
+
+    The GGUF inference section must print the ACTUAL exception (type,
+    message, full traceback) inside the worker before the spaces wrapper
+    can replace it, plus pre-inference facts — and re-raise the original
+    exception object unchanged so the ZeroGPU error mapping is intact.
+    Uses deterministic stub llama.cpp/torch modules (no GPU, no network).
+    """
+
+    class _FakeLlm:
+        def __init__(self, model_path=None, exc=None):
+            if model_path is not None:
+                self.model_path = model_path
+            self.n_ctx = 4096
+            self.n_gpu_layers = 0
+            self.n_batch = 512
+            self._exc = exc
+
+        def create_completion(self, prompt, **kw):
+            if self._exc is not None:
+                raise self._exc
+            return {"choices": [{"text": " world"}]}
+
+        def tokenize(self, data, **kw):
+            return [1, 2]
+
+        def detokenize(self, ids):
+            return b"hi"
+
+        def token_eos(self):
+            return 2
+
+    def setUp(self):
+        self._old_clb = os.environ.get("CUDA_LAUNCH_BLOCKING")
+        os.environ.pop("CUDA_LAUNCH_BLOCKING", None)
+        _delete_fake_modules()
+        _install_fake_torch()
+        # The GGUF preprocessor references torch.long (real torch API surface
+        # the shared fake does not stub); add it test-locally only.
+        sys.modules["torch"].long = "int64"
+        fake = types.ModuleType("llama_cpp")
+        fake.__version__ = "9.9.9-test"
+        fake.llama_supports_gpu_offload = lambda: True
+        fake.llama_print_system_info = lambda: "test-build AVX=1 CUDA=13.0"
+        sys.modules["llama_cpp"] = fake
+
+    def tearDown(self):
+        if self._old_clb is None:
+            os.environ.pop("CUDA_LAUNCH_BLOCKING", None)
+        else:
+            os.environ["CUDA_LAUNCH_BLOCKING"] = self._old_clb
+        sys.modules.pop("llama_cpp", None)
+        _delete_fake_modules()
+
+    def _backend(self):
+        return importlib.import_module("backend")
+
+    def _run_capture(self, fn):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            try:
+                result = fn()
+            except BaseException as e:
+                return None, e, buf.getvalue()
+        return result, None, buf.getvalue()
+
+    def test_cuda_error_propagates_with_full_diagnostics(self):
+        import tempfile
+        backend = self._backend()
+        with tempfile.TemporaryDirectory() as d:
+            model_path = os.path.join(d, "tiny.gguf")
+            with open(model_path, "wb") as f:
+                f.write(b"\x00" * 12345)
+            err = RuntimeError("CUDA error: out of memory allocating 1GB")
+            model = backend._GgufModel(self._FakeLlm(model_path=model_path, exc=err))
+            out, exc, logs = self._run_capture(
+                lambda: model.generate(input_ids=[[1, 2]], max_new_tokens=8))
+        # The ORIGINAL exception object propagates unchanged (mapping intact).
+        self.assertIs(exc, err)
+        self.assertEqual(str(exc), "CUDA error: out of memory allocating 1GB")
+        # Exact worker diagnostic lines are printed before the wrapper can act.
+        self.assertIn("[CLARO-GGUF] worker exception type=", logs)
+        self.assertIn("RuntimeError", logs)
+        self.assertIn("[CLARO-GGUF] worker exception=", logs)
+        self.assertIn("out of memory", logs)
+        self.assertIn("Traceback", logs)
+        self.assertIn("[CLARO-GGUF] llama_cpp import=success", logs)
+        self.assertIn("[CLARO-GGUF] llama_cpp version=9.9.9-test", logs)
+        self.assertIn("[CLARO-GGUF] GPU offload support=True", logs)
+        self.assertIn("[CLARO-GGUF] torch.cuda.is_available()=", logs)
+        self.assertIn("[CLARO-GGUF] llama.cpp build=test-build", logs)
+        self.assertIn(f"[CLARO-GGUF] model path={model_path}", logs)
+        self.assertIn("[CLARO-GGUF] model file size=12345", logs)
+        self.assertIn("[CLARO-GGUF] n_gpu_layers=0", logs)
+        self.assertIn("[CLARO-GGUF] n_ctx=4096", logs)
+        self.assertIn("[CLARO-GGUF] n_batch=512", logs)
+        # CUDA RuntimeError arms synchronous launches for the diagnostic run.
+        self.assertIn("CUDA_LAUNCH_BLOCKING", logs)
+        self.assertEqual(os.environ.get("CUDA_LAUNCH_BLOCKING"), "1")
+
+    def test_non_cuda_error_leaves_env_alone(self):
+        backend = self._backend()
+        err = RuntimeError("connection reset by peer")
+        model = backend._GgufModel(self._FakeLlm(exc=err))
+        out, exc, logs = self._run_capture(
+            lambda: model.generate(input_ids=[[1, 2]], max_new_tokens=8))
+        self.assertIs(exc, err)
+        self.assertIn("[CLARO-GGUF] worker exception type=", logs)
+        self.assertIn("Traceback", logs)
+        self.assertNotIn("CUDA_LAUNCH_BLOCKING", logs)
+        self.assertNotIn("CUDA_LAUNCH_BLOCKING", os.environ)
+
+    def test_gguf_branch_success_end_to_end(self):
+        backend = self._backend()
+        llm = self._FakeLlm()
+        result = types.SimpleNamespace(
+            modality="gguf",
+            preprocessor=backend._GgufPreprocessor(llm),
+            model=backend._GgufModel(llm),
+            loaded_class="GGUF (llama-cpp-python)",
+        )
+        out, exc, logs = self._run_capture(
+            lambda: backend._generate_text(result, "hello", 32))
+        self.assertIsNone(exc)
+        self.assertEqual(out[0], "hi")
+        self.assertTrue(out[1] is None or isinstance(out[1], int))
+        self.assertIn("[CLARO-GGUF] llama_cpp import=success", logs)
+        self.assertIn("[CLARO-GGUF] n_ctx=4096", logs)
+
+    def test_gguf_branch_propagates_worker_error(self):
+        backend = self._backend()
+        err = RuntimeError("boom-cuda-failure: CUDA illegal memory access")
+        llm = self._FakeLlm(exc=err)
+        result = types.SimpleNamespace(
+            modality="gguf",
+            preprocessor=backend._GgufPreprocessor(llm),
+            model=backend._GgufModel(llm),
+            loaded_class="GGUF (llama-cpp-python)",
+        )
+        out, exc, logs = self._run_capture(
+            lambda: backend._generate_text(result, "hello", 32))
+        self.assertIs(exc, err)
+        self.assertIn("boom-cuda-failure", str(exc))
+        self.assertIn("[CLARO-GGUF] gguf generate path exception type=", logs)
+        self.assertIn("[CLARO-GGUF] worker exception type=", logs)
+        self.assertIn("Traceback", logs)
+        self.assertEqual(os.environ.get("CUDA_LAUNCH_BLOCKING"), "1")
+
+
 class TrainGpuDurationTest(unittest.TestCase):
     """Regression tests for the @spaces.GPU duration sizing (train_api).
 

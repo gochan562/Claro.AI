@@ -59,6 +59,7 @@ app.use(helmet({
       "connect-src": [
         "'self'",
         "https://cdn.jsdelivr.net",      // Pyodide 0.26.4 runtime downloads
+        "https://huggingface.co",        // Model Cell Hugging Face Hub API
       ],
       "script-src-attr": ["'unsafe-inline'"],
     },

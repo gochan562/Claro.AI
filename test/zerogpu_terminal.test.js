@@ -77,13 +77,27 @@ test('5. error branch wires the helper', () => {
 
 // 6. Training UI translates the code too (shared classification).
 test('6. translateBackendError maps gpu_unavailable', () => {
+  const FRIENDLY_UI = '⚠️ ZeroGPU: GPU unavailable right now. Please try again later.';
   assert.strictEqual(
     ui.translateBackendError('whatever', 'gpu_unavailable'),
-    'ZeroGPU: GPU unavailable right now. Please try again later.'
+    FRIENDLY_UI
   );
   assert.strictEqual(
     ui.translateBackendError('GPU unavailable right now', 'training_error'),
-    'ZeroGPU: GPU unavailable right now. Please try again later.'
+    FRIENDLY_UI
+  );
+  // The Gradio/ZeroGPU-wrapped failure: only the combination of all three
+  // signals maps — a lone RuntimeError must not.
+  assert.strictEqual(
+    ui.translateBackendError(
+      "❌ ZeroGPU (model_runtime): ZeroGPU model error: unexpected error: 'RuntimeError' gradio.exceptions.Error: 'RuntimeError'",
+      'model_runtime'
+    ),
+    FRIENDLY_UI
+  );
+  assert(
+    !ui.translateBackendError("RuntimeError: connection reset by peer", 'model_runtime').includes('GPU unavailable'),
+    'lone RuntimeError must not map to gpu_unavailable'
   );
   // Unrelated codes are untouched.
   assert(ui.translateBackendError('training_error: boom', 'training_error').includes('Training failed'),

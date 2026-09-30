@@ -422,7 +422,17 @@ function translateBackendError(errMsg, code) {
   if (code === 'invalid_dataset_id' || low.includes('invalid dataset')) return "Claro.AI couldn't load this dataset. Check the dataset name or try another dataset.";
   if (low.includes('missing dependency') || low.includes('missing prompt')) return "Training environment is missing a required Python package.";
   if (low.includes('stopped_by_user') || low.includes('stopped by user')) return "Training was stopped.";
-  if (code === 'gpu_unavailable' || low.includes('gpu unavailable')) return "ZeroGPU: GPU unavailable right now. Please try again later.";
+  if (
+    code === 'gpu_unavailable' ||
+    low.includes('gpu unavailable') ||
+    (
+      low.includes('zerogpu') &&
+      low.includes('model_runtime') &&
+      low.includes('runtimeerror')
+    )
+  ) {
+    return "⚠️ ZeroGPU: GPU unavailable right now. Please try again later.";
+  }
   if (low.includes('training_error')) return "Training failed. Open Training Logs for technical details.";
   if (low.includes('bad_request')) return "Something in the configuration looks off. Check the highlighted fields.";
   return errMsg || "Training failed. Open Training Logs for technical details.";

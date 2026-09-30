@@ -350,6 +350,78 @@ async function run() {
   assert(err.message.includes('quota') || err.message.includes('retry later'), 'message must be actionable');
   console.log('✓ test 13: scheduler denial by message maps to zerogpu_quota with actionable text');
 
+  // ─── 14. Opaque worker error reclassifies by message ──
+  // The exact live failure: complete frame "[CLARO:model_runtime]
+  // unexpected error: 'RuntimeError: No CUDA GPUs are available'". This is
+  // ZeroGPU infrastructure (no GPU allocated), not a model failure: code
+  // gpu_unavailable, HTTP 502, friendly message, and neither
+  // "unexpected error" nor "RuntimeError" reaches the user.
+  setBackendResponses((u, init) => {
+    if (u.endsWith('/gradio_api/call/v2/generate')) return { status: 200, json: { event_id: 'evt-nogpu' } };
+    if (u.endsWith('/gradio_api/call/generate/evt-nogpu')) {
+      return {
+        ok: true, status: 200,
+        body: 'event: complete\ndata: "[CLARO:model_runtime] unexpected error: \'RuntimeError: No CUDA GPUs are available\'\\nTraceback (most recent call last): ..."\n\n',
+      };
+    }
+    return { status: 404, text: '?' };
+  });
+  err = null;
+  try {
+    await new ZeroGPUBackend(infra).run(
+      { model_id: 'm/m', task: 'text-generation', inputs: { prompt: 'x', max_new_tokens: 5 } },
+      new AbortController().signal
+    );
+  } catch (e) { err = e; }
+  assert(err instanceof GpuError, 'should be GpuError');
+  assert.strictEqual(err.code, 'gpu_unavailable', `no-GPU message must map to gpu_unavailable (got ${err && err.code})`);
+  assert.strictEqual(err.status, 502, 'HTTP status stays 502 (never disguised as success)');
+  assert(err.message.includes('GPU unavailable right now'), `friendly message expected (got ${err.message})`);
+  assert(!err.message.includes('unexpected error'), 'opaque "unexpected error" must not leak');
+  assert(!err.message.includes('RuntimeError'), 'raw "RuntimeError" must not leak');
+  console.log('✓ test 14: opaque no-GPU complete frame maps to gpu_unavailable with friendly message');
+
+  // ─── 15. Bare error frames classify the same way; quota keeps priority ──
+  async function runErrorFrame(payload) {
+    setBackendResponses((u, init) => {
+      if (u.endsWith('/gradio_api/call/v2/generate')) return { status: 200, json: { event_id: 'evt-ef' } };
+      if (u.endsWith('/gradio_api/call/generate/evt-ef')) {
+        return { ok: true, status: 200, body: `event: error\ndata: ${payload}\n\n` };
+      }
+      return { status: 404, text: '?' };
+    });
+    let caught = null;
+    try {
+      await new ZeroGPUBackend(infra).run(
+        { model_id: 'm/m', task: 'text-generation', inputs: { prompt: 'x', max_new_tokens: 5 } },
+        new AbortController().signal
+      );
+    } catch (e) { caught = e; }
+    assert(caught instanceof GpuError, 'should be GpuError');
+    return caught;
+  }
+  let e2 = await runErrorFrame('{"error": "RuntimeError: No CUDA GPUs are available"}');
+  assert.strictEqual(e2.code, 'gpu_unavailable', 'bare no-GPU error frame must map to gpu_unavailable');
+  assert(e2.message.includes('GPU unavailable right now'), 'friendly message expected');
+  e2 = await runErrorFrame('{"error": "Worker cannot provide a GPU right now"}');
+  assert.strictEqual(e2.code, 'gpu_unavailable', '"cannot provide a GPU" must map to gpu_unavailable');
+  e2 = await runErrorFrame('{"error": "GPU unavailable: scheduler busy"}');
+  assert.strictEqual(e2.code, 'gpu_unavailable', '"GPU unavailable" must map to gpu_unavailable');
+  // Quota-flavored denial keeps its code even though it shares phrasing.
+  e2 = await runErrorFrame('{"error": "ZeroGPU cannot provide a GPU right now: You have exceeded your ZeroGPU runs limit"}');
+  assert.strictEqual(e2.code, 'zerogpu_quota', 'quota denial must keep zerogpu_quota, not gpu_unavailable');
+  console.log('✓ test 15: error-frame GPU messages map to gpu_unavailable; quota keeps priority');
+
+  // ─── 16. Unrelated RuntimeErrors are NOT swallowed ──
+  // Only GPU-availability messages classify; anything else keeps its code.
+  e2 = await runErrorFrame('{"error": "RuntimeError: connection reset by peer"}');
+  assert.strictEqual(e2.code, 'zerogpu_runtime', `unrelated RuntimeError must stay zerogpu_runtime (got ${e2.code})`);
+  e2 = await runErrorFrame('{"error": "RuntimeError: CUDA out of memory. Tried to allocate 2.00 GiB"}');
+  assert.strictEqual(e2.code, 'gpu_oom', `OOM must stay gpu_oom (got ${e2.code})`);
+  e2 = await runErrorFrame('{"error": "some model exploded"}');
+  assert.strictEqual(e2.code, 'zerogpu_runtime', `generic error must stay zerogpu_runtime (got ${e2.code})`);
+  console.log('✓ test 16: unrelated RuntimeErrors keep their codes (never blanket-mapped)');
+
   delete global.fetch;
   console.log('\nAll ZeroGPU integration tests passed.');
 }

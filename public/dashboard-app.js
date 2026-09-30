@@ -58,6 +58,20 @@ let notebookRegistry = {
       gpuTerminal?.clear();
     }
 
+    // [TEST-HOOK:zeroGpuRunErrorFormat:START] Pure helper mapping a failed
+    // /api/zerogpu-run payload to GPU-terminal lines (unit-tested in Node).
+    // GPU-unavailability is an infrastructure condition: show the friendly
+    // retry line instead of the raw backend error. All other failures keep
+    // the existing red ❌ format with the backend code.
+    function formatZeroGpuRunError(data) {
+      if (data && data.code === 'gpu_unavailable') {
+        return [{ text: '⚠️ ZeroGPU: GPU unavailable right now. Please try again later.', color: 'yellow' }];
+      }
+      const code = data && data.code ? ` (${data.code})` : '';
+      return [{ text: `❌ ZeroGPU${code}: ${(data && data.error) || 'unknown error'}`, color: 'red' }];
+    }
+    // [TEST-HOOK:zeroGpuRunErrorFormat:END]
+
     function writeGpuLine(line, color) {
       if (!gpuTerminal) return;
       const codes = { red: '31', green: '32', yellow: '33', gray: '90' };
@@ -4367,8 +4381,7 @@ function parsePromptAndMaxTokens(inferenceContent, defaultPrompt) {
         setGpuState(res.ok ? 'connected' : 'disconnected');
 
         if (!res.ok || data.error) {
-          const code = data.code ? ` (${data.code})` : '';
-          writeGpuLine(`❌ ZeroGPU${code}: ${data.error || JSON.stringify(data)}`, 'red');
+          for (const l of formatZeroGpuRunError(data)) writeGpuLine(l.text, l.color);
           return null;
         }
         const text = (data.output || '').trim();

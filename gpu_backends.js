@@ -49,6 +49,46 @@ class GpuError extends Error {
   }
 }
 
+// ZeroGPU GPU-availability failures are infrastructure conditions, not model
+// errors. The Space surfaces torch's "RuntimeError: No CUDA GPUs are
+// available" (and equivalent worker GPU-allocation messages) either inside a
+// [CLARO:<code>] complete frame or as a bare SSE error frame. Detect by
+// message content ONLY — never by exception type name alone — and report a
+// dedicated code with a user-facing message. Raw diagnostics stay in the
+// server logs (every frame is logged before classification).
+const GPU_UNAVAILABLE_RE = /No CUDA GPUs? are available|GPU unavailable|cannot provide a GPU|No GPU device/i;
+const GPU_UNAVAILABLE_MESSAGE = 'GPU unavailable right now. Please try again later.';
+
+function isGpuUnavailableMessage(message) {
+  return GPU_UNAVAILABLE_RE.test(String(message || ''));
+}
+
+// Maps a Space [CLARO:<code>] complete-frame payload to a GpuError,
+// reclassifying GPU-availability failures to gpu_unavailable. Codes the
+// Space already pinned to a scheduler/GPU-state verdict (quota, timeout,
+// oom, unavailable) are authoritative and never overridden — detection by
+// message applies only to the remaining codes. All other codes pass through
+// with the same status table as before.
+const GPU_SCHEDULER_CODES = new Set(['zerogpu_quota', 'zerogpu_timeout', 'gpu_oom', 'gpu_unavailable']);
+
+function throwClaroModelError(code, message) {
+  if (!GPU_SCHEDULER_CODES.has(code) && isGpuUnavailableMessage(message)) {
+    throw new GpuError(`ZeroGPU model error: ${GPU_UNAVAILABLE_MESSAGE}`, 'gpu_unavailable', 502);
+  }
+  const status =
+    code === 'invalid_model_id'   ? 400 :
+    code === 'bad_request'         ? 400 :
+    code === 'task_model_mismatch'  ? 422 :
+    code === 'task_not_exposed'     ? 422 :
+    code === 'model_load_error'     ? 502 :
+    code === 'gguf_multiple_files'  ? 422 :
+    code === 'gpu_oom'              ? 502 :
+    code === 'zerogpu_quota'        ? 502 :
+    code === 'gpu_unavailable'      ? 502 :
+    502;
+  throw new GpuError(`ZeroGPU model error: ${message}`, code, status);
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ────────────────────────────────────────────────────────────────────────────
@@ -365,20 +405,7 @@ class ZeroGPUBackend {
                 // though it were generated text.
                 const m = typeof out === 'string' ? out.match(/^\[CLARO:([a-z_]+)\]\s*(.*)$/s) : null;
                 if (m) {
-                  const code = m[1];
-                  const message = m[2];
-                  const status =
-                    code === 'invalid_model_id'   ? 400 :
-                    code === 'bad_request'         ? 400 :
-                    code === 'task_model_mismatch'  ? 422 :
-                    code === 'task_not_exposed'     ? 422 :
-                    code === 'model_load_error'     ? 502 :
-                    code === 'gguf_multiple_files'  ? 422 :
-                    code === 'gpu_oom'              ? 502 :
-                    code === 'zerogpu_quota'        ? 502 :
-                    code === 'gpu_unavailable'      ? 502 :
-                    502;
-                  throw new GpuError(`ZeroGPU model error: ${message}`, code, status);
+                  throwClaroModelError(m[1], m[2]);
                 }
                 return out;
               } catch (err) {
@@ -416,20 +443,7 @@ class ZeroGPUBackend {
           const out = typeof text === 'string' ? text : JSON.stringify(text);
           const m = typeof out === 'string' ? out.match(/^\[CLARO:([a-z_]+)\]\s*(.*)$/s) : null;
           if (m) {
-            const code = m[1];
-            const message = m[2];
-            const status =
-              code === 'invalid_model_id'   ? 400 :
-              code === 'bad_request'         ? 400 :
-              code === 'task_model_mismatch'  ? 422 :
-              code === 'task_not_exposed'     ? 422 :
-              code === 'model_load_error'     ? 502 :
-              code === 'gguf_multiple_files'  ? 422 :
-              code === 'gpu_oom'              ? 502 :
-              code === 'zerogpu_quota'        ? 502 :
-              code === 'gpu_unavailable'      ? 502 :
-              502;
-            throw new GpuError(`ZeroGPU model error: ${message}`, code, status);
+            throwClaroModelError(m[1], m[2]);
           }
           return out;
         } catch (err) {
@@ -460,6 +474,9 @@ class ZeroGPUBackend {
         // already a string
       }
       if (/No GPU available|quota|runs.?limit|credits|exceed|GHA seconds|GPU is not available/i.test(message)) code = 'zerogpu_quota';
+      // GPU-availability detection only refines the default code: verdicts the
+      // classifier already reached above (quota, timeout, oom, …) are kept.
+      if (code === 'zerogpu_runtime' && isGpuUnavailableMessage(message)) code = 'gpu_unavailable';
       if (/No GPU was available after \d+s/i.test(message)) code = 'zerogpu_timeout';
       if (/Not Found/i.test(message)) code = 'space_unavailable';
       if (/Unrecognized|does not have|model_type|from_pretrained/i.test(message)) code = 'invalid_model_id';
@@ -473,6 +490,9 @@ class ZeroGPUBackend {
       }
       if (code === 'zerogpu_quota') {
         displayMessage = 'ZeroGPU cannot provide a GPU right now (quota exhausted, runs limit, or no capacity). Check the Space owner\u2019s ZeroGPU quota/billing and retry later. The model itself was not the problem.';
+      }
+      if (code === 'gpu_unavailable') {
+        displayMessage = 'GPU unavailable right now. Please try again later.';
       }
       throw new GpuError(`ZeroGPU error: ${displayMessage}`, code, status);
     }

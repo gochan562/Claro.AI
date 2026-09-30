@@ -59,6 +59,16 @@ class GpuError extends Error {
 const GPU_UNAVAILABLE_RE = /No CUDA GPUs? are available|GPU unavailable|cannot provide a GPU|No GPU device/i;
 const GPU_UNAVAILABLE_MESSAGE = 'GPU unavailable right now. Please try again later.';
 
+// Opaque Gradio-wrapped worker RuntimeError: the worker died carrying only
+// the bare type name (observed when no GPU is allocated — the real "No CUDA
+// GPUs are available" detail is replaced by the wrapper), e.g.
+//   "unexpected error: 'RuntimeError'"
+//   "gradio.exceptions.Error: 'RuntimeError'"
+// A RuntimeError WITH detail (e.g. 'RuntimeError: mat1 …') is a genuine
+// model error and must NOT match: the closing quote must be followed only
+// by line end.
+const OPAQUE_WORKER_RUNTIME_ERROR_RE = /['"]RuntimeError['"]\s*($|\n)/m;
+
 function isGpuUnavailableMessage(message) {
   return GPU_UNAVAILABLE_RE.test(String(message || ''));
 }
@@ -73,6 +83,12 @@ const GPU_SCHEDULER_CODES = new Set(['zerogpu_quota', 'zerogpu_timeout', 'gpu_oo
 
 function throwClaroModelError(code, message) {
   if (!GPU_SCHEDULER_CODES.has(code) && isGpuUnavailableMessage(message)) {
+    throw new GpuError(`ZeroGPU model error: ${GPU_UNAVAILABLE_MESSAGE}`, 'gpu_unavailable', 502);
+  }
+  // Opaque wrapper form of the same condition: code model_runtime carrying a
+  // bare quoted 'RuntimeError' (Gradio wrapper signature) with no specific
+  // detail. Detailed RuntimeErrors stay model_runtime.
+  if (code === 'model_runtime' && OPAQUE_WORKER_RUNTIME_ERROR_RE.test(String(message || ''))) {
     throw new GpuError(`ZeroGPU model error: ${GPU_UNAVAILABLE_MESSAGE}`, 'gpu_unavailable', 502);
   }
   const status =

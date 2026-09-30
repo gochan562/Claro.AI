@@ -422,6 +422,56 @@ async function run() {
   assert.strictEqual(e2.code, 'zerogpu_runtime', `generic error must stay zerogpu_runtime (got ${e2.code})`);
   console.log('✓ test 16: unrelated RuntimeErrors keep their codes (never blanket-mapped)');
 
+  // ─── 17. Opaque Gradio-wrapped worker RuntimeError reclassifies ──
+  // Live shape when the worker dies without a GPU: code model_runtime with
+  // only the bare quoted type name (the CUDA detail was lost by the
+  // wrapper). Must map to gpu_unavailable; a RuntimeError WITH detail must
+  // stay model_runtime.
+  setBackendResponses((u, init) => {
+    if (u.endsWith('/gradio_api/call/v2/generate')) return { status: 200, json: { event_id: 'evt-opaque' } };
+    if (u.endsWith('/gradio_api/call/generate/evt-opaque')) {
+      return {
+        ok: true, status: 200,
+        body: 'event: complete\ndata: "[CLARO:model_runtime] unexpected error: \'RuntimeError\'\\ngradio.exceptions.Error: \'RuntimeError\'"\n\n',
+      };
+    }
+    return { status: 404, text: '?' };
+  });
+  err = null;
+  try {
+    await new ZeroGPUBackend(infra).run(
+      { model_id: 'm/m', task: 'text-generation', inputs: { prompt: 'x', max_new_tokens: 5 } },
+      new AbortController().signal
+    );
+  } catch (e) { err = e; }
+  assert(err instanceof GpuError, 'should be GpuError');
+  assert.strictEqual(err.code, 'gpu_unavailable', `opaque worker RuntimeError must map to gpu_unavailable (got ${err && err.code})`);
+  assert.strictEqual(err.status, 502);
+  assert(err.message.includes('GPU unavailable right now'), 'friendly message expected');
+  assert(!err.message.includes('unexpected error') && !err.message.includes('RuntimeError'), 'opaque text must not leak');
+  // Same bucket, but WITH detail: genuine model error, untouched.
+  setBackendResponses((u, init) => {
+    if (u.endsWith('/gradio_api/call/v2/generate')) return { status: 200, json: { event_id: 'evt-detail' } };
+    if (u.endsWith('/gradio_api/call/generate/evt-detail')) {
+      return {
+        ok: true, status: 200,
+        body: 'event: complete\ndata: "[CLARO:model_runtime] unexpected error: \'RuntimeError: mat1 and mat2 shapes cannot be multiplied\'"\n\n',
+      };
+    }
+    return { status: 404, text: '?' };
+  });
+  err = null;
+  try {
+    await new ZeroGPUBackend(infra).run(
+      { model_id: 'm/m', task: 'text-generation', inputs: { prompt: 'x', max_new_tokens: 5 } },
+      new AbortController().signal
+    );
+  } catch (e) { err = e; }
+  assert(err instanceof GpuError, 'should be GpuError');
+  assert.strictEqual(err.code, 'model_runtime', `detailed RuntimeError must stay model_runtime (got ${err && err.code})`);
+  assert(err.message.includes('mat1'), 'model detail must be preserved');
+  console.log('✓ test 17: opaque wrapped RuntimeError maps to gpu_unavailable; detailed one stays model_runtime');
+
   delete global.fetch;
   console.log('\nAll ZeroGPU integration tests passed.');
 }

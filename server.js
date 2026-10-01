@@ -672,6 +672,111 @@ app.post('/api/train', strictLimiter, async (req, res) => {
   }
 });
 
+// ── Classical-ML experiments (local sklearn; CPU only) ───────────────────
+// Separate from /api/train/* (Hugging Face fine-tuning). Structured configs
+// only; datasets enter as file text or HF references, never raw code.
+const mlBackend = require('./ml_experiment_backend');
+
+function _mlErr(res, err) {
+  const status = err.status || 500;
+  const code = err.code || 'ml_error';
+  return res.status(status).json({ error: err.message, code });
+}
+
+app.post('/api/ml/datasets/upload', strictLimiter, async (req, res) => {
+  try {
+    const body = mlBackend.validateDatasetUpload(req.body);
+    const out = await mlBackend.ingestUpload(body);
+    return res.json(out);
+  } catch (err) { return _mlErr(res, err); }
+});
+
+app.post('/api/ml/datasets/hf', strictLimiter, async (req, res) => {
+  try {
+    const body = mlBackend.validateHfDataset(req.body);
+    const out = await mlBackend.ingestHf(body);
+    return res.json(out);
+  } catch (err) { return _mlErr(res, err); }
+});
+
+app.get('/api/ml/datasets/:ws_id', async (req, res) => {
+  try {
+    return res.json(mlBackend.getWorkspace(req.params.ws_id));
+  } catch (err) { return _mlErr(res, err); }
+});
+
+app.post('/api/ml/split/preview', strictLimiter, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const out = await mlBackend.splitPreview(
+      String(b.workspace_id || b.workspaceId || ''),
+      mlBackend.validateSplitConfig(b.split),
+      mlBackend.validateView(b.dataset_view || b.datasetView),
+      b.target_column || b.targetColumn || null,
+      b.task || 'classification');
+    return res.json(out);
+  } catch (err) { return _mlErr(res, err); }
+});
+
+app.get('/api/ml/models', (req, res) => {
+  return res.json(mlBackend.getModelCatalog());
+});
+
+app.post('/api/ml/experiments', strictLimiter, async (req, res) => {
+  try {
+    const config = mlBackend.validateExperimentConfig(req.body);
+    const rec = mlBackend.runExperiment(config);
+    return res.json({ experiment_id: rec.experiment_id, status: rec.status, config });
+  } catch (err) { return _mlErr(res, err); }
+});
+
+app.get('/api/ml/experiments', (req, res) => {
+  try {
+    return res.json({ experiments: mlBackend.listExperiments() });
+  } catch (err) { return _mlErr(res, err); }
+});
+
+app.get('/api/ml/experiments/compare', (req, res) => {
+  try {
+    const ids = String(req.query.ids || '').split(',').map((s) => s.trim()).filter(Boolean);
+    return res.json({ experiments: mlBackend.compareExperiments(ids) });
+  } catch (err) { return _mlErr(res, err); }
+});
+
+app.get('/api/ml/experiments/:id', (req, res) => {
+  try {
+    return res.json(mlBackend.getExperiment(req.params.id));
+  } catch (err) { return _mlErr(res, err); }
+});
+
+app.post('/api/ml/experiments/:id/rerun', strictLimiter, async (req, res) => {
+  try {
+    const rec = mlBackend.rerunExperiment(req.params.id);
+    return res.json({ experiment_id: rec.experiment_id, status: rec.status });
+  } catch (err) { return _mlErr(res, err); }
+});
+
+app.patch('/api/ml/experiments/:id', async (req, res) => {
+  try {
+    const rec = mlBackend.renameExperiment(req.params.id, (req.body || {}).name);
+    return res.json({ experiment_id: rec.experiment_id, name: rec.name });
+  } catch (err) { return _mlErr(res, err); }
+});
+
+app.delete('/api/ml/experiments/:id', async (req, res) => {
+  try {
+    return res.json(mlBackend.deleteExperiment(req.params.id));
+  } catch (err) { return _mlErr(res, err); }
+});
+
+app.post('/api/ml/predict', strictLimiter, async (req, res) => {
+  try {
+    const input = mlBackend.validatePredictRequest(req.body);
+    const out = await mlBackend.predictWithExperiment(input.experiment_id, input);
+    return res.json(out);
+  } catch (err) { return _mlErr(res, err); }
+});
+
 // Fallback for client-side routing: serve index.html for unknown non-API routes
 app.get('/*splat', (req,res,next)=>{
   if (req.path.startsWith('/api/')) return next();

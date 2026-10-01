@@ -8,3 +8,5 @@ huggingface_hub
 pillow
 numpy
 scikit-learn
+pandas
+joblib

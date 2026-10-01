@@ -302,6 +302,13 @@ let notebookRegistry = {
         cell.content = JSON.stringify(cell.training, null, 2);
       }
 
+      // Classical-ML cells (dataset/split/preprocess/predictor/evaluate/
+      // predict) carry serializable state in cell.ml; rendering and
+      // execution live in ml_experiment.js so the HF paths stay untouched.
+      if (typeof ML_CELL_TYPES !== 'undefined' && ML_CELL_TYPES.includes(type)) {
+        cell.ml = (typeof defaultMlCell === 'function') ? defaultMlCell(type) : { kind: type, version: 1, status: 'idle', error: '' };
+      }
+
       return cell;
     }
 
@@ -467,10 +474,18 @@ let notebookRegistry = {
             <div class="add-cell-menu-item" onclick="addCell('parameter');closeAddCellMenu()"><span class="menu-icon">🎛️</span><div><div>Parameter Cell</div><div class="menu-desc">Sliders for model config</div></div></div>
             <div class="add-cell-menu-sep"></div>
             <div class="add-cell-menu-item" onclick="addCell('training');closeAddCellMenu()"><span class="menu-icon">🏋️</span><div><div>Training Cell</div><div class="menu-desc">Fine-tune a model on a dataset</div></div></div>
+            <div class="add-cell-menu-sep"></div>
+            <div class="add-cell-menu-item" onclick="addCell('dataset');closeAddCellMenu()"><span class="menu-icon">🗂️</span><div><div>Dataset Cell</div><div class="menu-desc">Tabular data for ML experiments</div></div></div>
+            <div class="add-cell-menu-item" onclick="addCell('split');closeAddCellMenu()"><span class="menu-icon">✂️</span><div><div>Split Cell</div><div class="menu-desc">Train/validation/test split</div></div></div>
+            <div class="add-cell-menu-item" onclick="addCell('preprocess');closeAddCellMenu()"><span class="menu-icon">🧹</span><div><div>Preprocess Cell</div><div class="menu-desc">Impute, scale, encode</div></div></div>
+            <div class="add-cell-menu-item" onclick="addCell('predictor');closeAddCellMenu()"><span class="menu-icon">🌳</span><div><div>Predictor Cell</div><div class="menu-desc">Classical sklearn model</div></div></div>
+            <div class="add-cell-menu-item" onclick="addCell('evaluate');closeAddCellMenu()"><span class="menu-icon">📊</span><div><div>Evaluate Cell</div><div class="menu-desc">Metrics and curves</div></div></div>
+            <div class="add-cell-menu-item" onclick="addCell('predict');closeAddCellMenu()"><span class="menu-icon">🔮</span><div><div>Predict Cell</div><div class="menu-desc">Batch predictions + CSV</div></div></div>
           </div>
         </div>
         <button class="toolbar-btn run-btn" onclick="runAllCells()">▶ Run All</button>
         <button class="toolbar-btn" onclick="runMarkdownCells()">▶ Run Markdown</button>
+        <button class="toolbar-btn" onclick="toggleMlExperiments()">🧪 Experiments</button>
         <div class="gpu-indicator" id="gpu-indicator">
           <span class="gpu-dot idle" id="gpu-dot"></span>
           <div class="gpu-tooltip" id="gpu-tooltip">⚪ GPU: A10G · Idle (connects when you run a cell)</div>
@@ -2893,6 +2908,11 @@ print(f"Loaded trained model from {MODEL_DIR}")
     }
 
     function createCellElement(cell) {
+      // Classical-ML cells render through ml_experiment.js (same notebook
+      // chrome: header, Run/Delete, status). All other types unchanged below.
+      if (cell.ml && typeof buildMlCellElement === 'function') {
+        return buildMlCellElement(cell);
+      }
       const div = document.createElement('div');
       div.className = 'notebook-cell';
       div.id = `cell-${cell.id}`;
@@ -2973,6 +2993,11 @@ print(f"Loaded trained model from {MODEL_DIR}")
       
       const cell = notebook.cells.find(c => c.id === cellId);
       if (!cell) return;
+      // Classical-ML cells dispatch to ml_experiment.js; HF/GPU paths below
+      // are unchanged.
+      if (cell.ml && typeof mlRunCell === 'function') {
+        return mlRunCell(cellId);
+      }
       if (cell.type === 'training') {
         return startTrainingCell(cellId);
       }

@@ -242,9 +242,9 @@ let notebookRegistry = {
       }
     }
 
-    function addCell(type) {
+    function buildCell(type) {
       const notebook = getActiveNotebook();
-      if (!notebook) return;
+      if (!notebook) return null;
 
       const cell = {
         id: notebook.nextCellId++,
@@ -302,9 +302,65 @@ let notebookRegistry = {
         cell.content = JSON.stringify(cell.training, null, 2);
       }
 
+      return cell;
+    }
+
+    function addCell(type) {
+      const notebook = getActiveNotebook();
+      if (!notebook) return;
+      const cell = buildCell(type);
+      if (!cell) return;
       notebook.cells.push(cell);
       updateNotebook();
       renderNotebookEditor();
+      revealCell(cell.id);
+    }
+
+    // Insert a new cell directly after `afterCellId` (Colab/Jupyter-style
+    // between-cell insertion). Falls back to appending when the anchor is
+    // gone. Reuses the same cell factory, ids, state and rendering as addCell.
+    function insertCellAfter(afterCellId, type) {
+      const notebook = getActiveNotebook();
+      if (!notebook) return;
+      const cell = buildCell(type);
+      if (!cell) return;
+      const idx = notebook.cells.findIndex(c => c.id === afterCellId);
+      if (idx === -1) notebook.cells.push(cell);
+      else notebook.cells.splice(idx + 1, 0, cell);
+      updateNotebook();
+      renderNotebookEditor();
+      revealCell(cell.id);
+    }
+
+    function revealCell(cellId) {
+      scrollToCell(cellId);
+      focusCellEditor(cellId);
+    }
+
+    // Scroll the notebook's own scroll container (never the window) so the
+    // cell lands around the lower-middle of the viewport. Only invoked for
+    // newly added/inserted cells — never on unrelated updates.
+    function scrollToCell(cellId) {
+      const container = document.getElementById('notebook-cells');
+      const el = document.getElementById(`cell-${cellId}`);
+      if (!container || !el) return;
+      const top = Math.max(0, (el.offsetTop || 0) - container.clientHeight * 0.35);
+      try {
+        if (typeof container.scrollTo === 'function') container.scrollTo({ top, behavior: 'smooth' });
+        else container.scrollTop = top;
+      } catch (_) {
+        try { container.scrollTop = top; } catch (_) {}
+      }
+    }
+
+    // Focus the cell's editor when it has one (code/markdown/model).
+    // Parameter/training cells manage their own UI and are left alone.
+    function focusCellEditor(cellId) {
+      try {
+        const ed = cellEditors[cellId];
+        if (ed && typeof ed.focus === 'function') { ed.focus(); return true; }
+      } catch (_) {}
+      return false;
     }
 
     function deleteCell(cellId) {
@@ -430,7 +486,19 @@ let notebookRegistry = {
         const cellElement = createCellElement(cell);
         container.appendChild(cellElement);
         initCellEditor(cell);
+        container.appendChild(createInsertDivider(cell.id));
       });
+    }
+
+    // Compact Colab-style insertion control rendered between cells (and
+    // after the last one). Real buttons, keyboard accessible, quiet until
+    // hovered. Numeric cell ids match the existing inline-onclick convention.
+    function createInsertDivider(afterCellId) {
+      const d = document.createElement('div');
+      d.className = 'cell-insert-divider';
+      d.setAttribute('data-after-cell', afterCellId);
+      d.innerHTML = `<span class="cell-insert-line"></span><span class="cell-insert-buttons"><button class="cell-insert-btn" onclick="insertCellAfter(${afterCellId},'code')">+ Code</button><button class="cell-insert-btn" onclick="insertCellAfter(${afterCellId},'markdown')">+ Markdown</button></span>`;
+      return d;
     }
 
     function setMarkdownRendered(cellId, html) {

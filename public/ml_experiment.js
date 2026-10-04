@@ -152,7 +152,8 @@ function mlPredictorCells(withExperiment) {
 function defaultMlCell(type) {
   const base = { kind: type, version: 1, status: 'idle', error: '' };
   if (type === 'dataset') {
-    return { ...base, source: 'upload', filename: '', dataset_id: '', hf_split: '',
+    return { ...base, source: 'huggingface', filename: '', dataset_id: '', hf_title: '',
+      hf_config: '', hf_split: '',
       workspace_id: '', profile: null,
       view: { drop_columns: [], filters: [], sample: {} },
       target_column: '', feature_columns: null, exploreOpen: false };
@@ -247,9 +248,7 @@ function mlDatasetBody(cell) {
     h += `<label>File <input type="file" data-ml-file="${cell.id}" accept=".csv,.tsv,.tab,.json"></label>` +
       `<button class="cell-btn" onclick="mlUploadDataset(${cell.id})">Upload</button>`;
   } else {
-    h += `<label>Dataset ID ${mlTextInput('dataset_id', m.dataset_id, 'owner/name', '220px')}</label>` +
-      `<label>Split ${mlTextInput('hf_split', m.hf_split, 'train (blank = auto)', '140px')}</label>` +
-      `<button class="cell-btn" onclick="mlLoadHfDataset(${cell.id})">Load</button>`;
+    h += mlHfBrowserHtml(cell);
   }
   h += `</div>`;
   if (!m.profile) {
@@ -300,17 +299,327 @@ async function mlUploadDataset(cellId) {
   }
 }
 
-async function mlLoadHfDataset(cellId) {
+// Full dataset-cell body renderer (also used for lightweight single-cell
+// re-renders that preserve scroll position and input focus).
+function mlDatasetBodyInner(cell) {
+  return mlDatasetBody(cell);
+}
+
+// ── Hugging Face dataset browser (metadata only; contents load on demand) ──
+// Ephemeral browse state lives outside cell.ml (never persisted); selection
+// (dataset_id/title/config/split) is persisted in cell.ml like before.
+const mlHfUi = {};
+
+function mlHfState(cellId) {
+  const k = String(cellId);
+  if (!mlHfUi[k]) {
+    mlHfUi[k] = { q: '', task: '', language: '', sort: 'downloads',
+      results: [], next_cursor: null, searching: false, searched: false,
+      selected_info: null, info_loading: false, info_loaded_for: '', error: '' };
+  }
+  return mlHfUi[k];
+}
+
+const ML_HF_TASKS = [['', '(any task)'], ['text-classification', 'text classification'],
+  ['tabular-classification', 'tabular classification'], ['tabular-regression', 'tabular regression'],
+  ['token-classification', 'token classification'], ['question-answering', 'question answering'],
+  ['summarization', 'summarization'], ['translation', 'translation'],
+  ['text-generation', 'text generation'], ['image-classification', 'image classification']];
+const ML_HF_SORTS = [['downloads', 'Downloads'], ['likes', 'Likes'], ['lastModified', 'Recently updated']];
+
+function mlHfBrowserHtml(cell) {
+  const m = cell.ml;
+  const ui = mlHfState(cell.id);
+  let h = `<div class="ml-row">` +
+    `<input class="ml-input" data-ml-hf="q" value="${mlEsc(ui.q)}" placeholder="🔍 Search datasets..." style="flex:1;min-width:160px"` +
+    ` onkeydown="if(event.key==='Enter'){event.preventDefault();mlHfSearch(${cell.id},true);}">` +
+    `<button class="cell-btn run" onclick="mlHfSearch(${cell.id},true)">Search</button></div>`;
+  h += `<div class="ml-row">` +
+    `<label>Task ${mlSelectHtml('hf_task', ML_HF_TASKS, ui.task)}</label>` +
+    `<label>Language ${mlTextInput('hf_language', ui.language, 'e.g. en', '90px')}</label>` +
+    `<label>Sort ${mlSelectHtml('hf_sort', ML_HF_SORTS, ui.sort)}</label></div>`;
+  if (ui.searching) h += `<div class="ml-hint">Searching Hugging Face…</div>`;
+  if (ui.error) h += `<div class="ml-error">⚠️ ${mlEsc(ui.error)}</div>`;
+  if (!ui.searching && !ui.results.length && !ui.error) {
+    h += `<div class="ml-hint">Search above, or pick from popular datasets below.</div>`;
+  }
+  if (ui.results.length) {
+    h += `<div class="ml-hf-results">` + ui.results.map((d) => (
+      `<div class="ml-hf-row"><div class="ml-hf-main">` +
+      `<div class="ml-hf-id">${mlEsc(d.id)}</div>` +
+      (d.description ? `<div class="ml-hf-desc">${mlEsc(d.description.slice(0, 160))}</div>` : '') +
+      `<div class="ml-hf-meta">${d.downloads ? `⬇ ${mlFmtCount(d.downloads)} · ` : ''}` +
+      `${d.likes ? `♡ ${mlFmtCount(d.likes)}` : ''}` +
+      `${(d.tasks || []).slice(0, 3).map((t) => ` <span class="ml-tag">${mlEsc(t)}</span>`).join('')}` +
+      `</div></div>` +
+      `<button class="cell-btn" onclick="mlHfSelect(${cell.id},'${mlEsc(d.id).replace(/'/g, '&#39;')}')">Select</button></div>`
+    )).join('') + `</div>`;
+    if (ui.next_cursor) {
+      h += `<div class="ml-row"><button class="cell-btn" onclick="mlHfMore(${cell.id})">Load more</button></div>`;
+    }
+  }
+  // Selection + split/config + load (existing ingest path).
+  h += `<div class="ml-sec"><strong>Selected dataset</strong>`;
+  if (m.dataset_id) {
+    h += `<div class="ml-summary"><strong>${mlEsc(m.dataset_id)}</strong>` +
+      (m.hf_title ? ` — ${mlEsc(m.hf_title)}` : '') + `</div>`;
+    h += mlHfSelectionHtml(cell, ui);
+  } else {
+    h += `<div class="ml-hint">No dataset selected yet.</div>`;
+  }
+  h += `<div class="ml-row"><label>Manual ID ${mlTextInput('dataset_id_manual', '', 'owner/name', '200px')}</label>` +
+    `<button class="cell-btn" onclick="mlHfManual(${cell.id})">Use ID</button></div>`;
+  h += `</div>`;
+  // Auto-load popular datasets once per cell when the browser is untouched.
+  if (!m.workspace_id && !ui.searched && !ui.searching && !ui.results.length && !ui.error) {
+    ui.searching = true;
+    setTimeout(() => mlHfPopular(cell.id), 0);
+  }
+  return h;
+}
+
+function mlSelectHtml(field, options, current) {
+  return `<select class="ml-input" data-ml-hf="${field}">` +
+    options.map((o) => `<option value="${mlEsc(o[0])}"${String(o[0]) === String(current) ? ' selected' : ''}>${mlEsc(o[1])}</option>`).join('') +
+    `</select>`;
+}
+
+function mlFmtCount(n) {
+  n = Number(n) || 0;
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+  return String(n);
+}
+
+function mlHfSelectionHtml(cell, ui) {
+  const m = cell.ml;
+  const info = ui.selected_info;
+  let h = '';
+  if (ui.info_loading) return `<div class="ml-hint">Loading dataset details…</div>`;
+  if (info) {
+    if (info.description) h += `<div class="ml-hf-desc">${mlEsc(info.description.slice(0, 300))}</div>`;
+    const cfgs = info.configs || [];
+    if (cfgs.length > 1) {
+      h += `<div class="ml-row"><label>Configuration ${mlSelectHtml('hf_config_sel', cfgs.map((c) => [c, c]), m.hf_config || cfgs[0])}</label></div>`;
+    } else if (cfgs.length === 1 && !m.hf_config) {
+      m.hf_config = cfgs[0];
+    }
+    const splits = info.splits || {};
+    const cfgKey = (m.hf_config && splits[m.hf_config]) ? m.hf_config : (cfgs[0] || Object.keys(splits)[0]);
+    const opts = (cfgKey && splits[cfgKey]) || [];
+    if (opts.length) {
+      h += `<div class="ml-row"><label>Split ${mlSelectHtml('hf_split_sel', opts.map((s) => [s, s]), m.hf_split || opts[0])}</label></div>`;
+    } else {
+      h += `<div class="ml-row"><label>Split ${mlTextInput('hf_split_manual', m.hf_split, 'train (blank = auto)', '160px')}</label></div>`;
+    }
+  } else {
+    h += `<div class="ml-row"><label>Split ${mlTextInput('hf_split_manual', m.hf_split, 'train (blank = auto)', '160px')}</label></div>`;
+  }
+  h += `<div class="ml-row"><button class="cell-btn run" onclick="mlLoadHfDataset(${cell.id})">Load Dataset</button></div>`;
+  return h;
+}
+
+function mlHfReadBar(cellId) {
+  const el = document.getElementById(`cell-${cellId}`);
+  const out = { q: '', task: '', language: '', sort: 'downloads' };
+  if (!el) return out;
+  el.querySelectorAll('[data-ml-hf]').forEach((input) => {
+    out[input.getAttribute('data-ml-hf')] = input.value;
+  });
+  return out;
+}
+
+async function mlHfSearch(cellId, reset) {
+  const cell = mlFindCell(cellId);
+  if (!cell) return;
+  const ui = mlHfState(cellId);
+  const bar = mlHfReadBar(cellId);
+  ui.q = bar.q; ui.task = bar.task; ui.language = bar.language; ui.sort = bar.sort;
+  if (reset) { ui.results = []; ui.next_cursor = null; }
+  ui.searching = true; ui.error = '';
+  mlRerenderCell(cellId);
+  try {
+    const qs = new URLSearchParams({ sort: ui.sort || 'downloads', limit: '20' });
+    if (ui.q.trim()) qs.set('q', ui.q.trim());
+    if (ui.task) qs.set('task', ui.task);
+    if (ui.language.trim()) qs.set('language', ui.language.trim());
+    const data = await mlApi(`/api/ml/datasets/search?${qs.toString()}`);
+    ui.results = data.datasets || [];
+    ui.next_cursor = data.next_cursor || null;
+    ui.searched = true;
+  } catch (e) {
+    ui.error = e.message;
+  }
+  ui.searching = false;
+  mlSaveAndRenderLite(cellId);
+}
+
+async function mlHfPopular(cellId) {
+  const cell = mlFindCell(cellId);
+  if (!cell) return;
+  const ui = mlHfState(cellId);
+  try {
+    const data = await mlApi('/api/ml/datasets/search?sort=downloads&limit=8');
+    const still = mlFindCell(cellId);
+    if (!still) return;
+    const u2 = mlHfState(cellId);
+    if (u2.searched) return; // user searched meanwhile; don't clobber
+    u2.results = data.datasets || [];
+    u2.next_cursor = null;
+    u2.searched = true;
+  } catch (e) {
+    const still = mlFindCell(cellId);
+    if (still) mlHfState(cellId).error = e.message;
+  }
+  const still = mlFindCell(cellId);
+  if (still) {
+    mlHfState(cellId).searching = false;
+    mlSaveAndRenderLite(cellId);
+  }
+}
+
+async function mlHfMore(cellId) {
+  const cell = mlFindCell(cellId);
+  if (!cell) return;
+  const ui = mlHfState(cellId);
+  if (!ui.next_cursor || ui.searching) return;
+  ui.searching = true; ui.error = '';
+  mlRerenderCell(cellId);
+  try {
+    const qs = new URLSearchParams({ sort: ui.sort || 'downloads', limit: '20', cursor: ui.next_cursor });
+    if (ui.q.trim()) qs.set('q', ui.q.trim());
+    if (ui.task) qs.set('task', ui.task);
+    if (ui.language.trim()) qs.set('language', ui.language.trim());
+    const data = await mlApi(`/api/ml/datasets/search?${qs.toString()}`);
+    const seen = new Set(ui.results.map((d) => d.id));
+    (data.datasets || []).forEach((d) => { if (!seen.has(d.id)) ui.results.push(d); });
+    ui.next_cursor = data.next_cursor || null;
+  } catch (e) {
+    ui.error = e.message;
+  }
+  ui.searching = false;
+  mlSaveAndRenderLite(cellId);
+}
+
+async function mlHfSelect(cellId, datasetId) {
+  const cell = mlFindCell(cellId);
+  if (!cell) return;
+  cell.ml.dataset_id = datasetId;
+  cell.ml.hf_title = '';
+  cell.ml.hf_config = '';
+  cell.ml.hf_split = '';
+  const ui = mlHfState(cellId);
+  ui.selected_info = null;
+  ui.info_loaded_for = '';
+  ui.error = '';
+  mlSaveAndRenderLite(cellId);
+  await mlHfEnsureInfo(cellId);
+}
+
+async function mlHfManual(cellId) {
   const cell = mlFindCell(cellId);
   if (!cell) return;
   const f = mlReadForm(cellId);
+  const val = String(f.dataset_id_manual || '').trim();
+  if (!val) return;
+  cell.ml.dataset_id = val;
+  cell.ml.hf_title = '';
+  cell.ml.hf_config = '';
+  cell.ml.hf_split = '';
+  const ui = mlHfState(cellId);
+  ui.selected_info = null;
+  ui.info_loaded_for = '';
+  ui.error = '';
+  mlSaveAndRenderLite(cellId);
+  await mlHfEnsureInfo(cellId);
+}
+
+async function mlHfEnsureInfo(cellId) {
+  const cell = mlFindCell(cellId);
+  if (!cell || !cell.ml.dataset_id) return;
+  const ui = mlHfState(cellId);
+  if (ui.info_loading) return;
+  if (ui.selected_info && ui.info_loaded_for === cell.ml.dataset_id) return;
+  ui.info_loading = true;
+  ui.error = '';
+  mlRerenderCell(cellId);
+  try {
+    const info = await mlApi(`/api/ml/datasets/info?dataset_id=${encodeURIComponent(cell.ml.dataset_id)}`);
+    const still = mlFindCell(cellId);
+    if (!still || still.ml.dataset_id !== cell.ml.dataset_id) return;
+    const u2 = mlHfState(cellId);
+    u2.selected_info = info;
+    u2.info_loaded_for = cell.ml.dataset_id;
+    if (info.title || info.name) still.ml.hf_title = info.title || info.name;
+    const cfgs = info.configs || [];
+    if (cfgs.length && !still.ml.hf_config) still.ml.hf_config = cfgs[0];
+    const splitsByCfg = (info.splits && typeof info.splits === 'object') ? info.splits : {};
+    const cfgKey = (still.ml.hf_config && splitsByCfg[still.ml.hf_config])
+      ? still.ml.hf_config : (cfgs[0] || Object.keys(splitsByCfg)[0]);
+    const splits = (cfgKey && splitsByCfg[cfgKey]) || [];
+    if (splits.length && !still.ml.hf_split) still.ml.hf_split = splits[0];
+  } catch (e) {
+    const still = mlFindCell(cellId);
+    if (still) mlHfState(cellId).error = e.message;
+  }
+  const still = mlFindCell(cellId);
+  if (still) {
+    mlHfState(cellId).info_loading = false;
+    mlSaveAndRenderLite(cellId);
+  }
+}
+
+function mlRerenderCell(cellId) {
+  // Lightweight re-render of one cell body (no full notebook render, so
+  // search input focus and scroll position survive).
+  try {
+    const cell = mlFindCell(cellId);
+    if (!cell) return;
+    const body = document.querySelector(`#cell-${cellId} .ml-cell-body`);
+    if (!body || cell.ml.kind !== 'dataset') return;
+    body.innerHTML = mlDatasetBodyInner(cell);
+  } catch (_) {}
+}
+
+function mlSaveAndRenderLite(cellId) {
+  if (typeof updateNotebook === 'function') {
+    try { updateNotebook(); } catch (_) {}
+  }
+  const cell = (typeof mlFindCell === 'function') ? mlFindCell(cellId) : null;
+  if (cell && cell.ml && cell.ml.kind === 'dataset') mlRerenderCell(cellId);
+  else if (typeof renderNotebookEditor === 'function') {
+    try { renderNotebookEditor(); } catch (_) {}
+  }
+}
+
+async function mlLoadHfDataset(cellId) {
+  const cell = mlFindCell(cellId);
+  if (!cell) return;
+  const ui = mlHfState(cellId);
+  const el = document.getElementById(`cell-${cellId}`);
+  const pick = (sel) => {
+    const n = el && el.querySelector(`[data-ml-hf="${sel}"], [data-ml-field="${sel}"]`);
+    return (n && n.value !== undefined ? String(n.value) : '').trim();
+  };
+  const cfgSel = pick('hf_config_sel');
+  const splitSel = pick('hf_split_sel') || pick('hf_split_manual');
+  const manualId = pick('dataset_id_manual');
+  const dataset_id = (cell.ml.dataset_id || manualId).trim();
+  if (!dataset_id) {
+    mlSetStatus(cell, 'error', 'Select a dataset or enter its ID first.');
+    return;
+  }
   mlSetStatus(cell, 'working', '');
   try {
     const data = await mlApi('/api/ml/datasets/hf', {
-      method: 'POST', body: { dataset_id: f.dataset_id, split: f.hf_split || null },
+      method: 'POST',
+      body: { dataset_id, split: splitSel || null, config: cfgSel || null },
     });
+    const info = ui.selected_info;
     Object.assign(cell.ml, {
-      dataset_id: f.dataset_id, hf_split: f.hf_split || '',
+      dataset_id, hf_config: cfgSel || cell.ml.hf_config || '',
+      hf_split: splitSel || cell.ml.hf_split || '',
+      hf_title: (info && (info.title || info.name)) || cell.ml.hf_title || '',
       workspace_id: data.workspace_id, profile: data.profile,
       target_column: data.profile.columns[0] || '',
       feature_columns: null,

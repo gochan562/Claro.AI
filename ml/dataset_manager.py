@@ -60,18 +60,21 @@ def load_frame_from_text(filename, content, max_bytes, max_rows):
     return df, {'format': fmt, 'bytes': nbytes, 'truncated': truncated}
 
 
-def load_frame_from_hf(dataset_id, split=None, max_rows=50000):
+def load_frame_from_hf(dataset_id, split=None, max_rows=50000, config=None):
     try:
         from datasets import load_dataset
     except Exception as e:
         raise DatasetError('Hugging Face datasets library unavailable: %s' % e)
     if not dataset_id or not isinstance(dataset_id, str):
         raise DatasetError('dataset_id is required.')
+    if config is not None and (not isinstance(config, str) or not config.strip()):
+        raise DatasetError('Invalid dataset configuration.')
+    name = config.strip() if isinstance(config, str) and config.strip() else None
     try:
-        ds = load_dataset(dataset_id.strip(), split=split, streaming=False)
+        ds = load_dataset(dataset_id.strip(), name, split=split, streaming=False)
     except Exception:
         try:
-            full = load_dataset(dataset_id.strip(), streaming=False)
+            full = load_dataset(dataset_id.strip(), name, streaming=False)
         except Exception as e:
             raise DatasetError('Could not load Hugging Face dataset %r: %s' % (dataset_id, e))
         names = list(full.keys())

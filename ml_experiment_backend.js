@@ -136,7 +136,186 @@ function validateHfDataset(body) {
     throw _err(`Invalid dataset_id: ${dataset_id}. Use owner/name.`, 'bad_request', 400);
   }
   const split = body.split == null || body.split === '' ? null : String(body.split).slice(0, 64);
-  return { dataset_id, split };
+  const config = body.config == null || body.config === '' ? null : String(body.config).slice(0, 200);
+  return { dataset_id, split, config };
+}
+
+// ── Hugging Face Hub dataset discovery (metadata only, never contents) ──
+// Fixed upstream bases only — the client sends structured params, never URLs.
+const HF_HUB_API = 'https://huggingface.co/api/datasets';
+const HF_SPLITS_API = 'https://datasets-server.huggingface.co/splits';
+const HF_SEARCH_TTL_MS = 60000;
+const HF_SEARCH_CACHE_MAX = 100;
+const _hfSearchCache = new Map(); // key -> { at, data }
+const HF_SORTS = ['downloads', 'likes', 'lastModified'];
+const HF_TASKS = ['text-classification', 'token-classification', 'question-answering',
+  'summarization', 'translation', 'text-generation', 'image-classification',
+  'object-detection', 'tabular-classification', 'tabular-regression',
+  'tabular-to-tabular', 'audio-classification', 'reinforcement-learning'];
+
+function _hfAuthHeaders() {
+  const token = process.env.HF_TOKEN || process.env.HUGGING_FACE_HUB_TOKEN || '';
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+function _hfCacheGet(key) {
+  const hit = _hfSearchCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.at > HF_SEARCH_TTL_MS) {
+    _hfSearchCache.delete(key);
+    return null;
+  }
+  return hit.data;
+}
+
+function _hfCacheSet(key, data) {
+  if (_hfSearchCache.size >= HF_SEARCH_CACHE_MAX) {
+    const oldest = _hfSearchCache.keys().next().value;
+    _hfSearchCache.delete(oldest);
+  }
+  _hfSearchCache.set(key, { at: Date.now(), data });
+}
+
+function _hfFriendlyError(status, context) {
+  if (status === 401 || status === 403) {
+    return _err('That dataset is gated and requires access.' +
+      (process.env.HF_TOKEN ? '' : ' Set HF_TOKEN on the server to access gated datasets.'),
+      'gated_dataset', status);
+  }
+  if (status === 404) {
+    return _err(`Dataset could not be found${context ? ` (${context})` : ''}.`, 'not_found', 404);
+  }
+  if (status === 429) {
+    return _err('Hugging Face is rate-limiting requests. Try again shortly.', 'rate_limited', 429);
+  }
+  return _err('Hugging Face is temporarily unavailable. Try again.', 'hf_unavailable', 502);
+}
+
+function validateHfSearch(query) {
+  query = query || {};
+  const q = query.q == null ? '' : String(query.q).slice(0, 100);
+  const task = query.task == null || query.task === '' ? null : String(query.task).slice(0, 64);
+  if (task && !HF_TASKS.includes(task)) throw _err(`Unknown task filter: ${task}.`, 'bad_request', 400);
+  const language = query.language == null || query.language === '' ? null : String(query.language).slice(0, 10);
+  if (language && !/^[a-z]{2,3}(-[A-Za-z]{2,4})?$/.test(language)) {
+    throw _err(`Invalid language filter: ${language}.`, 'bad_request', 400);
+  }
+  const sort = query.sort == null || query.sort === '' ? 'downloads' : String(query.sort);
+  if (!HF_SORTS.includes(sort)) throw _err(`Unknown sort: ${sort}.`, 'bad_request', 400);
+  let limit = query.limit == null || query.limit === '' ? 20 : Number(query.limit);
+  if (!Number.isFinite(limit) || !Number.isInteger(limit) || limit < 1) {
+    throw _err('limit must be an integer >= 1.', 'bad_request', 400);
+  }
+  limit = Math.min(limit, 50);
+  const cursor = query.cursor == null || query.cursor === '' ? null : String(query.cursor).slice(0, 500);
+  return { q, task, language, sort, limit, cursor };
+}
+
+function _pickTags(tags, prefix) {
+  const out = [];
+  for (const t of tags || []) {
+    if (typeof t === 'string' && t.startsWith(prefix)) out.push(t.slice(prefix.length));
+  }
+  return out.slice(0, 12);
+}
+
+function _mapHubDataset(d) {
+  const id = String(d.id || '');
+  const card = (d.cardData && typeof d.cardData === 'object') ? d.cardData : {};
+  return {
+    id,
+    name: id.includes('/') ? id.split('/').slice(1).join('/') : id,
+    author: id.includes('/') ? id.split('/')[0] : '',
+    description: String(card.description || '').slice(0, 500),
+    downloads: Number(d.downloads) || 0,
+    likes: Number(d.likes) || 0,
+    last_modified: d.lastModified || d.last_modified || null,
+    tasks: _pickTags(d.tags, 'task_categories:'),
+    languages: _pickTags(d.tags, 'language:'),
+  };
+}
+
+function _nextCursorFromLink(link) {
+  if (!link) return null;
+  const m = String(link).match(/<([^>]*[?&]cursor=([^>&]+))>;\s*rel="next"/);
+  return m ? decodeURIComponent(m[2]) : null;
+}
+
+async function searchHfDatasets(params) {
+  const key = JSON.stringify(params);
+  const cached = _hfCacheGet(key);
+  if (cached) return cached;
+  const qs = new URLSearchParams({
+    sort: params.sort, direction: '-1', limit: String(params.limit),
+  });
+  if (params.q) qs.set('search', params.q);
+  // NOTE: Hub `filter` accepts a single comma-joined value; task+language combine here.
+  const filters = [];
+  if (params.task) filters.push(`task_categories:${params.task}`);
+  if (params.language) filters.push(`language:${params.language}`);
+  if (filters.length) qs.set('filter', filters.join(','));
+  if (params.cursor) qs.set('cursor', params.cursor);
+  let res;
+  try {
+    res = await fetch(`${HF_HUB_API}?${qs.toString()}`, { headers: _hfAuthHeaders() });
+  } catch (e) {
+    throw _err('Hugging Face is temporarily unavailable. Try again.', 'hf_unavailable', 502);
+  }
+  if (!res.ok) throw _hfFriendlyError(res.status);
+  let list;
+  try {
+    list = await res.json();
+  } catch (_) {
+    throw _err('Hugging Face is temporarily unavailable. Try again.', 'hf_unavailable', 502);
+  }
+  if (!Array.isArray(list)) throw _err('Hugging Face is temporarily unavailable. Try again.', 'hf_unavailable', 502);
+  const data = {
+    datasets: list.map(_mapHubDataset).filter((d) => d.id.includes('/')),
+    next_cursor: _nextCursorFromLink(res.headers.get('link')),
+  };
+  _hfCacheSet(key, data);
+  return data;
+}
+
+async function getHfDatasetInfo(dataset_id) {
+  const id = _nonEmptyString(dataset_id, 'dataset_id');
+  if (!/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(id)) {
+    throw _err(`Invalid dataset_id: ${id}. Use owner/name.`, 'bad_request', 400);
+  }
+  let meta;
+  try {
+    const res = await fetch(`${HF_HUB_API}/${id}`, { headers: _hfAuthHeaders() });
+    if (!res.ok) throw _hfFriendlyError(res.status, id);
+    meta = await res.json();
+  } catch (e) {
+    if (e && e.code) throw e;
+    throw _err('Hugging Face is temporarily unavailable. Try again.', 'hf_unavailable', 502);
+  }
+  const mapped = _mapHubDataset(meta || {});
+  mapped.id = id;
+  if (!mapped.author && id.includes('/')) mapped.author = id.split('/')[0];
+  let configs = [];
+  let splits = {};
+  try {
+    const res = await fetch(`${HF_SPLITS_API}?dataset=${encodeURIComponent(id)}`, { headers: _hfAuthHeaders() });
+    if (res.ok) {
+      const body = await res.json();
+      const rows = Array.isArray(body && body.splits) ? body.splits : [];
+      const byConfig = {};
+      for (const r of rows) {
+        const c = String((r && r.config) || 'default');
+        const s = String((r && r.split) || '');
+        if (!s) continue;
+        if (!byConfig[c]) byConfig[c] = [];
+        if (!byConfig[c].includes(s)) byConfig[c].push(s);
+      }
+      configs = Object.keys(byConfig);
+      splits = byConfig;
+    }
+  } catch (_) {
+    // Split metadata is best-effort; the loader still tries the split.
+  }
+  return { ...mapped, configs, splits };
 }
 
 function validateView(view) {
@@ -366,13 +545,14 @@ async function ingestUpload({ filename, content }) {
   }
 }
 
-async function ingestHf({ dataset_id, split }) {
+async function ingestHf({ dataset_id, split, config }) {
   const ws_id = _genWsId();
-  const { stdout } = await _runPython(
-    ['ml/experiment_runner.py', 'dataset-ingest-hf',
+  const args = ['ml/experiment_runner.py', 'dataset-ingest-hf',
       '--ws', ws_id, '--workspace-base', path.join(__dirname),
       '--dataset-id', dataset_id, '--split', split || '',
-      '--max-rows', String(ML_MAX_DATASET_ROWS)],
+      '--max-rows', String(ML_MAX_DATASET_ROWS)];
+  if (config) args.push('--config', config);
+  const { stdout } = await _runPython(args,
     { timeoutMs: 300000, maxBuffer: 32 * 1024 * 1024 });
   const payload = _lastJsonLine(stdout);
   if (!payload || payload.type !== 'result') {
@@ -707,6 +887,9 @@ module.exports = {
   experiments,
   validateDatasetUpload,
   validateHfDataset,
+  searchHfDatasets,
+  getHfDatasetInfo,
+  validateHfSearch,
   validateView,
   validateSplitConfig,
   validatePreprocessingConfig,

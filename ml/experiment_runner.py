@@ -87,8 +87,9 @@ def cmd_dataset_ingest(args):
 def cmd_dataset_ingest_hf(args):
     try:
         from ml import dataset_manager as _dm
+        cfg = args.config.strip() if isinstance(args.config, str) and args.config.strip() else None
         df, info = _dm.load_frame_from_hf(args.dataset_id, args.split or None,
-                                          int(args.max_rows))
+                                          int(args.max_rows), config=cfg)
         if df.shape[1] > 500:
             raise ValueError('Too many columns (%d).' % df.shape[1])
         base = args.workspace_base
@@ -101,6 +102,7 @@ def cmd_dataset_ingest_hf(args):
             'bytes': 0,
             'truncated': info['truncated'],
             'split': info['split'],
+            'config': cfg,
             'target_column': None,
             'feature_columns': None,
             'row_count': int(len(df)),
@@ -625,6 +627,7 @@ def main(argv=None):
     p.add_argument('--workspace-base', required=True)
     p.add_argument('--dataset-id', required=True)
     p.add_argument('--split', default='')
+    p.add_argument('--config', default='')
     p.add_argument('--max-rows', default='50000')
     p.set_defaults(fn=cmd_dataset_ingest_hf)
     p = sub.add_parser('predict-rows')

@@ -699,6 +699,19 @@ app.post('/api/ml/datasets/hf', strictLimiter, async (req, res) => {
   } catch (err) { return _mlErr(res, err); }
 });
 
+app.get('/api/ml/datasets/search', strictLimiter, async (req, res) => {
+  try {
+    const params = mlBackend.validateHfSearch(req.query);
+    return res.json(await mlBackend.searchHfDatasets(params));
+  } catch (err) { return _mlErr(res, err); }
+});
+
+app.get('/api/ml/datasets/info', strictLimiter, async (req, res) => {
+  try {
+    return res.json(await mlBackend.getHfDatasetInfo(String(req.query.dataset_id || '')));
+  } catch (err) { return _mlErr(res, err); }
+});
+
 app.get('/api/ml/datasets/:ws_id', async (req, res) => {
   try {
     return res.json(mlBackend.getWorkspace(req.params.ws_id));

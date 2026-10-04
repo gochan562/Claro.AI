@@ -328,5 +328,60 @@ class EndToEndTest(unittest.TestCase):
         self.assertEqual(len(space['b']), 3)
 
 
+class HfConfigTest(unittest.TestCase):
+    """Config/subset passthrough for HF ingestion (no network: the datasets
+    library is stubbed; only argument routing is exercised)."""
+
+    def _fake_datasets(self, record):
+        import types
+        fake = types.ModuleType('datasets')
+
+        class FakeDS:
+            def to_pandas(self):
+                import pandas as pd
+                return pd.DataFrame({'x': [1, 2], 'y': ['a', 'b']})
+
+        def load_dataset(dataset_id, name=None, split=None, streaming=False):
+            record['dataset_id'] = dataset_id
+            record['name'] = name
+            record['split'] = split
+            return FakeDS()
+
+        fake.load_dataset = load_dataset
+        return fake
+
+    def test_config_reaches_loader(self):
+        import sys
+        record = {}
+        sys.modules['datasets'] = self._fake_datasets(record)
+        try:
+            df, _ = dm.load_frame_from_hf('owner/ds', split='train', max_rows=10, config='plain_text')
+            self.assertEqual(len(df), 2)
+            self.assertEqual(record['name'], 'plain_text')
+            self.assertEqual(record['split'], 'train')
+        finally:
+            sys.modules.pop('datasets', None)
+
+    def test_no_config_passes_none(self):
+        import sys
+        record = {}
+        sys.modules['datasets'] = self._fake_datasets(record)
+        try:
+            dm.load_frame_from_hf('owner/ds', split=None, max_rows=10)
+            self.assertIsNone(record['name'])
+        finally:
+            sys.modules.pop('datasets', None)
+
+    def test_invalid_config_rejected_without_network(self):
+        import sys
+        record = {}
+        sys.modules['datasets'] = self._fake_datasets(record)
+        try:
+            with self.assertRaises(dm.DatasetError):
+                dm.load_frame_from_hf('owner/ds', split='train', max_rows=10, config='   ')
+        finally:
+            sys.modules.pop('datasets', None)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

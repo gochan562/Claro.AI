@@ -73,9 +73,66 @@ function _safeMlDir(kind, id) {
 function _pythonBin() { return process.env.PYTHON_BIN || 'python3'; }
 
 async function _runPython(args, { timeoutMs = 60000, maxBuffer = 8 * 1024 * 1024 } = {}) {
-  const { stdout, stderr } = await execFileAsync(_pythonBin(), args,
-    { cwd: __dirname, timeout: timeoutMs, maxBuffer });
-  return { stdout: String(stdout || ''), stderr: String(stderr || '') };
+  // Always resolves with full process telemetry — never rejects on non-zero
+  // exit. Only a spawn failure itself (missing binary, EACCES) rejects.
+  // Callers MUST parse the structured JSON line themselves so Python-side
+  // _fail() payloads (type/error/code) survive instead of becoming opaque
+  // exec errors.
+  try {
+    const { stdout, stderr } = await execFileAsync(_pythonBin(), args,
+      { cwd: __dirname, timeout: timeoutMs, maxBuffer });
+    return { stdout: String(stdout || ''), stderr: String(stderr || ''),
+             code: 0, signal: null, timedOut: false };
+  } catch (err) {
+    if (err && (err.code === 'ENOENT' || err.code === 'EACCES')) throw err;
+    const message = String((err && err.message) || '');
+    return {
+      stdout: String((err && err.stdout) || ''),
+      stderr: String((err && err.stderr) || ''),
+      code: typeof (err && err.code) === 'number' ? err.code : null,
+      signal: (err && err.signal) || null,
+      timedOut: !!(err && (err.killed || err.code === 'ETIMEDOUT' || /timed out|ETIMEDOUT/i.test(message))),
+    };
+  }
+}
+
+function _mlStatusFor(code) {
+  switch (code) {
+    case 'bad_request': case 'hf_config_not_found': case 'hf_split_not_found':
+    case 'dataset_too_large':
+      return 400;
+    case 'not_found': case 'hf_dataset_not_found':
+      return 404;
+    case 'hf_auth_error':
+      return 401;
+    case 'rate_limited': case 'hf_rate_limited':
+      return 429;
+    case 'hf_dependency_error': case 'hf_conversion_error':
+      return 500;
+    case 'missing_artifact':
+      return 404;
+    default:
+      return 502;
+  }
+}
+
+// Parse a completed Python run into its result payload, or throw a mapped
+// error. Structured {type:'error', error, code} payloads keep their code;
+// crashes without JSON keep prior behavior (generic prefix + 502) while
+// the tail of stderr goes to the server log only (never the UI).
+function _throwPythonResult(run, { prefix, defaultCode = 'ingest_error' } = {}) {
+  const payload = _lastJsonLine(run.stdout);
+  if (payload && payload.type === 'result') return payload;
+  if (payload && payload.type === 'error') {
+    const code = payload.code || defaultCode;
+    throw _err(`${prefix}: ${payload.error}`, code, _mlStatusFor(code));
+  }
+  if (run.timedOut) {
+    throw _err(`${prefix}: Python process timed out.`, defaultCode, _mlStatusFor(defaultCode));
+  }
+  console.error(`[ML-HF] python exit=${run.code} signal=${run.signal} stderr=${String(run.stderr).slice(-2000)}`);
+  const suffix = run.code !== 0 && run.code !== null ? ` (exit ${run.code})` : '';
+  throw _err(`${prefix}: no result${suffix}`, defaultCode, _mlStatusFor(defaultCode));
 }
 
 function _lastJsonLine(stdout) {
@@ -528,17 +585,14 @@ async function ingestUpload({ filename, content }) {
   const tmp = path.join(os.tmpdir(), `mlup_${ws_id}.txt`);
   fs.writeFileSync(tmp, content, 'utf8');
   try {
-    const { stdout } = await _runPython(
+    const run = await _runPython(
       ['ml/experiment_runner.py', 'dataset-ingest',
         '--ws', ws_id, '--workspace-base', path.join(__dirname),
         '--filename', filename, '--input', tmp,
         '--max-bytes', String(ML_MAX_DATASET_BYTES),
         '--max-rows', String(ML_MAX_DATASET_ROWS)],
       { timeoutMs: 120000 });
-    const payload = _lastJsonLine(stdout);
-    if (!payload || payload.type !== 'result') {
-      throw _err(`Dataset ingestion failed: ${(payload && payload.error) || 'no result'}`, 'ingest_error', 502);
-    }
+    const payload = _throwPythonResult(run, { prefix: 'Dataset ingestion failed' });
     return { workspace_id: ws_id, manifest: payload.manifest, profile: payload.profile };
   } finally {
     try { fs.unlinkSync(tmp); } catch (_) {}
@@ -552,13 +606,19 @@ async function ingestHf({ dataset_id, split, config }) {
       '--dataset-id', dataset_id, '--split', split || '',
       '--max-rows', String(ML_MAX_DATASET_ROWS)];
   if (config) args.push('--config', config);
-  const { stdout } = await _runPython(args,
+  // Concise operational log (no secrets: ids/configs/splits only).
+  console.error(`[ML-HF] ingest start dataset=${dataset_id} config=${config || '(auto)'} split=${split || '(auto)'}`);
+  const run = await _runPython(args,
     { timeoutMs: 300000, maxBuffer: 32 * 1024 * 1024 });
-  const payload = _lastJsonLine(stdout);
-  if (!payload || payload.type !== 'result') {
-    throw _err(`Hugging Face dataset load failed: ${(payload && payload.error) || 'no result'}`, 'ingest_error', 502);
+  console.error(`[ML-HF] python exit=${run.code} stdout-json=${_lastJsonLine(run.stdout) ? _lastJsonLine(run.stdout).type : 'none'}`);
+  try {
+    const payload = _throwPythonResult(run, { prefix: 'Hugging Face dataset load failed' });
+    console.error(`[ML-HF] ingest ok rows=${payload.manifest && payload.manifest.row_count}`);
+    return { workspace_id: ws_id, manifest: payload.manifest, profile: payload.profile };
+  } catch (err) {
+    console.error(`[ML-HF] stderr=${String(run.stderr).slice(-2000)}`);
+    throw err;
   }
-  return { workspace_id: ws_id, manifest: payload.manifest, profile: payload.profile };
 }
 
 function getWorkspace(ws_id) {
@@ -568,17 +628,14 @@ function getWorkspace(ws_id) {
 }
 
 async function splitPreview(workspace_id, split, view, target, task) {
-  const { stdout } = await _runPython(
+  const run = await _runPython(
     ['ml/experiment_runner.py', 'split-preview',
       '--workspace', path.join(__dirname), '--ws', workspace_id,
       '--split-json', JSON.stringify(split),
       '--view-json', JSON.stringify(view || {}),
       '--target', target || '', '--task', task || 'classification'],
     { timeoutMs: 120000 });
-  const payload = _lastJsonLine(stdout);
-  if (!payload || payload.type !== 'result') {
-    throw _err(`Split preview failed: ${(payload && payload.error) || 'no result'}`, 'split_error', 502);
-  }
+  const payload = _throwPythonResult(run, { prefix: 'Split preview failed', defaultCode: 'split_error' });
   return payload.split;
 }
 
@@ -851,11 +908,8 @@ async function predictWithExperiment(exp_id, input) {
   const outPath = path.join(dir, 'predictions.csv');
   args.push('--out', outPath);
   try {
-    const { stdout } = await _runPython(args, { timeoutMs: 120000 });
-    const payload = _lastJsonLine(stdout);
-    if (!payload || payload.type !== 'result') {
-      throw _err(`Prediction failed: ${(payload && payload.error) || 'no result'}`, 'predict_error', 502);
-    }
+    const run = await _runPython(args, { timeoutMs: 120000 });
+    const payload = _throwPythonResult(run, { prefix: 'Prediction failed', defaultCode: 'predict_error' });
     return { experiment_id: exp_id, rows: payload.rows, count: payload.count, output: 'predictions.csv' };
   } finally {
     if (tmpCsv) { try { fs.unlinkSync(tmpCsv); } catch (_) {} }
@@ -865,14 +919,13 @@ async function predictWithExperiment(exp_id, input) {
 async function _workspaceRowsForPredict(workspace_id, filters, max_rows) {
   const p = _wsPaths(workspace_id);
   if (!fs.existsSync(p.data)) throw _err(`Unknown dataset workspace.`, 'not_found', 404);
-  const { stdout } = await _runPython(
+  const run = await _runPython(
     ['ml/experiment_runner.py', 'predict-rows',
       '--workspace', path.join(__dirname), '--ws', workspace_id,
       '--filters-json', JSON.stringify(filters || []),
       '--max-rows', String(max_rows || 500)],
     { timeoutMs: 60000 });
-  const payload = _lastJsonLine(stdout);
-  if (!payload || payload.type !== 'result') throw _err('Could not read dataset rows.', 'predict_error', 502);
+  const payload = _throwPythonResult(run, { prefix: 'Could not read dataset rows', defaultCode: 'predict_error' });
   return payload.rows;
 }
 

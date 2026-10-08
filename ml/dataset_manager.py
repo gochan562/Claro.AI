@@ -9,6 +9,7 @@ import io
 import json
 import os
 
+import numpy as np
 import pandas as pd
 
 MAX_PREVIEW_ROWS = 100
@@ -86,9 +87,15 @@ def load_frame_from_hf(dataset_id, split=None, max_rows=50000, config=None):
         df = ds.to_pandas()
     except Exception as e:
         raise DatasetError('Could not convert dataset to table: %s' % e)
-    # Flatten list/struct columns to JSON strings so the frame stays tabular.
+    # Flatten list/struct/array columns to JSON strings so the frame stays tabular.
     for c in list(df.columns):
-        if len(df) and isinstance(df[c].iloc[0], (list, dict)):
+        if not len(df):
+            break
+        v0 = df[c].iloc[0]
+        if isinstance(v0, np.ndarray):
+            df[c] = df[c].map(lambda v: json.dumps(
+                v.tolist() if isinstance(v, np.ndarray) else v, default=str))
+        elif isinstance(v0, (list, dict)):
             df[c] = df[c].map(lambda v: json.dumps(v, default=str))
     truncated = False
     if len(df) > max_rows:

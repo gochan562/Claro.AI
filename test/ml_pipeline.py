@@ -383,5 +383,166 @@ class HfConfigTest(unittest.TestCase):
             sys.modules.pop('datasets', None)
 
 
+class HfIngestErrorsTest(unittest.TestCase):
+    """Ingestion failure taxonomy (no network except where noted).
+
+    The classifier maps real exception shapes to user-facing codes without
+    tracebacks; the split fallback is exercised with a stubbed loader.
+    """
+
+    def _classifier(self):
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from ml.experiment_runner import _classify_ingest_error
+        return _classify_ingest_error
+
+    def test_missing_dependency(self):
+        code, msg = self._classifier()(ModuleNotFoundError("No module named 'datasets'"))
+        self.assertEqual(code, 'hf_dependency_error')
+        self.assertNotIn('Traceback', msg)
+
+    def test_dataset_not_found_shapes(self):
+        for text in ("Dataset 'x' doesn't exist on the Hub or cannot be accessed.",
+                     "Couldn't find dataset 'x'", '404 Client Error'):
+            code, msg = self._classifier()(ValueError(text))
+            self.assertEqual(code, 'hf_dataset_not_found', text)
+            self.assertEqual(msg, 'Dataset could not be found.')
+
+    def test_gated_shapes(self):
+        for text in ('GatedRepoError: You must be authenticated (401)',
+                     '403 Forbidden for repo'):
+            code, _ = self._classifier()(ValueError(text))
+            self.assertEqual(code, 'hf_auth_error', text)
+
+    def test_config_split_shapes(self):
+        code, msg = self._classifier()(
+            ValueError("BuilderConfig 'nope' not found. Available: ['default']"))
+        self.assertEqual(code, 'hf_config_not_found')
+        code, msg = self._classifier()(
+            ValueError('Unknown split "zzz". Should be one of ["train", "test"]'))
+        self.assertEqual(code, 'hf_split_not_found')
+        self.assertIn('split', msg)
+
+    def test_network_and_rate_shapes(self):
+        code, _ = self._classifier()(ConnectionError('Connection aborted by peer'))
+        self.assertEqual(code, 'hf_network_error')
+        code, _ = self._classifier()(ValueError('429 Too Many Requests'))
+        self.assertEqual(code, 'hf_rate_limited')
+
+    def test_conversion_shape(self):
+        code, msg = self._classifier()(
+            ValueError('to_pandas failed: pyarrow.lib.ArrowInvalid: struct arrays'))
+        self.assertEqual(code, 'hf_conversion_error')
+        self.assertIn('tabular', msg)
+
+    def test_split_fallback_uses_dataset_dict(self):
+        # Direct split load fails -> loader falls back to DatasetDict select.
+        import sys
+        import types
+        import pandas as pd
+        calls = {}
+
+        class FakeSplit:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def to_pandas(self):
+                return pd.DataFrame(self._rows)
+
+        class FakeDict(dict):
+            pass
+
+        fake = types.ModuleType('datasets')
+
+        def load_dataset(dataset_id, name=None, split=None, streaming=False):
+            calls.setdefault('calls', []).append((name, split))
+            if split is not None:
+                raise ValueError('Unknown split "%s". Should be one of ["train", "test"]' % split)
+            d = FakeDict()
+            d['train'] = FakeSplit([{'x': 1}, {'x': 2}])
+            d['test'] = FakeSplit([{'x': 3}])
+            return d
+
+        fake.load_dataset = load_dataset
+        sys.modules['datasets'] = fake
+        try:
+            df, info = dm.load_frame_from_hf('owner/ds', split='test', max_rows=10)
+            self.assertEqual(len(df), 1)
+            self.assertEqual(calls['calls'][0], (None, 'test'))
+        finally:
+            sys.modules.pop('datasets', None)
+
+    def test_invalid_split_message(self):
+        import sys
+        import types
+        fake = types.ModuleType('datasets')
+
+        def load_dataset(dataset_id, name=None, split=None, streaming=False):
+            if split is not None:
+                raise ValueError('Unknown split "%s".' % split)
+            return {'train': None}
+
+        fake.load_dataset = load_dataset
+        sys.modules['datasets'] = fake
+        try:
+            with self.assertRaises(dm.DatasetError) as ctx:
+                dm.load_frame_from_hf('owner/ds', split='zzz', max_rows=10)
+            self.assertIn('zzz', str(ctx.exception))
+        finally:
+            sys.modules.pop('datasets', None)
+
+    def test_tabular_conversion_shapes(self):
+        # Real datasets objects, no network: ClassLabel, text, list columns.
+        from datasets import Dataset, Features, Value, ClassLabel, Sequence
+        feats = Features({'text': Value('string'),
+                          'label': ClassLabel(names=['neg', 'pos']),
+                          'tags': Sequence(Value('int32'))})
+        ds = Dataset.from_dict({'text': ['good', 'bad'], 'label': [1, 0],
+                                'tags': [[1, 2], [3]]}, features=feats)
+        df = ds.to_pandas()
+        # Loader flattening keeps the frame tabular (lists/arrays -> JSON strings).
+        import json as _json
+        import numpy as _np
+        for c in list(df.columns):
+            if not len(df):
+                break
+            v0 = df[c].iloc[0]
+            if isinstance(v0, _np.ndarray):
+                df[c] = df[c].map(lambda v: _json.dumps(
+                    v.tolist() if isinstance(v, _np.ndarray) else v, default=str))
+            elif isinstance(v0, (list, dict)):
+                df[c] = df[c].map(lambda v: _json.dumps(v, default=str))
+        self.assertEqual(list(df.columns), ['text', 'label', 'tags'])
+        self.assertEqual(df['tags'].iloc[0], '[1, 2]')
+        self.assertTrue(set(df['label'].tolist()) <= {0, 1})
+
+    def test_loader_flattens_ndarray_columns(self):
+        # End-to-end through load_frame_from_hf with a stubbed loader whose
+        # to_pandas yields numpy arrays (the previously missed case).
+        import sys
+        import types
+        import numpy as _np
+        import pandas as _pd
+
+        class FakeSplit:
+            def to_pandas(self):
+                return _pd.DataFrame({'x': [1, 2],
+                                      'tags': [_np.array([1, 2]), _np.array([3])]})
+
+        fake = types.ModuleType('datasets')
+
+        def load_dataset(dataset_id, name=None, split=None, streaming=False):
+            return FakeSplit()
+
+        fake.load_dataset = load_dataset
+        sys.modules['datasets'] = fake
+        try:
+            df, _ = dm.load_frame_from_hf('owner/ds', split='train', max_rows=10)
+            self.assertEqual(df['tags'].iloc[0], '[1, 2]')
+            self.assertEqual(df['tags'].iloc[1], '[3]')
+        finally:
+            sys.modules.pop('datasets', None)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -41,9 +41,56 @@ def _progress(job, message, **kw):
     _emit(out)
 
 
-def _fail(message):
-    _emit({'type': 'error', 'error': message})
+def _fail(message, code='ingest_error'):
+    _emit({'type': 'error', 'error': message, 'code': code})
     sys.exit(1)
+
+
+def _classify_ingest_error(e):
+    """Map an ingestion exception to (code, user_message).
+
+    No tracebacks here — those stay in server logs. Messages are safe for UI.
+    """
+    name = type(e).__name__
+    low = ('%s: %s' % (name, e)).lower()
+    if isinstance(e, ModuleNotFoundError) or 'no module named' in low:
+        mod = str(e).split("'")[1] if "'" in str(e) else 'a required package'
+        return ('hf_dependency_error',
+                'Python environment is missing the %s package required to load datasets.' % mod)
+    if 'gated' in low or 'must be authenticated' in low or ' 401' in low or '(401' in low or ' 403' in low:
+        return ('hf_auth_error',
+                'That dataset is gated and requires access.')
+    if '429' in low or 'too many requests' in low or 'rate limit' in low:
+        return ('hf_rate_limited',
+                'Hugging Face is rate-limiting requests. Try again shortly.')
+    if 'config' in low and ('not found' in low or 'unknown' in low or 'available' in low):
+        return ('hf_config_not_found',
+                'That configuration is not available for this dataset.')
+    if 'split' in low and ('unknown' in low or 'not found' in low or 'should be one of' in low or 'available' in low):
+        return ('hf_split_not_found',
+                'That split is not available for this dataset/configuration.')
+    if ('not found' in low or '404' in low or "couldn't find" in low
+            or 'filenotfound' in low.replace(' ', '')
+            or 'datasetnotfounderror' in low.replace(' ', '')
+            or "doesn't exist" in low):
+        return ('hf_dataset_not_found',
+                'Dataset could not be found.')
+    if 'to_pandas' in low or 'pyarrow' in low or 'arrow' in low:
+        return ('hf_conversion_error',
+                'This dataset cannot be loaded as a tabular ML dataset.')
+    if low.startswith('valueerror: too many columns'):
+        return ('dataset_too_large',
+                'Dataset has too many columns to load safely.')
+    net_words = ('connectionerror', 'connecttimeout', 'connectionaborted',
+                 'connectionrefused', 'temporaryfailure', 'nameresolution',
+                 'nodnamenorservname', 'urlerror', 'timeout', 'timedout',
+                 'proxyerror', 'remotedisconnected', 'socket', 'ssl')
+    compact = low.replace(' ', '')
+    if any(w in compact for w in net_words):
+        return ('hf_network_error',
+                'Hugging Face is temporarily unavailable. Try again.')
+    return ('ingest_error',
+            '%s: %s' % (name, str(e)[:300]))
 
 
 def cmd_dataset_ingest(args):
@@ -119,7 +166,8 @@ def cmd_dataset_ingest_hf(args):
             json.dump(profile, f, indent=2, default=str)
         _emit({'type': 'result', 'manifest': manifest, 'profile': profile})
     except Exception as e:
-        _fail('%s: %s' % (type(e).__name__, e))
+        code, message = _classify_ingest_error(e)
+        _fail(message, code)
 
 
 def cmd_predict_rows(args):
@@ -140,7 +188,7 @@ def cmd_predict_rows(args):
         out = out.head(int(args.max_rows)).astype(object).where(pd.notna(out.head(int(args.max_rows))), None)
         _emit({'type': 'result', 'rows': out.to_dict(orient='records')})
     except Exception as e:
-        _fail('%s: %s' % (type(e).__name__, e))
+        _fail('%s: %s' % (type(e).__name__, e), 'predict_error')
 
 
 def cmd_dataset_profile(args):
@@ -168,7 +216,7 @@ def cmd_split_preview(args):
         desc['notes'] = notes
         _emit({'type': 'result', 'split': desc})
     except Exception as e:
-        _fail('%s: %s' % (type(e).__name__, e))
+        _fail('%s: %s' % (type(e).__name__, e), 'split_error')
 
 
 def _resolve_xy(frame, target, features):
@@ -602,7 +650,7 @@ def cmd_predict(args):
         _emit({'type': 'result', 'rows': out_rows,
                'count': len(out_rows), 'output': args.out})
     except Exception as e:
-        _fail('%s: %s' % (type(e).__name__, e))
+        _fail('%s: %s' % (type(e).__name__, e), 'predict_error')
 
 
 def main(argv=None):

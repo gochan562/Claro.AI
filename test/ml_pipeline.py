@@ -544,5 +544,45 @@ class HfIngestErrorsTest(unittest.TestCase):
             sys.modules.pop('datasets', None)
 
 
+class RunnerImportRobustnessTest(unittest.TestCase):
+    """experiment_runner must import without heavy deps, and every command
+    must emit a structured dependency error (never a bare traceback) when
+    a package is missing. Uses `python -S` (no site-packages) as the
+    missing-dependency environment — no network needed."""
+
+    def _run_nosite(self, *argv):
+        import subprocess
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env = dict(os.environ)
+        env['PYTHONPATH'] = repo + (os.pathsep + env['PYTHONPATH'] if env.get('PYTHONPATH') else '')
+        return subprocess.run(
+            [sys.executable, '-S', os.path.join(repo, 'ml', 'experiment_runner.py')] + list(argv),
+            capture_output=True, text=True, timeout=120, cwd=repo, env=env)
+
+    def test_module_import_needs_no_heavy_deps(self):
+        import subprocess
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env = dict(os.environ)
+        env['PYTHONPATH'] = repo + (os.pathsep + env.get('PYTHONPATH', ''))
+        r = subprocess.run(
+            [sys.executable, '-S', '-c', 'import ml.experiment_runner; print("import OK")'],
+            capture_output=True, text=True, timeout=120, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr[-1000:])
+        self.assertIn('import OK', r.stdout)
+
+    def test_missing_dep_emits_structured_error(self):
+        r = self._run_nosite('dataset-ingest-hf', '--ws', 'mlw_aaaaaaaaaaaa',
+                             '--workspace-base', tempfile.gettempdir(),
+                             '--dataset-id', 'scikit-learn/iris',
+                             '--config', 'default', '--split', 'train',
+                             '--max-rows', '50000')
+        self.assertNotEqual(r.returncode, 0)
+        payload = json.loads(r.stdout.strip().split('\n')[-1])
+        self.assertEqual(payload.get('type'), 'error')
+        self.assertEqual(payload.get('code'), 'hf_dependency_error')
+        self.assertIn('joblib', payload.get('error', ''))
+        self.assertNotIn('Traceback', payload.get('error', ''))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

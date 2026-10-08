@@ -54,6 +54,28 @@ async function run() {
     ok('structured Python error survives exit 1 with code + status');
   }
 
+  // ── 1b. Missing Python dependency emits structured JSON, not a traceback ──
+  // (exact production symptom: bare `import joblib` killed module import
+  // before any command — and its error handler — could run).
+  {
+    const bin = path.join(os.tmpdir(), 'ml-fake-nodeps.sh');
+    fs.writeFileSync(bin, '#!/bin/sh\nexec python3 -S "$@"\n', 'utf8');
+    fs.chmodSync(bin, 0o755);
+    process.env.PYTHON_BIN = bin;
+    try {
+      await ml.ingestHf({ dataset_id: 'scikit-learn/iris', split: 'train', config: 'default' });
+      assert.fail('ingestHf should have thrown');
+    } catch (e) {
+      assert.strictEqual(e.code, 'hf_dependency_error', `code, got ${e.code}: ${e.message}`);
+      assert(e.message.includes('joblib'), `names the missing package: ${e.message}`);
+      assert(!e.message.includes('Traceback'), 'no traceback in UI error');
+    } finally {
+      delete process.env.PYTHON_BIN;
+      fs.unlinkSync(bin);
+    }
+    ok('missing dependency yields structured hf_dependency_error (import-safe entry)');
+  }
+
   // ── 2. Crash without JSON stays generic, traceback stays server-side ──
   {
     const bin = writeFakeBin('ml-fake-crash.js',

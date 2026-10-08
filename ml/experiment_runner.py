@@ -11,6 +11,7 @@ No arbitrary code execution: every op is driven by validated config.
 """
 import argparse
 import copy
+import importlib
 import json
 import os
 import sys
@@ -19,16 +20,30 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import joblib
-import numpy as np
-import pandas as pd
 
-from ml import dataset_manager as dm
-from ml import evaluation as ev
-from ml import models as mm
-from ml import preprocessing as pp
-from ml import serialization as se
-from ml import split as sp
+def _ensure_deps():
+    """Bind heavy third-party/ml modules as module globals.
+
+    Called first inside every subcommand so a missing package produces a
+    structured hf_dependency_error (via _fail) INSTEAD of killing module
+    import before any command — and its error handler — can run.
+    Safe to call repeatedly; imports are cached after the first call.
+    """
+    g = globals()
+    try:
+        g['joblib'] = importlib.import_module('joblib')
+        g['np'] = importlib.import_module('numpy')
+        g['pd'] = importlib.import_module('pandas')
+        g['dm'] = importlib.import_module('ml.dataset_manager')
+        g['ev'] = importlib.import_module('ml.evaluation')
+        g['mm'] = importlib.import_module('ml.models')
+        g['pp'] = importlib.import_module('ml.preprocessing')
+        g['se'] = importlib.import_module('ml.serialization')
+        g['sp'] = importlib.import_module('ml.split')
+    except ModuleNotFoundError as e:
+        missing = str(e).split("'")[1] if "'" in str(e) else 'a required package'
+        _fail('Python environment is missing the %s package.' % missing,
+              'hf_dependency_error')
 
 
 def _emit(obj):
@@ -94,6 +109,7 @@ def _classify_ingest_error(e):
 
 
 def cmd_dataset_ingest(args):
+    _ensure_deps()
     import tempfile
     try:
         with open(args.input, 'r', encoding='utf-8', errors='replace') as f:
@@ -132,6 +148,7 @@ def cmd_dataset_ingest(args):
 
 
 def cmd_dataset_ingest_hf(args):
+    _ensure_deps()
     try:
         from ml import dataset_manager as _dm
         cfg = args.config.strip() if isinstance(args.config, str) and args.config.strip() else None
@@ -171,6 +188,7 @@ def cmd_dataset_ingest_hf(args):
 
 
 def cmd_predict_rows(args):
+    _ensure_deps()
     try:
         from ml import dataset_manager as _dm
         frame = _dm.load_workspace_frame(args.workspace, args.ws)
@@ -192,6 +210,7 @@ def cmd_predict_rows(args):
 
 
 def cmd_dataset_profile(args):
+    _ensure_deps()
     try:
         frame = dm.load_workspace_frame(args.workspace, args.ws)
         view = json.loads(args.view_json or '{}')
@@ -205,6 +224,7 @@ def cmd_dataset_profile(args):
 
 
 def cmd_split_preview(args):
+    _ensure_deps()
     try:
         frame = dm.load_workspace_frame(args.workspace, args.ws)
         view = json.loads(args.view_json or '{}')
@@ -347,7 +367,10 @@ def _expand_search_space(raw):
         elif isinstance(spec, dict) and 'low' in spec and 'high' in spec:
             lo, hi = float(spec['low']), float(spec['high'])
             steps = int(spec.get('steps', 5))
-            vals = np.linspace(lo, hi, max(2, steps)).tolist()
+            steps = max(2, steps)
+            # Pure-Python linspace (no numpy needed; this helper is also
+            # called directly by tests without the runtime deps bound).
+            vals = [lo + ((hi - lo) * k) / (steps - 1) for k in range(steps)]
             if spec.get('integer'):
                 vals = sorted(set(int(round(v)) for v in vals))
             space[name] = vals
@@ -445,6 +468,7 @@ def _top(names, vals, k=20):
 
 
 def cmd_run(args):
+    _ensure_deps()
     t0 = time.time()
     with open(args.config) as f:
         cfg = json.load(f)
@@ -611,6 +635,7 @@ def _summarize_metrics(metrics):
 
 
 def cmd_predict(args):
+    _ensure_deps()
     try:
         bundle = se.load_joblib(args.model)
         pipe = bundle['pipeline']

@@ -382,6 +382,39 @@ class HfConfigTest(unittest.TestCase):
         finally:
             sys.modules.pop('datasets', None)
 
+    def test_chained_cause_preserved_and_first_failure_logged(self):
+        # Regression: DatasetGenerationError("An error occurred while
+        # generating the dataset") hides the real cause in `from e`.
+        # The loader must keep the chain in the error and log the first
+        # failure's traceback server-side (stderr), without leaking paths
+        # beyond the library's own message.
+        import io
+        import sys
+        import types
+        from contextlib import redirect_stderr
+        fake = types.ModuleType('datasets')
+
+        def load_dataset(dataset_id, name=None, split=None, streaming=False):
+            try:
+                raise OSError('disk full writing arrow file')
+            except OSError as cause:
+                raise Exception('An error occurred while generating the dataset') from cause
+
+        fake.load_dataset = load_dataset
+        sys.modules['datasets'] = fake
+        try:
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                with self.assertRaises(dm.DatasetError) as ctx:
+                    dm.load_frame_from_hf('owner/ds', split='train', max_rows=10)
+            msg = str(ctx.exception)
+            self.assertIn('Could not load Hugging Face dataset', msg)
+            self.assertIn('caused by', msg)
+            self.assertIn('OSError', msg)
+            self.assertIn('Traceback', buf.getvalue())
+        finally:
+            sys.modules.pop('datasets', None)
+
 
 class HfIngestErrorsTest(unittest.TestCase):
     """Ingestion failure taxonomy (no network except where noted).

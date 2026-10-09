@@ -114,6 +114,18 @@ async function run() {
     ok('live iris load (config=default, split=train, 150 rows)');
     try { fs.rmSync(path.join(__dirname, '..', 'ml_workspaces', out.workspace_id), { recursive: true, force: true }); } catch (_) {}
 
+    // 3a2. WikiText regression: config wikitext-2-raw-v1 + split train.
+    // (Previously failed opaquely; the loader must succeed and the manifest
+    // must record the exact config used.)
+    const wiki = await ml.ingestHf({ dataset_id: 'Salesforce/wikitext', split: 'train', config: 'wikitext-2-raw-v1' });
+    assert.strictEqual(wiki.profile.row_count, 36718, 'wikitext-2-raw-v1 train has 36,718 rows');
+    assert(wiki.profile.columns.includes('text'), 'wikitext text column present');
+    const wikiManifest = JSON.parse(fs.readFileSync(
+      path.join(__dirname, '..', 'ml_workspaces', wiki.workspace_id, 'manifest.json'), 'utf8'));
+    assert.strictEqual(wikiManifest.config, 'wikitext-2-raw-v1');
+    ok('live wikitext load (config=wikitext-2-raw-v1, split=train, 36718 rows)');
+    try { fs.rmSync(path.join(__dirname, '..', 'ml_workspaces', wiki.workspace_id), { recursive: true, force: true }); } catch (_) {}
+
     // 3b. Invalid split/config/id map to structured codes (no generic 502).
     const cases = [
       [{ dataset_id: 'scikit-learn/iris', split: 'frobnicator' }, 'hf_split_not_found', 400],

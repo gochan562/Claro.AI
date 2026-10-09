@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import os
+import traceback
 
 import numpy as np
 import pandas as pd
@@ -17,6 +18,28 @@ MAX_PREVIEW_ROWS = 100
 
 class DatasetError(ValueError):
     pass
+
+
+def _caused_by_suffix(exc, limit=320):
+    """One-line summary of an exception's __cause__/__context__ chain.
+
+    str(exc) drops chained causes — e.g. DatasetGenerationError("An error
+    occurred while generating the dataset") hides the real download, disk,
+    or Arrow failure in `from e`. Browser-safe: exception type names plus
+    first message lines only, truncated; no tokens, paths kept as-is from
+    the library message.
+    """
+    parts = []
+    seen = set()
+    cur = getattr(exc, '__cause__', None) or getattr(exc, '__context__', None)
+    while cur is not None and id(cur) not in seen and len(parts) < 3:
+        seen.add(id(cur))
+        first = str(cur).strip().split('\n')[0][:200]
+        parts.append('%s: %s' % (type(cur).__name__, first))
+        cur = getattr(cur, '__cause__', None) or getattr(cur, '__context__', None)
+    if not parts:
+        return ''
+    return (' (caused by %s)' % ' <- '.join(parts))[:limit]
 
 
 def sniff_format(filename):
@@ -74,10 +97,15 @@ def load_frame_from_hf(dataset_id, split=None, max_rows=50000, config=None):
     try:
         ds = load_dataset(dataset_id.strip(), name, split=split, streaming=False)
     except Exception:
+        # Preserve the first failure in the server log (stderr): it is
+        # otherwise lost when the full-dataset fallback below succeeds, and
+        # its absence makes fallback failures undiagnosable.
+        traceback.print_exc()
         try:
             full = load_dataset(dataset_id.strip(), name, streaming=False)
         except Exception as e:
-            raise DatasetError('Could not load Hugging Face dataset %r: %s' % (dataset_id, e))
+            raise DatasetError('Could not load Hugging Face dataset %r: %s%s' % (
+                dataset_id, e, _caused_by_suffix(e)))
         names = list(full.keys())
         pick = split or ('train' if 'train' in names else names[0])
         if pick not in names:

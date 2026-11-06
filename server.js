@@ -685,6 +685,9 @@ function _mlErr(res, err) {
   // free disk space, failing operation) from the ML backend. Full
   // tracebacks stay in server logs; env vars/tokens never reach the client.
   if (err.diagnostics) body.diagnostics = err.diagnostics;
+  // Deployment marker from the HF ingest path ('hf-diag-v1'): its presence
+  // in a response proves the running process has the diagnostics code.
+  if (err.diagnostics_version) body.diagnostics_version = err.diagnostics_version;
   return res.status(status).json(body);
 }
 

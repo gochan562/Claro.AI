@@ -131,14 +131,21 @@ function _throwPythonResult(run, { prefix, defaultCode = 'ingest_error' } = {}) 
     } else {
       // Python crashed before reporting (or non-JSON output): synthesize
       // minimal diagnostics from run telemetry + local free space so the
-      // failure is never fully opaque.
-      const stderrFirst = String(run.stderr || '').trim().split('\n').pop() || '';
+      // failure is never fully opaque. Raw stderr never reaches the client
+      // here — only a bare exception TYPE NAME if the crash's last stderr
+      // line is exactly one (e.g. 'MemoryError'); full stderr stays in the
+      // server log.
+      const stderrLines = String(run.stderr || '').trim().split('\n').filter(Boolean);
+      const lastLine = stderrLines[stderrLines.length - 1] || '';
+      const typeMatch = lastLine.match(/^\s*([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Interrupt|Exit))\s*:?\s*$/);
       err.diagnostics = _publicDiagnostics({
         error_type: run.timedOut ? 'SubprocessTimeout' : 'SubprocessCrash',
-        error_message: (run.timedOut ? 'python subprocess timed out'
-          : `python exit=${run.code} signal=${run.signal} ${stderrFirst}`).slice(0, 300),
-        root_cause_type: run.timedOut ? 'timeout' : (payload ? 'no_json_result' : 'python_crash'),
-        root_cause_message: stderrFirst.slice(0, 300),
+        error_message: run.timedOut ? 'python subprocess timed out'
+          : `python exit=${run.code} signal=${run.signal}`,
+        root_cause_type: run.timedOut ? 'timeout'
+          : (typeMatch ? typeMatch[1] : (payload ? 'no_json_result' : 'python_crash')),
+        root_cause_message: run.timedOut ? 'subprocess timeout'
+          : (typeMatch ? typeMatch[1] : ''),
         failing_operation: 'python_subprocess',
         paths: [path.join(__dirname, 'ml_workspaces')],
         disk: _localDiskDiagnostics([path.join(__dirname, 'ml_workspaces')]),
@@ -706,6 +713,10 @@ async function ingestHf({ dataset_id, split, config }) {
     const stderrTail = String(run.stderr || '').trim().split('\n').slice(-25).join('\n');
     if (stderrTail) console.error(`[ML-HF] python stderr (tail):\n${stderrTail}`);
     if (err.diagnostics) console.error(`[ML-DIAG] ${JSON.stringify(err.diagnostics)}`);
+    // Temporary deployment marker: proves the RUNNING server executes this
+    // code path (Node caches modules at startup — a stale process never
+    // emits it). Remove once deployment is verified.
+    err.diagnostics_version = 'hf-diag-v1';
     throw err;
   }
 }

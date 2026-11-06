@@ -34,7 +34,15 @@ async function mlApi(path, opts) {
   let data = null;
   try { data = await res.json(); } catch (_) { data = null; }
   if (!res.ok) {
-    throw new Error((data && data.error) || `HTTP ${res.status}`);
+    const err = new Error((data && data.error) || `HTTP ${res.status}`);
+    // Preserve structured fields — mlApi callers (and the console) would
+    // otherwise lose the backend's sanitized `diagnostics` object.
+    if (data && typeof data === 'object') {
+      err.code = data.code;
+      if (data.diagnostics) err.diagnostics = data.diagnostics;
+      if (data.diagnostics_version) err.diagnostics_version = data.diagnostics_version;
+    }
+    throw err;
   }
   return data;
 }
@@ -627,7 +635,16 @@ async function mlLoadHfDataset(cellId) {
     });
     mlSetStatus(cell, 'ready', '');
   } catch (e) {
-    mlSetStatus(cell, 'error', e.message);
+    // Surface the root cause when the backend attached structured
+    // diagnostics (e.g. Errno 122 disk quota): "msg — root cause: Type: m".
+    let msg = e.message;
+    const d = e.diagnostics;
+    if (d && d.root_cause_type) {
+      const cause = `${d.root_cause_type}: ${d.root_cause_message || ''}`.slice(0, 160);
+      if (!msg.includes(cause)) msg = `${msg} — root cause: ${cause}`;
+    }
+    if (e.diagnostics) console.error('[ML-DIAG]', e.diagnostics);
+    mlSetStatus(cell, 'error', msg);
   }
 }
 

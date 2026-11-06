@@ -680,7 +680,12 @@ const mlBackend = require('./ml_experiment_backend');
 function _mlErr(res, err) {
   const status = err.status || 500;
   const code = err.code || 'ml_error';
-  return res.status(status).json({ error: err.message, code });
+  const body = { error: err.message, code };
+  // Structured, sanitizer-allowlisted diagnostics (types, messages, paths,
+  // free disk space, failing operation) from the ML backend. Full
+  // tracebacks stay in server logs; env vars/tokens never reach the client.
+  if (err.diagnostics) body.diagnostics = err.diagnostics;
+  return res.status(status).json(body);
 }
 
 app.post('/api/ml/datasets/upload', strictLimiter, async (req, res) => {

@@ -29,6 +29,113 @@ def _log_write(path, op):
         print('[TRAIN-DIAG] WRITE %s path=(stats failed)' % (op,))
 
 
+# ── Structured failure diagnostics ──────────────────────────────────────
+# Allowlist-built ONLY: no environment variables, no tokens, no stderr text.
+# Filesystem paths listed here are our own artifacts and the HF cache dir
+# (required observability for disk-quota diagnosis); free space comes from
+# os.statvfs on those paths. Full tracebacks stay on stderr, never here.
+
+def _statvfs_diag(p):
+    # statvfs the nearest existing ancestor: the target file may not exist
+    # yet (a failed create IS the failure being diagnosed).
+    try:
+        cur = str(p)
+        while cur and not os.path.exists(cur):
+            nxt = os.path.dirname(cur)
+            if nxt == cur:
+                break
+            cur = nxt
+        st = os.statvfs(cur or str(p))
+        return {
+            'path': str(p),
+            'free_bytes': int(st.f_bavail) * int(st.f_frsize),
+            'total_bytes': int(st.f_blocks) * int(st.f_frsize),
+        }
+    except Exception:
+        return {'path': str(p), 'statvfs_error': 'unavailable'}
+
+
+def _cause_chain(exc, max_depth=4):
+    # exc itself first, then __cause__ (preferred) / __context__ links.
+    chain, seen, cur = [], set(), exc
+    while cur is not None and id(cur) not in seen and len(chain) < max_depth:
+        seen.add(id(cur))
+        chain.append({'type': type(cur).__name__,
+                      'message': str(cur).strip().split('\n')[0][:300]})
+        cur = getattr(cur, '__cause__', None) or getattr(cur, '__context__', None)
+    return chain
+
+
+def _hf_cache_paths():
+    # Library-derived cache directories only (never env var values).
+    paths = []
+    try:
+        from datasets import config as _dscfg
+        for attr in ('HF_DATASETS_CACHE', 'DOWNLOADED_DATASETS_PATH',
+                     'DEFAULT_CACHE_PATH'):
+            p = getattr(_dscfg, attr, None)
+            if p:
+                paths.append(str(p))
+    except Exception:
+        pass
+    return paths
+
+
+def _build_diagnostics(exc, failing_operation, extra_paths=()):
+    # OSError carries the exact failing path/errno (Errno 122 etc.).
+    chain = _cause_chain(exc)
+    deepest = chain[-1] if chain else {'type': type(exc).__name__,
+                                       'message': str(exc)[:300]}
+    paths, seen = [], set()
+
+    def _add(p):
+        p = str(p)
+        if p and p not in seen:
+            seen.add(p)
+            paths.append(p)
+
+    _add(getattr(exc, 'filename', None) or '')
+    for p in extra_paths:
+        _add(p)
+    for p in _hf_cache_paths():
+        _add(p)
+    disk = [_statvfs_diag(p) for p in paths[:4]]
+    diag = {
+        'error_type': chain[0]['type'] if chain else type(exc).__name__,
+        'error_message': chain[0]['message'] if chain else str(exc)[:300],
+        'root_cause_type': deepest['type'],
+        'root_cause_message': deepest['message'],
+        'failing_operation': str(failing_operation),
+        'paths': paths,
+        'disk': disk,
+    }
+    if isinstance(exc, OSError) and getattr(exc, 'errno', None) is not None:
+        diag['errno'] = int(exc.errno)
+        diag['os_error'] = str(getattr(exc, 'strerror', '') or '')
+    else:
+        # The quota/OS error is often a CAUSE deep in the chain (e.g.
+        # DatasetGenerationError from an OSError) — surface it if present.
+        cur = getattr(exc, '__cause__', None) or getattr(exc, '__context__', None)
+        seen = {id(exc)}
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            if isinstance(cur, OSError) and getattr(cur, 'errno', None) is not None:
+                diag['errno'] = int(cur.errno)
+                diag['os_error'] = str(getattr(cur, 'strerror', '') or '')
+                if getattr(cur, 'filename', None) and str(cur.filename) not in diag['paths']:
+                    diag['paths'].insert(0, str(cur.filename))
+                break
+            cur = getattr(cur, '__cause__', None) or getattr(cur, '__context__', None)
+    return diag
+
+
+def _raise_with_diagnostics(exc, failing_operation, extra_paths=(), message=None):
+    err = DatasetError(message if message is not None else (
+        '%s: %s' % (type(exc).__name__, str(exc)[:300])))
+    err.diagnostics = _build_diagnostics(exc, failing_operation, extra_paths)
+    raise err
+
+
 class DatasetError(ValueError):
     pass
 
@@ -117,8 +224,10 @@ def load_frame_from_hf(dataset_id, split=None, max_rows=50000, config=None):
         try:
             full = load_dataset(dataset_id.strip(), name, streaming=False)
         except Exception as e:
-            raise DatasetError('Could not load Hugging Face dataset %r: %s%s' % (
-                dataset_id, e, _caused_by_suffix(e)))
+            _raise_with_diagnostics(
+                e, 'load_dataset', message=(
+                    'Could not load Hugging Face dataset %r: %s%s' % (
+                        dataset_id, e, _caused_by_suffix(e))))
         names = list(full.keys())
         pick = split or ('train' if 'train' in names else names[0])
         if pick not in names:
@@ -127,7 +236,9 @@ def load_frame_from_hf(dataset_id, split=None, max_rows=50000, config=None):
     try:
         df = ds.to_pandas()
     except Exception as e:
-        raise DatasetError('Could not convert dataset to table: %s' % e)
+        _raise_with_diagnostics(
+            e, 'ds.to_pandas',
+            message='Could not convert dataset to table: %s' % e)
     # Flatten list/struct/array columns to JSON strings so the frame stays tabular.
     for c in list(df.columns):
         if not len(df):
@@ -339,9 +450,23 @@ def workspace_paths(base_dir, ws_id):
 
 def save_workspace(base_dir, ws_id, df, manifest):
     p = workspace_paths(base_dir, ws_id)
-    os.makedirs(p['root'], exist_ok=True)
+    try:
+        os.makedirs(p['root'], exist_ok=True)
+    except Exception as e:
+        _raise_with_diagnostics(
+            e, 'save_workspace:create workspace dir',
+            extra_paths=[p['root']],
+            message='Could not create dataset workspace: %s' % e)
     _log_write(p['data'], 'df.to_csv')
-    df.to_csv(p['data'], index=False)
+    try:
+        df.to_csv(p['data'], index=False)
+    except Exception as e:
+        # Disk-quota (Errno 122) and similar write failures surface here:
+        # carry structured diagnostics so the root cause is observable.
+        _raise_with_diagnostics(
+            e, 'save_workspace:write data.csv',
+            extra_paths=[p['data'], p['root']],
+            message='Could not save dataset to workspace: %s' % e)
     _log_write(p['manifest'], 'json.dump manifest')
     manifest = dict(manifest)
     manifest['sha256'] = dataset_sha256(p['data'])

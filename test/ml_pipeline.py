@@ -577,6 +577,99 @@ class HfIngestErrorsTest(unittest.TestCase):
             sys.modules.pop('datasets', None)
 
 
+class IngestDiagnosticsTest(unittest.TestCase):
+    """Structured diagnostics on ingestion failure: root cause type/message,
+    failing operation, relevant paths, and statvfs free space — allowlist
+    only (no env vars, no tokens, no tracebacks). Feeds the Node side which
+    forwards a sanitized copy to the browser."""
+
+    def test_save_workspace_quota_failure_carries_diagnostics(self):
+        base = tempfile.mkdtemp(prefix='mlws_diag_')
+        try:
+            df = pd.DataFrame({'x': [1, 2, 3]})
+            orig_to_csv = pd.DataFrame.to_csv
+
+            def quota_to_csv(self, *a, **kw):
+                err = OSError(122, 'Disk quota exceeded')
+                err.filename = os.path.join(base, 'ml_workspaces', 'mlw_diag000000', 'data.csv')
+                raise err
+
+            pd.DataFrame.to_csv = quota_to_csv
+            try:
+                with self.assertRaises(dm.DatasetError) as ctx:
+                    dm.save_workspace(base, 'mlw_diag000000', df, {'workspace_id': 'mlw_diag000000'})
+            finally:
+                pd.DataFrame.to_csv = orig_to_csv
+            d = getattr(ctx.exception, 'diagnostics', None)
+            self.assertIsNotNone(d, 'diagnostics attached to DatasetError')
+            self.assertEqual(d['errno'], 122)
+            self.assertEqual(d['root_cause_type'], 'OSError')
+            self.assertIn('quota', d['root_cause_message'].lower())
+            self.assertEqual(d['failing_operation'], 'save_workspace:write data.csv')
+            self.assertTrue(any(p.endswith('data.csv') for p in d['paths']),
+                            'failing path listed: %s' % d['paths'])
+            self.assertTrue(d['disk'], 'statvfs free space captured')
+            for entry in d['disk']:
+                self.assertIn('free_bytes', entry)
+            self.assertNotIn('env', d)
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_load_failure_carries_cause_chain(self):
+        import sys
+        import types
+
+        class FakeErr(Exception):
+            pass
+
+        fake = types.ModuleType('datasets')
+
+        def load_dataset(dataset_id, name=None, split=None, streaming=False):
+            try:
+                raise OSError(28, 'No space left on device')
+            except OSError as cause:
+                raise FakeErr('An error occurred while generating the dataset') from cause
+
+        fake.load_dataset = load_dataset
+        sys.modules['datasets'] = fake
+        try:
+            with self.assertRaises(dm.DatasetError) as ctx:
+                dm.load_frame_from_hf('owner/ds', split='train', max_rows=10)
+        finally:
+            sys.modules.pop('datasets', None)
+        d = getattr(ctx.exception, 'diagnostics', None)
+        self.assertIsNotNone(d)
+        self.assertEqual(d['error_type'], 'FakeErr')
+        self.assertEqual(d['root_cause_type'], 'OSError')
+        self.assertEqual(d['errno'], 28)
+        self.assertEqual(d['failing_operation'], 'load_dataset')
+        self.assertTrue(d['paths'], 'HF cache paths listed for disk diagnosis')
+
+    def test_runner_error_payload_includes_diagnostics(self):
+        import io
+        import sys
+        from contextlib import redirect_stdout
+        import ml.experiment_runner as er
+        base = tempfile.mkdtemp(prefix='mlws_runner_')
+        try:
+            err = OSError(122, 'Disk quota exceeded')
+            payload_d = er._diagnostics_for(err, base, 'mlw_diag000000')
+            self.assertEqual(payload_d['errno'], 122)
+            self.assertTrue(any('mlw_diag000000' in p for p in payload_d['paths']),
+                            'workspace path added: %s' % payload_d['paths'])
+            self.assertTrue(payload_d['disk'], 'workspace statvfs captured')
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                with self.assertRaises(SystemExit):
+                    er._fail('boom', 'ingest_error', payload_d)
+            out = json.loads(buf.getvalue().strip().split('\n')[-1])
+            self.assertEqual(out['type'], 'error')
+            self.assertEqual(out['diagnostics']['errno'], 122)
+            self.assertNotIn('Traceback', out['error'])
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+
 class RunnerImportRobustnessTest(unittest.TestCase):
     """experiment_runner must import without heavy deps, and every command
     must emit a structured dependency error (never a bare traceback) when

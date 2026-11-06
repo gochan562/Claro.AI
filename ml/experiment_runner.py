@@ -56,8 +56,13 @@ def _progress(job, message, **kw):
     _emit(out)
 
 
-def _fail(message, code='ingest_error'):
-    _emit({'type': 'error', 'error': message, 'code': code})
+def _fail(message, code='ingest_error', diagnostics=None):
+    out = {'type': 'error', 'error': message, 'code': code}
+    if diagnostics:
+        # Allowlist-built structured fields only (types, messages, paths,
+        # statvfs free space). Full tracebacks go to stderr, never here.
+        out['diagnostics'] = diagnostics
+    _emit(out)
     sys.exit(1)
 
 
@@ -106,6 +111,51 @@ def _classify_ingest_error(e):
                 'Hugging Face is temporarily unavailable. Try again.')
     return ('ingest_error',
             '%s: %s' % (name, str(e)[:300]))
+
+
+def _diagnostics_for(e, base=None, ws_id=None):
+    # Structured diagnostics for an ingestion exception. Prefer the
+    # allowlisted dict built at the failure site (DatasetError.diagnostics);
+    # otherwise build a minimal one. Adds workspace paths + statvfs free
+    # space so disk-quota failures (Errno 122) are observable. Full
+    # tracebacks go to stderr (subprocess), never into this payload.
+    try:
+        traceback.print_exc()
+    except Exception:
+        pass
+    diag = None
+    if getattr(e, 'diagnostics', None):
+        try:
+            diag = dict(e.diagnostics)
+        except Exception:
+            diag = None
+    if diag is None:
+        try:
+            from ml import dataset_manager as _dm  # not the _ensure_deps global
+            diag = _dm._build_diagnostics(e, 'unspecified')
+        except Exception:
+            diag = {
+                'error_type': type(e).__name__,
+                'error_message': str(e)[:300],
+                'root_cause_type': type(e).__name__,
+                'root_cause_message': str(e)[:300],
+                'failing_operation': 'unspecified',
+                'paths': [],
+                'disk': [],
+            }
+    try:
+        if base and ws_id and ws_id.startswith('mlw_'):
+            from ml import dataset_manager as _dm
+            root = os.path.join(base, 'ml_workspaces', ws_id)
+            paths = [root, os.path.join(root, 'data.csv')]
+            existing = diag.get('paths') or []
+            diag['paths'] = (existing + [p for p in paths if p not in existing])[:8]
+            diag.setdefault('disk', []).extend(
+                _dm._statvfs_diag(p) for p in paths
+                if all(d.get('path') != p for d in diag['disk']))
+    except Exception:
+        pass
+    return diag
 
 
 def cmd_dataset_ingest(args):
@@ -184,7 +234,7 @@ def cmd_dataset_ingest_hf(args):
         _emit({'type': 'result', 'manifest': manifest, 'profile': profile})
     except Exception as e:
         code, message = _classify_ingest_error(e)
-        _fail(message, code)
+        _fail(message, code, _diagnostics_for(e, args.workspace_base, args.ws))
 
 
 def cmd_predict_rows(args):

@@ -123,16 +123,43 @@ function _mlStatusFor(code) {
 function _throwPythonResult(run, { prefix, defaultCode = 'ingest_error' } = {}) {
   const payload = _lastJsonLine(run.stdout);
   if (payload && payload.type === 'result') return payload;
+  const mkError = (message, code) => {
+    const err = _err(message, code, _mlStatusFor(code));
+    const pub = _publicDiagnostics(payload && payload.diagnostics);
+    if (pub) {
+      err.diagnostics = pub;
+    } else {
+      // Python crashed before reporting (or non-JSON output): synthesize
+      // minimal diagnostics from run telemetry + local free space so the
+      // failure is never fully opaque.
+      const stderrFirst = String(run.stderr || '').trim().split('\n').pop() || '';
+      err.diagnostics = _publicDiagnostics({
+        error_type: run.timedOut ? 'SubprocessTimeout' : 'SubprocessCrash',
+        error_message: (run.timedOut ? 'python subprocess timed out'
+          : `python exit=${run.code} signal=${run.signal} ${stderrFirst}`).slice(0, 300),
+        root_cause_type: run.timedOut ? 'timeout' : (payload ? 'no_json_result' : 'python_crash'),
+        root_cause_message: stderrFirst.slice(0, 300),
+        failing_operation: 'python_subprocess',
+        paths: [path.join(__dirname, 'ml_workspaces')],
+        disk: _localDiskDiagnostics([path.join(__dirname, 'ml_workspaces')]),
+      });
+    }
+    // Full (unsanitized) diagnostics + stderr belong in the server log only.
+    if (payload && payload.diagnostics) {
+      console.error(`[ML-DIAG] ${JSON.stringify(payload.diagnostics)}`);
+    }
+    return err;
+  };
   if (payload && payload.type === 'error') {
     const code = payload.code || defaultCode;
-    throw _err(`${prefix}: ${payload.error}`, code, _mlStatusFor(code));
+    throw mkError(`${prefix}: ${payload.error}`, code);
   }
   if (run.timedOut) {
-    throw _err(`${prefix}: Python process timed out.`, defaultCode, _mlStatusFor(defaultCode));
+    throw mkError(`${prefix}: Python process timed out.`, defaultCode);
   }
   console.error(`[ML-HF] python exit=${run.code} signal=${run.signal} stderr=${String(run.stderr).slice(-2000)}`);
   const suffix = run.code !== 0 && run.code !== null ? ` (exit ${run.code})` : '';
-  throw _err(`${prefix}: no result${suffix}`, defaultCode, _mlStatusFor(defaultCode));
+  throw mkError(`${prefix}: no result${suffix}`, defaultCode);
 }
 
 function _lastJsonLine(stdout) {
@@ -144,6 +171,58 @@ function _lastJsonLine(stdout) {
     }
   }
   return null;
+}
+
+// ── Structured ingestion diagnostics ─────────────────────────────────────
+// Python emits an ALLOWLIST-built `diagnostics` object in structured error
+// payloads (types, messages, relevant paths, statvfs free space, failing
+// operation). The browser receives only fields that survive this sanitizer:
+// no environment variables, no tokens, no raw stderr, no tracebacks. Full
+// detail stays in the server log via console (the server's logger).
+
+function _scrubSecrets(s) {
+  // Redact anything token-shaped before it can leave the process.
+  return String(s)
+    .replace(/Bearer\s+\S+/gi, 'Bearer (redacted)')
+    .replace(/hf_[A-Za-z0-9]{16,}/g, 'hf_***(redacted)')
+    .replace(/github_pat_[A-Za-z0-9_]{16,}/g, 'github_pat_***(redacted)')
+    .replace(/gh[pousr]_[A-Za-z0-9]{16,}/g, 'gh_***(redacted)')
+    .replace(/sk-[A-Za-z0-9_-]{16,}/g, 'sk-***(redacted)');
+}
+
+function _scrubText(v) { return _scrubSecrets(String(v)).slice(0, 400); }
+
+function _publicDiagnostics(d) {
+  if (!d || typeof d !== 'object') return undefined;
+  const ALLOW = ['error_type', 'error_message', 'root_cause_type',
+    'root_cause_message', 'failing_operation', 'errno', 'os_error'];
+  const out = {};
+  for (const k of ALLOW) {
+    if (d[k] === undefined || d[k] === null) continue;
+    out[k] = typeof d[k] === 'number' ? d[k] : _scrubText(d[k]);
+  }
+  for (const k of ['paths', 'disk']) {
+    if (!Array.isArray(d[k])) continue;
+    out[k] = d[k].slice(0, 8).map(v => typeof v === 'string'
+      ? _scrubText(v) : (v && typeof v === 'object' ? v : String(v)));
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+// Free-space snapshot (Node's statfs — the statvfs equivalent) for paths
+// Node owns, used when Python crashed before it could report diagnostics.
+function _localDiskDiagnostics(paths) {
+  const disk = [];
+  for (const p of paths.slice(0, 4)) {
+    try {
+      const st = fs.statfsSync(p);
+      disk.push({ path: p, free_bytes: Number(st.bavail) * Number(st.bsize),
+                  total_bytes: Number(st.blocks) * Number(st.bsize) });
+    } catch (_) {
+      disk.push({ path: p, statvfs_error: 'unavailable' });
+    }
+  }
+  return disk;
 }
 
 // ── Validation (structural; Python re-validates semantics) ──
@@ -616,7 +695,17 @@ async function ingestHf({ dataset_id, split, config }) {
     console.error(`[ML-HF] ingest ok rows=${payload.manifest && payload.manifest.row_count}`);
     return { workspace_id: ws_id, manifest: payload.manifest, profile: payload.profile };
   } catch (err) {
-    console.error(`[ML-HF] stderr=${String(run.stderr).slice(-2000)}`);
+    // Server-side diagnostics (the server's logger): structured DIAG lines
+    // from the subprocess, the Python stderr traceback tail, and the
+    // sanitized diagnostics object. Nothing here is sent to the browser
+    // except err.diagnostics (allowlist-sanitized in _throwPythonResult).
+    console.error(`[ML-HF] ingest FAILED dataset=${dataset_id} config=${config || '(auto)'} split=${split || '(auto)'} exit=${run.code} signal=${run.signal} timedOut=${run.timedOut}`);
+    for (const line of String(run.stdout || '').split('\n')) {
+      if (line.includes('[TRAIN-DIAG]')) console.error(line.trim());
+    }
+    const stderrTail = String(run.stderr || '').trim().split('\n').slice(-25).join('\n');
+    if (stderrTail) console.error(`[ML-HF] python stderr (tail):\n${stderrTail}`);
+    if (err.diagnostics) console.error(`[ML-DIAG] ${JSON.stringify(err.diagnostics)}`);
     throw err;
   }
 }

@@ -94,6 +94,90 @@ async function run() {
       fs.unlinkSync(bin);
     }
     ok('crash without JSON falls back generic without leaking stderr');
+
+  // ── 2b. Disk-quota-style failure carries structured diagnostics ──
+  // Production symptom: OSError Errno 122 on the HF/tmpfs write. Python's
+  // structured error payload must reach Node as err.diagnostics (root
+  // cause, paths, free space, failing op) with secrets scrubbed, and the
+  // full detail must appear in the SERVER log ([ML-DIAG]/[TRAIN-DIAG]).
+  {
+    const diag = {
+      error_type: 'DatasetError',
+      error_message: 'Could not save dataset to workspace: [Errno 122] Disk quota exceeded',
+      root_cause_type: 'OSError',
+      root_cause_message: '[Errno 122] Disk quota exceeded',
+      failing_operation: 'save_workspace:write data.csv',
+      errno: 122,
+      os_error: 'Disk quota exceeded',
+      paths: ['/home/runner/workspace/ml_workspaces/mlw_x/data.csv',
+              '/home/runner/.cache/huggingface/datasets'],
+      disk: [{ path: '/home/runner/workspace/ml_workspaces/mlw_x',
+               free_bytes: 123456789, total_bytes: 220000000000 }],
+      // planted secrets — MUST be scrubbed from anything client-visible
+      note: 'token hf_FAKE-token-abcdef1234567890abcdef leaked Bearer sk-fake-key-1234567890abcdef',
+    };
+    const bin = writeFakeBin('ml-fake-quota.js',
+      `console.log('[TRAIN-DIAG] WRITE save_workspace:write data.csv path=/home/runner/workspace/ml_workspaces/mlw_x/data.csv free_GB=0.01');\n` +
+      `console.log(JSON.stringify({ type: 'error', error: 'Hugging Face dataset load failed: Could not save dataset to workspace: [Errno 122] Disk quota exceeded', code: 'ingest_error', diagnostics: ${JSON.stringify(diag)} }));\n` +
+      `process.exit(1);`);
+    process.env.PYTHON_BIN = bin;
+    const errs = [];
+    const origErr = console.error;
+    console.error = (...a) => { errs.push(a.map(String).join(' ')); };
+    try {
+      await ml.ingestHf({ dataset_id: 'Salesforce/wikitext', split: 'train', config: 'wikitext-2-raw-v1' });
+      assert.fail('ingestHf should have thrown');
+    } catch (e) {
+      console.error = origErr;
+      const d = e.diagnostics;
+      assert(d, 'diagnostics attached to the error');
+      assert.strictEqual(d.root_cause_type, 'OSError');
+      assert.strictEqual(d.errno, 122);
+      assert.strictEqual(d.failing_operation, 'save_workspace:write data.csv');
+      assert(Array.isArray(d.paths) && d.paths.some(p => p.includes('data.csv')), 'failing path present');
+      assert(Array.isArray(d.disk) && d.disk.length && typeof d.disk[0].free_bytes === 'number',
+        'statvfs free space present');
+      // sanitization: nothing token-shaped survives to the client-visible object
+      const flat = JSON.stringify(d);
+      assert(!flat.includes('hf_FAKE-token'), 'hf token scrubbed');
+      assert(!flat.includes('sk-fake-key'), 'sk key scrubbed');
+      assert(!flat.includes('Bearer sk-fake'), 'bearer secret scrubbed');
+      assert(!flat.includes('Traceback'), 'no tracebacks in client diagnostics');
+      // server log has the full detail
+      const logAll = errs.join('\n');
+      assert(logAll.includes('[ML-DIAG]'), 'structured diagnostics in server log');
+      assert(logAll.includes('[TRAIN-DIAG]'), 'TRAIN-DIAG write log in server log');
+      assert(logAll.includes('hf_FAKE-token'), 'unsanitized detail stays server-side only');
+      assert(!e.message.includes('Traceback'), 'no traceback in UI message');
+    } finally {
+      console.error = origErr;
+      delete process.env.PYTHON_BIN;
+      fs.unlinkSync(bin);
+    }
+    ok('structured diagnostics reach Node error + server log, secrets scrubbed');
+  }
+
+  // ── 2c. Crash without JSON now synthesizes diagnostics (never opaque) ──
+  {
+    const bin = writeFakeBin('ml-fake-crash2.js',
+      `console.error('Traceback (most recent call last):\\n  MemoryError'); process.exit(1);`);
+    process.env.PYTHON_BIN = bin;
+    try {
+      await ml.ingestHf({ dataset_id: 'a/b', split: null });
+      assert.fail('ingestHf should have thrown');
+    } catch (e) {
+      const d = e.diagnostics;
+      assert(d, 'synthesized diagnostics on crash');
+      assert.strictEqual(d.error_type, 'SubprocessCrash');
+      assert(Array.isArray(d.disk) && d.disk.length, 'local free-space snapshot present');
+      assert(Array.isArray(d.paths) && d.paths.some(p => p.includes('ml_workspaces')),
+        'workspace path present');
+    } finally {
+      delete process.env.PYTHON_BIN;
+      fs.unlinkSync(bin);
+    }
+    ok('crash without JSON synthesizes diagnostics (SubprocessCrash + disk)');
+  }
   }
 
   // ── 3. Live acceptance (tiny public dataset; skipped offline) ──

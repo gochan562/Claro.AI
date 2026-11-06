@@ -16,6 +16,19 @@ import pandas as pd
 MAX_PREVIEW_ROWS = 100
 
 
+def _log_write(path, op):
+    try:
+        dirname = os.path.dirname(path) if os.path.dirname(path) else '.'
+        if os.path.exists(dirname):
+            st = os.statvfs(dirname)
+            free_gb = st.f_bavail * st.f_frsize / (1024**3)
+        else:
+            free_gb = 'N/A'
+        print('[TRAIN-DIAG] WRITE %s path=%s free_GB=%s' % (op, path, free_gb))
+    except Exception:
+        print('[TRAIN-DIAG] WRITE %s path=(stats failed)' % (op,))
+
+
 class DatasetError(ValueError):
     pass
 
@@ -241,8 +254,8 @@ def profile_dataframe(df, target=None, hist_bins=20, max_corr_cols=30,
             profile['scatter'] = {
                 'x': str(a), 'y': str(b),
                 'points': [[float(x), float(y)] for x, y in
-                            zip(pd.to_numeric(sub[a], errors='coerce'),
-                                pd.to_numeric(sub[b], errors='coerce'))],
+                    zip(pd.to_numeric(sub[a], errors='coerce'),
+                        pd.to_numeric(sub[b], errors='coerce'))],
             }
         except Exception:
             profile['scatter'] = None
@@ -327,7 +340,9 @@ def workspace_paths(base_dir, ws_id):
 def save_workspace(base_dir, ws_id, df, manifest):
     p = workspace_paths(base_dir, ws_id)
     os.makedirs(p['root'], exist_ok=True)
+    _log_write(p['data'], 'df.to_csv')
     df.to_csv(p['data'], index=False)
+    _log_write(p['manifest'], 'json.dump manifest')
     manifest = dict(manifest)
     manifest['sha256'] = dataset_sha256(p['data'])
     with open(p['manifest'], 'w') as f:

@@ -204,6 +204,19 @@ function normalizeStructuredRequest(body) {
     );
   }
 
+  // prompt_format: auto (default) | chat | raw. 'chat' applies the model's
+  // own chat template Space-side (required by instruct models like
+  // MuyaoYuan/LoCo-7B); 'raw' preserves historical verbatim tokenization.
+  let prompt_format = inputs.prompt_format ?? body.prompt_format ?? 'auto';
+  prompt_format = String(prompt_format).toLowerCase().trim();
+  if (!['auto', 'chat', 'raw'].includes(prompt_format)) {
+    throw new GpuError(
+      'inputs.prompt_format must be one of auto/chat/raw',
+      'bad_request',
+      400
+    );
+  }
+
   // Optional parameters
   const temperature = inputs.temperature !== undefined ? Number(inputs.temperature) : 0.7;
   const top_p = inputs.top_p !== undefined ? Number(inputs.top_p) : 0.9;
@@ -239,14 +252,14 @@ function normalizeStructuredRequest(body) {
     );
   }
 
-  return { modelId, task, prompt, max_new_tokens: maxNewTokens, temperature, top_p, gguf_file, revision, adapter_path };
+  return { modelId, task, prompt, max_new_tokens: maxNewTokens, temperature, top_p, gguf_file, revision, adapter_path, prompt_format };
 }
 
 // Generate a deduplication key for a request
-function _dedupKey(modelId, task, prompt, maxNewTokens, temperature, top_p) {
+function _dedupKey(modelId, task, prompt, maxNewTokens, temperature, top_p, prompt_format) {
   const crypto = require('crypto');
   const hash = crypto.createHash('sha256');
-  hash.update(`${modelId}|${task}|${prompt}|${maxNewTokens}|${temperature}|${top_p}`);
+  hash.update(`${modelId}|${task}|${prompt}|${maxNewTokens}|${temperature}|${top_p}|${prompt_format || 'auto'}`);
   return hash.digest('hex').slice(0, 16);
 }
 
@@ -305,7 +318,7 @@ class ZeroGPUBackend {
   // supported repo (Transformers / Diffusers / GGUF) instead of hard-coding
   // a single model.  We forward the validated model_id/task alongside the
   // prompt so the Space actually does the requested work.
-  async _postGenerate(prompt, maxNewTokens, signal, modelId, task, authToken, temperature, top_p, gguf_file, revision, adapter_path) {
+  async _postGenerate(prompt, maxNewTokens, signal, modelId, task, authToken, temperature, top_p, gguf_file, revision, adapter_path, prompt_format) {
     const url = `${this.base}/gradio_api/call/v2/generate`;
     const body = { prompt, max_new_tokens: maxNewTokens };
     if (modelId) body.model_id = modelId;
@@ -316,6 +329,9 @@ class ZeroGPUBackend {
     if (gguf_file) body.gguf_file = gguf_file;
     if (revision) body.revision = revision;
     if (adapter_path) body.adapter_path = adapter_path;
+    // prompt_format: omit 'auto' (the Space default) so older Spaces without
+    // the parameter never see an unknown kwarg; send explicit chat/raw.
+    if (prompt_format && prompt_format !== 'auto') body.prompt_format = prompt_format;
     const headers = { 'Content-Type': 'application/json' };
     if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
     const res = await fetch(url, {
@@ -520,10 +536,10 @@ class ZeroGPUBackend {
 
   // run(body, signal, onLine, authToken): { output, stderr }
   async run(body, signal, onLine, authToken) {
-    const { modelId, task, prompt, max_new_tokens, temperature, top_p, gguf_file, revision } = normalizeStructuredRequest(body);
+    const { modelId, task, prompt, max_new_tokens, temperature, top_p, gguf_file, revision, prompt_format } = normalizeStructuredRequest(body);
 
     // Request deduplication: check if identical request is already in-flight
-    const dedupKey = _dedupKey(modelId, task, prompt, max_new_tokens, temperature, top_p);
+    const dedupKey = _dedupKey(modelId, task, prompt, max_new_tokens, temperature, top_p, prompt_format);
     if (_inflightRequests.has(dedupKey)) {
       console.log('[ZeroGPU] Deduplicating request:', dedupKey);
       if (onLine) onLine(`↗ ZeroGPU (dedup) → ${this.spaceId}  model=${modelId} task=${task} max_new_tokens=${max_new_tokens}`);
@@ -539,10 +555,10 @@ class ZeroGPUBackend {
       }
     }
 
-    if (onLine) onLine(`↗ ZeroGPU → ${this.spaceId}  model=${modelId} task=${task} max_new_tokens=${max_new_tokens} temp=${temperature} top_p=${top_p}`);
+    if (onLine) onLine(`↗ ZeroGPU → ${this.spaceId}  model=${modelId} task=${task} max_new_tokens=${max_new_tokens} temp=${temperature} top_p=${top_p}` + (prompt_format && prompt_format !== 'auto' ? ` prompt_format=${prompt_format}` : ''));
 
     // Create the promise and store it for deduplication
-    const runPromise = this._runInternal(prompt, max_new_tokens, signal, modelId, task, authToken, temperature, top_p, gguf_file, revision, onLine);
+    const runPromise = this._runInternal(prompt, max_new_tokens, signal, modelId, task, authToken, temperature, top_p, gguf_file, revision, onLine, prompt_format);
     _inflightRequests.set(dedupKey, runPromise);
 
     try {
@@ -559,10 +575,10 @@ class ZeroGPUBackend {
     }
   }
 
-  async _runInternal(prompt, max_new_tokens, signal, modelId, task, authToken, temperature, top_p, gguf_file, revision, onLine) {
+  async _runInternal(prompt, max_new_tokens, signal, modelId, task, authToken, temperature, top_p, gguf_file, revision, onLine, prompt_format) {
     let eventId;
     try {
-      eventId = await this._postGenerate(prompt, max_new_tokens, signal, modelId, task, authToken, temperature, top_p, gguf_file, revision);
+      eventId = await this._postGenerate(prompt, max_new_tokens, signal, modelId, task, authToken, temperature, top_p, gguf_file, revision, undefined, prompt_format);
     } catch (err) {
       if (err.name === 'AbortError') throw new GpuError('ZeroGPU call was cancelled.', 'cancelled', 499);
       if (err.name === 'TypeError') {

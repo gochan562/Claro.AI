@@ -193,7 +193,7 @@ def _parse_structured(prompt_or_json: str):
     the local provider send a single structured blob.
     """
     if not isinstance(prompt_or_json, str):
-        return prompt_or_json, None, None, None, None, None
+        return prompt_or_json, None, None, None, None, None, None
     s = prompt_or_json.strip()
     if s.startswith("{") and s.endswith("}"):
         try:
@@ -206,10 +206,11 @@ def _parse_structured(prompt_or_json: str):
                     obj.get("max_new_tokens"),
                     obj.get("do_sample"),
                     obj.get("adapter_path") or obj.get("adapter_dir"),
+                    obj.get("prompt_format"),
                 )
         except Exception:
             pass
-    return prompt_or_json, None, None, None, None, None
+    return prompt_or_json, None, None, None, None, None, None
 
 
 def _gpu_duration(prompt, max_new_tokens, task, model_id, *_args, **_kwargs):
@@ -234,7 +235,7 @@ def _gpu_duration(prompt, max_new_tokens, task, model_id, *_args, **_kwargs):
 
 
 @spaces.GPU(duration=_gpu_duration)
-def _gpu_infer(prompt, max_new_tokens, task, model_id, gguf_file, revision, temperature, top_p, do_sample, adapter_path=None):
+def _gpu_infer(prompt, max_new_tokens, task, model_id, gguf_file, revision, temperature, top_p, do_sample, adapter_path=None, prompt_format="auto"):
     """GPU-scoped inference: moves the CPU-cached model onto CUDA, runs the
     requested task, and offloads it again.  Model *loading* deliberately happens
     on the CPU worker (see generate()) so cold loads do not consume GPU seconds.
@@ -257,10 +258,11 @@ def _gpu_infer(prompt, max_new_tokens, task, model_id, gguf_file, revision, temp
         top_p=top_p,
         do_sample=do_sample,
         adapter_path=adapter_path,
+        prompt_format=prompt_format,
     )
 
 
-def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=None, revision=None, temperature=0.7, top_p=0.9, do_sample=True, adapter_path=None):
+def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=None, revision=None, temperature=0.7, top_p=0.9, do_sample=True, adapter_path=None, prompt_format="auto"):
     """Structured endpoint.
 
     Args:
@@ -284,7 +286,7 @@ def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=Non
     """
     # Unwrap an optional structured JSON payload passed through `prompt`.
     if model_id is None and task is None:
-        p, mid, t, mnt, ds, ap = _parse_structured(prompt)
+        p, mid, t, mnt, ds, ap, pf = _parse_structured(prompt)
         if mid is not None:
             model_id = mid
             task = t
@@ -294,6 +296,8 @@ def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=Non
                 do_sample = bool(ds)
             if ap is not None:
                 adapter_path = ap
+            if pf is not None:
+                prompt_format = pf
             prompt = p
 
     model_id = (model_id or DEFAULT_MODEL_ID).strip()
@@ -346,6 +350,12 @@ def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=Non
     else:
         do_sample = bool(do_sample)
 
+    # Validate prompt_format (auto/chat/raw; default auto)
+    prompt_format = (prompt_format if prompt_format is not None else "auto")
+    prompt_format = str(prompt_format).strip().lower() or "auto"
+    if prompt_format not in ("auto", "chat", "raw"):
+        return f"[CLARO:bad_request] prompt_format must be one of auto/chat/raw"
+
     # Estimate duration for logging (actual quota based on real compute time)
     model_size_hint = model_id.split("/")[-1] if "/" in model_id else model_id
     estimated_duration = estimate_gpu_duration(task, max_new_tokens, "", model_size_hint)
@@ -368,6 +378,7 @@ def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=Non
             top_p,
             do_sample,
             adapter_path,
+            prompt_format,
         )
         # Return the generated text verbatim on success — the local Claro.AI
         # provider returns it directly to the dashboard.  Debug info (model

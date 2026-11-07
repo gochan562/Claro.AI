@@ -3238,6 +3238,97 @@ print(f"Loaded trained model from {MODEL_DIR}")
       }
     }
 
+    // ── Resource-conscious, text-only model eligibility (Model Picker) ──────
+    // The default picker offers text-only models up to 8B TOTAL parameters.
+    // MoE models are judged by TOTAL parameter count (the HF API's
+    // num_parameters filter is total-based too — verified: Qwen3-30B-A3B,
+    // 30.5B total / 3.3B active, is excluded by max:8B).
+    // Eligibility uses structured metadata ONLY (safetensors.total,
+    // pipeline_tag, tags, library_name) — never model-card wording, so an
+    // ordinary text model is never rejected because its card mentions
+    // images or videos. Malformed/missing metadata fails safe (excluded
+    // from the default picker); custom model IDs bypass this entirely.
+    const HF_MAX_TOTAL_PARAMS = 8e9; // 8B total parameters
+
+    const HF_ALLOWED_PIPELINES = new Set([
+      'text-generation', 'text2text-generation', 'text-classification',
+      'token-classification', 'question-answering', 'summarization',
+      'translation', 'fill-mask', 'sentence-similarity', 'feature-extraction',
+      'zero-shot-classification',
+    ]);
+
+    // Image and video tasks — rejected wherever they surface (pipeline_tag
+    // or tags), covering the spec's lists plus adjacent HF variants.
+    const HF_BLOCKED_TASKS = new Set([
+      // image
+      'image-classification', 'image-to-text', 'image-text-to-text',
+      'image-to-image', 'text-to-image', 'image-segmentation',
+      'object-detection', 'depth-estimation', 'mask-generation',
+      'unconditional-image-generation', 'zero-shot-image-classification',
+      'image-feature-extraction', 'visual-question-answering',
+      'visual-document-question-answering', 'document-question-answering',
+      'image-to-3d', 'text-to-3d',
+      // video
+      'text-to-video', 'image-to-video', 'video-classification',
+      'video-text-to-text',
+    ]);
+
+    // Tags that mark vision-language / multimodal models even when their
+    // pipeline_tag is plain text-generation (e.g. LLaVA-class models).
+    const HF_BLOCKED_TAG_EXACT = new Set([
+      'multimodal', 'vision', 'video', 'image', 'vlm', 'ocr',
+      'any-to-any', 'vision-language',
+    ]);
+    const HF_BLOCKED_TAG_PREFIXES = ['image', 'video', 'vision'];
+
+    // Decide whether a model is eligible for the default picker.
+    // Returns { eligible: boolean, reason: string } — independently testable.
+    function hfModelEligibility(model) {
+      if (!model || typeof model !== 'object' || !model.id) {
+        return { eligible: false, reason: 'malformed model entry' };
+      }
+      // 1. Total parameter count (safetensors metadata from the HF API).
+      const total = model.safetensors && typeof model.safetensors === 'object'
+        ? model.safetensors.total : undefined;
+      if (typeof total !== 'number' || !Number.isFinite(total) || total <= 0) {
+        return { eligible: false, reason: 'unknown parameter count' };
+      }
+      if (total > HF_MAX_TOTAL_PARAMS) {
+        return { eligible: false, reason: 'exceeds 8B parameters' };
+      }
+      // 2. Pipeline task must be one of the allowed text tasks. Unknown or
+      //    non-text pipeline tags are excluded from the curated default.
+      const pipeline = typeof model.pipeline_tag === 'string' ? model.pipeline_tag : '';
+      if (!HF_ALLOWED_PIPELINES.has(pipeline)) {
+        return { eligible: false, reason: `task "${pipeline || 'unknown'}" is not a supported text task` };
+      }
+      // 3. Modality tags: reject image/video tasks and vision-language /
+      //    multimodal markers. Prefix matching covers tag variants; exact
+      //    matching avoids rejecting text models on unrelated wording.
+      const tags = Array.isArray(model.tags) ? model.tags : [];
+      for (const tag of tags) {
+        if (typeof tag !== 'string') continue;
+        const t = tag.toLowerCase();
+        if (HF_BLOCKED_TASKS.has(t) || HF_BLOCKED_TAG_EXACT.has(t)) {
+          return { eligible: false, reason: `image/video or multimodal tag "${tag}"` };
+        }
+        if (HF_BLOCKED_TAG_PREFIXES.some((pre) => t.startsWith(pre))) {
+          return { eligible: false, reason: `image/video tag "${tag}"` };
+        }
+      }
+      // 4. Diffusers repos generate pixels/audio, not text.
+      if (model.library_name === 'diffusers') {
+        return { eligible: false, reason: 'diffusers (non-text) library' };
+      }
+      return { eligible: true, reason: 'ok' };
+    }
+
+    // Apply eligibility filtering to a fetched page (before rendering).
+    function applyModelFilters(models) {
+      const list = Array.isArray(models) ? models : [];
+      return list.filter((m) => hfModelEligibility(m).eligible);
+    }
+
     function openModelPicker(cellId) {
       uiState.currentModelCellId = cellId;
       const modal = document.getElementById('model-picker-modal');
@@ -3283,6 +3374,20 @@ print(f"Loaded trained model from {MODEL_DIR}")
       const search  = document.getElementById('model-search').value.trim();
 
       const params = new URLSearchParams({ limit: '30', full: 'false' });
+      // Server-side pre-filters (the API's num_parameters filter is
+      // TOTAL-parameter based, so MoE models are judged by total size).
+      // Client-side eligibility (hfModelEligibility) remains the authority:
+      // the server filter cannot express modality/tag rules and lets
+      // unknown-parameter models through.
+      params.set('num_parameters', 'max:8B');
+      // NOTE: passing ANY expand[] switches the API to sparse responses, so
+      // every field the cards and the eligibility helper use must be
+      // expanded explicitly (safetensors for params; the rest for the cards
+      // and the modality/task checks).
+      for (const f of ['safetensors', 'pipeline_tag', 'tags', 'library_name',
+                       'downloads', 'likes', 'lastModified']) {
+        params.append('expand[]', f);
+      }
       if (sort && sort !== 'trending') {
         params.set('sort', sort);
         params.set('direction', '-1');
@@ -3291,16 +3396,34 @@ print(f"Loaded trained model from {MODEL_DIR}")
       if (search)         params.set('search', search);
       if (hfNextCursor)   params.set('cursor', hfNextCursor);
 
+      if (!reset && !hfNextCursor) {
+        // "Load more" with an exhausted cursor: nothing further to fetch.
+        renderModelList();
+        return;
+      }
+
       try {
-        const response = await fetch(`https://huggingface.co/api/models?${params}`);
-        if (!response.ok) throw new Error(`HF API returned ${response.status}`);
+        // A filtered page can legitimately yield zero eligible models (e.g.
+        // a search term dominated by multimodal repos) while a cursor still
+        // points ahead. Auto-advance (bounded) so the list never renders an
+        // empty page while more results exist.
+        let eligible = [];
+        let guard = 0;
+        while (eligible.length === 0 && guard < 6) {
+          guard += 1;
+          const response = await fetch(`https://huggingface.co/api/models?${params}`);
+          if (!response.ok) throw new Error(`HF API returned ${response.status}`);
 
-        const data = await response.json();
-        const newModels = Array.isArray(data) ? data : (data.models || []);
+          const data = await response.json();
+          const newModels = Array.isArray(data) ? data : (data.models || []);
 
-        hfNextCursor = response.headers.get('X-Next-Cursor') || null;
+          hfNextCursor = response.headers.get('X-Next-Cursor') || null;
+          eligible = eligible.concat(applyModelFilters(newModels));
+          if (!hfNextCursor) break;
+          params.set('cursor', hfNextCursor);
+        }
 
-        hfModels = reset ? newModels : [...hfModels, ...newModels];
+        hfModels = reset ? eligible : [...hfModels, ...eligible];
         filteredModels = hfModels;
         renderModelList();
       } catch (error) {
@@ -3315,7 +3438,8 @@ print(f"Loaded trained model from {MODEL_DIR}")
       const modelListDiv = document.getElementById('model-list');
 
       if (filteredModels.length === 0) {
-        modelListDiv.innerHTML = '<p style="color: #94a3b8;">No models found.</p>';
+        modelListDiv.innerHTML = '<p style="color:#94a3b8;">No text-only models up to 8B parameters matched. ' +
+          'Try a different search or task, or paste a model ID directly into the Model Cell.</p>';
         return;
       }
 
@@ -4406,7 +4530,17 @@ function parsePromptAndMaxTokens(inferenceContent, defaultPrompt) {
         // being silently reduced.
         if (Number.isFinite(n) && n >= 1) maxNewTokens = n;
       }
-      return { prompt, max_new_tokens: maxNewTokens };
+      // Optional prompt_format line in the inference cell:
+      //   prompt_format = "auto" | "chat" | "raw"
+      // 'chat' makes the Space apply the model's own chat template (needed
+      // by instruct models such as MuyaoYuan/LoCo-7B). Default auto.
+      let promptFormat = 'auto';
+      const mFmt = text.match(/^\s*prompt_format\s*=\s*f?(?:"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'|```([\s\S]*?)```)\s*$/m);
+      if (mFmt) {
+        const v = (mFmt[1] !== undefined ? mFmt[1] : (mFmt[2] !== undefined ? mFmt[2] : mFmt[3]) || '').trim().toLowerCase();
+        if (['auto', 'chat', 'raw'].includes(v)) promptFormat = v;
+      }
+      return { prompt, max_new_tokens: maxNewTokens, prompt_format: promptFormat };
     }
 
     async function runCellViaZeroGPU(notebook, cell) {
@@ -4439,15 +4573,15 @@ function parsePromptAndMaxTokens(inferenceContent, defaultPrompt) {
         return null;
       }
 
-      const { prompt, max_new_tokens } = parsePromptAndMaxTokens(inferenceContent, 'Once upon a time');
+      const { prompt, max_new_tokens, prompt_format } = parsePromptAndMaxTokens(inferenceContent, 'Once upon a time');
 
-      writeGpuLine(`↗ POST /api/zerogpu-run  model=${modelId}  task=${task}  max_new_tokens=${max_new_tokens}`, 'gray');
+      writeGpuLine(`↗ POST /api/zerogpu-run  model=${modelId}  task=${task}  max_new_tokens=${max_new_tokens}` + (prompt_format !== 'auto' ? `  prompt_format=${prompt_format}` : ''), 'gray');
       if (max_new_tokens > ZEROGPU_MAX_NEW_TOKENS) {
         writeGpuLine(`⚠️ max_new_tokens=${max_new_tokens} exceeds the hard limit of ${ZEROGPU_MAX_NEW_TOKENS} — the server will reject this with a validation error. Lower it in the inference cell.`, 'yellow');
       }
       writeGpuLine(`  prompt: ${prompt.length > 60 ? prompt.slice(0, 60) + '…' : prompt}`);
 
-      const body = { model_id: modelId, task, inputs: { prompt, max_new_tokens } };
+      const body = { model_id: modelId, task, inputs: { prompt, max_new_tokens, prompt_format } };
       try {
         const res  = await fetch('/api/zerogpu-run', {
           method:  'POST',

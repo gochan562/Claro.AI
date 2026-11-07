@@ -1833,14 +1833,7 @@
               <option value="translation">Translation</option>
               <option value="fill-mask">Fill Mask</option>
               <option value="sentence-similarity">Sentence Similarity</option>
-              <option value="image-classification">Image Classification</option>
-              <option value="image-segmentation">Image Segmentation</option>
-              <option value="object-detection">Object Detection</option>
-              <option value="image-to-text">Image to Text</option>
-              <option value="text-to-image">Text to Image</option>
-              <option value="automatic-speech-recognition">Speech Recognition</option>
-              <option value="audio-classification">Audio Classification</option>
-              <option value="depth-estimation">Depth Estimation</option>
+              <option value="feature-extraction">Feature Extraction</option>
               <option value="zero-shot-classification">Zero-Shot Classification</option>
             </select>
             <select id="sort-filter" onchange="loadHFModels(true)">
@@ -1850,6 +1843,9 @@
               <option value="lastModified">Recently Updated</option>
               <option value="createdAt">Newest</option>
             </select>
+          </div>
+          <div id="model-list-hint" style="color:#64748b;font-size:12px;margin:0 0 6px 2px;">
+            Text-only models · Up to 8B parameters
           </div>
           <div id="model-list" class="model-list"></div>
         </div>

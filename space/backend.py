@@ -1124,9 +1124,60 @@ def _logits_diag(tag: str, scores) -> None:
         logger.warning("[CLARO-DIAG] %s logits_diag failed: %s", tag, exc)
 
 
+def _resolve_prompt_format(preprocessor, prompt_format) -> str:
+    """Validate prompt_format and resolve 'auto' against the tokenizer.
+
+    - 'raw':  tokenize the prompt verbatim (historical behavior).
+    - 'chat': apply the model's chat template (required by instruct models
+      like MuyaoYuan/LoCo-7B whose documented usage is apply_chat_template).
+    - 'auto': chat when the tokenizer ships a chat template, else raw.
+
+    Raises ClaroBackendError(bad_request) for unknown values.
+    """
+    fmt = (prompt_format if prompt_format is not None else "auto")
+    fmt = str(fmt).strip().lower() or "auto"
+    if fmt not in ("auto", "chat", "raw"):
+        raise ClaroBackendError(
+            f"prompt_format must be one of auto/chat/raw (got {prompt_format!r}).",
+            code="bad_request",
+        )
+    if fmt == "auto":
+        has_template = bool(getattr(preprocessor, "chat_template", None))
+        return "chat" if has_template else "raw"
+    return fmt
+
+
+def _tokenize_prompt(result: "LoaderResult", prompt: str, prompt_format: str) -> dict:
+    """Tokenize the prompt honoring prompt_format ('raw' | 'chat').
+
+    'chat' builds a single user message and applies the model's own chat
+    template with add_generation_prompt=True, so generation starts in the
+    assistant turn. Returns the tokenized inputs dict (batch of 1).
+    """
+    fmt = _resolve_prompt_format(result.preprocessor, prompt_format)
+    if fmt == "chat":
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            inputs = result.preprocessor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+        except TypeError:
+            # Older transformers without return_dict= on apply_chat_template:
+            # render to text, then tokenize the rendered template normally.
+            rendered = result.preprocessor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True)
+            inputs = result.preprocessor(rendered, return_tensors="pt")
+        return inputs
+    return result.preprocessor(prompt, return_tensors="pt")
+
+
 def _generate_text_gguf(result: LoaderResult, prompt: str, max_new_tokens: int,
                       temperature: float = 0.7, top_p: float = 0.9,
-                      do_sample: bool = True) -> "tuple[str, Optional[int]]":
+                      do_sample: bool = True, prompt_format: str = "auto") -> "tuple[str, Optional[int]]":
     """GGUF text generation via llama.cpp (diagnostic-wrapped).
 
     The shared _generate_text preamble below (parameters(), forward pass,
@@ -1136,7 +1187,7 @@ def _generate_text_gguf(result: LoaderResult, prompt: str, max_new_tokens: int,
     diagnostics (via _GgufModel.generate) and re-raises the original
     exception unchanged so the ZeroGPU error mapping is intact.
     """
-    inputs = result.preprocessor(prompt, return_tensors="pt")
+    inputs = _tokenize_prompt(result, prompt, prompt_format)
     gen_kwargs = dict(
         input_ids=inputs["input_ids"],
         max_new_tokens=int(max_new_tokens),
@@ -1168,7 +1219,7 @@ def _generate_text_gguf(result: LoaderResult, prompt: str, max_new_tokens: int,
 
 def _generate_text(result: LoaderResult, prompt: str, max_new_tokens: int,
                     temperature: float = 0.7, top_p: float = 0.9,
-                    do_sample: bool = True) -> "tuple[str, Optional[int]]":
+                    do_sample: bool = True, prompt_format: str = "auto") -> "tuple[str, Optional[int]]":
     import torch
     if result.preprocessor is None:
         raise ClaroBackendError(
@@ -1181,8 +1232,8 @@ def _generate_text(result: LoaderResult, prompt: str, max_new_tokens: int,
         # llama.cpp completion call. All other modalities use the shared
         # path below unchanged.
         return _generate_text_gguf(result, prompt, max_new_tokens,
-                                   temperature, top_p, do_sample)
-    inputs = result.preprocessor(prompt, return_tensors="pt").to(result.model.device)
+                                   temperature, top_p, do_sample, prompt_format)
+    inputs = _tokenize_prompt(result, prompt, prompt_format).to(result.model.device)
     is_enc_dec = bool(getattr(result.model.config, "is_encoder_decoder", False))
     on_cuda = torch.cuda.is_available() and next(result.model.parameters()).is_cuda
 
@@ -1300,6 +1351,7 @@ def run_inference(
     top_p: float = 0.9,
     do_sample: bool = True,
     adapter_path: Optional[str] = None,
+    prompt_format: str = "auto",
 ) -> str:
     """Run inference on GPU. Model is loaded via load_model() which uses CPU cache.
     
@@ -1330,7 +1382,7 @@ def run_inference(
                         f"Task '{task}' is not compatible with a Diffusion pipeline.",
                         code="task_model_mismatch",
                     )
-                text, n_tokens = _generate_text(result, prompt, max_new_tokens, temperature, top_p, do_sample=do_sample)
+                text, n_tokens = _generate_text(result, prompt, max_new_tokens, temperature, top_p, do_sample=do_sample, prompt_format=prompt_format)
 
             elif task in ("text-to-image", "image-generation"):
                 if result.modality != "diffusion":

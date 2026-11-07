@@ -94,6 +94,55 @@ async function run() {
   assert(prev.classes.train && prev.classes.train.length === 2, 'class balance shown');
   console.log('✓ split preview 70/15/15 stratified');
 
+  // ── 4b. sample validation: blank sample = no sampling, never an error ──
+  // Regression: the dataset cell initializes view.sample = {}; the old
+  // validator rejected it with 'sample needs n or frac.', so split preview
+  // never reached ml/split.py.
+  {
+    // 1. Empty / blank sample objects are no sampling requests.
+    for (const s of [{}, { n: null }, { n: '' }, { frac: null }, { n: '', frac: null }]) {
+      const v = ml.validateView({ sample: s });
+      assert.strictEqual(v.sample, undefined,
+        `blank sample ${JSON.stringify(s)} must emit no sample key`);
+    }
+    // Reaches Python end-to-end (the exact broken path):
+    const prevEmpty = await ml.splitPreview(ing.workspace_id,
+      { strategy: 'train_val_test', train_frac: 0.7, val_frac: 0.15, test_frac: 0.15, seed: 42, shuffle: true, stratify: true },
+      { sample: {} }, 'bought', 'classification');
+    assert.strictEqual(prevEmpty.counts.train + prevEmpty.counts.validation + prevEmpty.counts.test, 150,
+      'split preview with sample:{} reaches ml/split.py unsampled');
+    // Same behavior on the experiment-run path:
+    const cfgEmpty = ml.validateExperimentConfig({
+      workspace_id: ing.workspace_id, task: 'classification', target_column: 'bought',
+      dataset_view: { sample: {} },
+      split: { strategy: 'train_val_test' }, preprocessing: {},
+      model: { family: 'LogisticRegression', params: {} },
+    });
+    assert.strictEqual(cfgEmpty.dataset_view.sample, undefined,
+      'experiment config treats sample:{} as unsampled');
+
+    // 2. A valid sample.n is preserved.
+    assert.deepStrictEqual(ml.validateView({ sample: { n: 50 } }).sample,
+      { n: 50, frac: null, seed: 42 });
+    // 3. A valid sample.frac is preserved.
+    assert.deepStrictEqual(ml.validateView({ sample: { frac: 0.25 } }).sample,
+      { n: null, frac: 0.25, seed: 42 });
+
+    // 4. Invalid non-empty sampling values still throw.
+    for (const bad of [{ n: 0 }, { n: -5 }, { n: 'abc' }, { n: 999999 },
+                       { frac: 0 }, { frac: 1 }, { frac: 1.5 }, { frac: -0.1 },
+                       { n: 10, frac: 'x' }]) {
+      expectErr(() => ml.validateView({ sample: bad }), 'bad_request');
+    }
+    // Non-object samples and non-empty objects without n/frac are rejected,
+    // never silently ignored.
+    expectErr(() => ml.validateView({ sample: 5 }), 'bad_request');
+    expectErr(() => ml.validateView({ sample: 'half' }), 'bad_request');
+    expectErr(() => ml.validateView({ sample: ['a'] }), 'bad_request');
+    expectErr(() => ml.validateView({ sample: { seed: 7 } }), 'bad_request');
+    console.log('✓ sample validation: blank = no sampling; valid n/frac kept; invalid rejected');
+  }
+
   // ── 5. full experiment: train + CV + evaluate artifacts ──
   const config = ml.validateExperimentConfig({
     workspace_id: ing.workspace_id,

@@ -483,15 +483,35 @@ function validateView(view) {
     });
   }
   if (view.sample !== undefined && view.sample !== null) {
+    if (typeof view.sample !== 'object' || Array.isArray(view.sample)) {
+      throw _err('sample must be an object with n or frac.', 'bad_request', 400);
+    }
     const s = view.sample;
-    out.sample = {
-      n: s.n == null || s.n === '' ? null : _optInt(s.n, 'sample.n', 1, ML_MAX_DATASET_ROWS, null),
-      frac: s.frac == null || s.frac === '' ? null : _optFloat(s.frac, 'sample.frac', 0, 1, null),
-      seed: _optInt(s.seed, 'sample.seed', 0, 2 ** 31 - 1, 42),
-    };
-    if (out.sample.n == null && out.sample.frac == null) {
+    // Blank sampling means "no sampling requested": the dataset cell
+    // initializes view.sample = {} and users must not have to configure
+    // sampling just to split a dataset. Values PRESENT but blank
+    // (null / '') count as blank too, matching _optInt/_optFloat semantics.
+    // Any present non-blank value is validated — invalid ones still throw.
+    const hasN = !(s.n == null || s.n === '');
+    const hasFrac = !(s.frac == null || s.frac === '');
+    if (hasN || hasFrac) {
+      out.sample = {
+        n: hasN ? _optInt(s.n, 'sample.n', 1, ML_MAX_DATASET_ROWS, null) : null,
+        frac: hasFrac ? _optFloat(s.frac, 'sample.frac', 0, 1, null) : null,
+        seed: _optInt(s.seed, 'sample.seed', 0, 2 ** 31 - 1, 42),
+      };
+      // Python samples only for 0 < frac < 1; frac at or outside the bounds
+      // would be a silently ignored no-op, so reject it up front.
+      if (out.sample.frac != null && !(out.sample.frac > 0 && out.sample.frac < 1)) {
+        throw _err('sample.frac must be between 0 and 1 (exclusive).', 'bad_request', 400);
+      }
+    } else if (Object.keys(s).some((k) => s[k] != null && s[k] !== '')) {
+      // Non-empty sample object with no usable n/frac (e.g. {seed: 7}) is a
+      // malformed sampling request — never silently ignored.
       throw _err('sample needs n or frac.', 'bad_request', 400);
     }
+    // else: blank sample → no `sample` key emitted; Python (view.get('sample')
+    // or {}) treats the view as unsampled.
   }
   return out;
 }

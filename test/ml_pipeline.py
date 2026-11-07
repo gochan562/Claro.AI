@@ -311,6 +311,12 @@ class EndToEndTest(unittest.TestCase):
             self.assertEqual(rec['status'], 'finished')
             self.assertIn('test', rec['metrics'])
             self.assertIn('cv', rec['metrics'])
+            # Summarized API schema: both F1 variants must be present as
+            # flat keys (regression: UI read nested macro.f1 and showed dashes).
+            for split in ('train', 'validation', 'test'):
+                if split in rec['metrics']:
+                    self.assertIn('f1_macro', rec['metrics'][split])
+                    self.assertIn('f1_weighted', rec['metrics'][split])
             # reload + predict from the artifact
             bundle = se.load_joblib(os.path.join(workdir, 'model.joblib'))
             self.assertIn('pipeline', bundle)
@@ -668,6 +674,59 @@ class IngestDiagnosticsTest(unittest.TestCase):
             self.assertNotIn('Traceback', out['error'])
         finally:
             shutil.rmtree(base, ignore_errors=True)
+
+
+class MetricsSummaryTest(unittest.TestCase):
+    """_summarize_metrics must flatten classification F1 values into the
+    API schema: f1_macro from macro.f1 AND f1_weighted from weighted.f1.
+    The fixture uses DISTINCT values so accidental field swapping fails."""
+
+    @staticmethod
+    def _fixture(macro_f1, weighted_f1, task='classification'):
+        m = {'task': task, 'accuracy': 0.8, 'balanced_accuracy': 0.7,
+             'roc_auc': 0.85, 'pr_auc': 0.75, 'log_loss': 0.4}
+        if task == 'classification':
+            if macro_f1 is not None or weighted_f1 is not None:
+                m['macro'] = {'precision': 0.6, 'recall': 0.5, 'f1': macro_f1}
+                m['weighted'] = {'precision': 0.8, 'recall': 0.8, 'f1': weighted_f1}
+        else:
+            m.update({'mae': 12.5, 'mse': 300.0, 'rmse': 17.3, 'r2': 0.65})
+        return m
+
+    def test_classification_summary_has_both_f1_flat(self):
+        import ml.experiment_runner as er
+        metrics = {'task': 'classification',
+                   'train': self._fixture(0.5, 0.9),
+                   'test': self._fixture(0.25, 0.875)}
+        out = er._summarize_metrics(metrics)
+        self.assertEqual(out['task'], 'classification')
+        # Distinct macro/weighted values catch accidental swapping.
+        self.assertAlmostEqual(out['train']['f1_macro'], 0.5)
+        self.assertAlmostEqual(out['train']['f1_weighted'], 0.9)
+        self.assertAlmostEqual(out['test']['f1_macro'], 0.25)
+        self.assertAlmostEqual(out['test']['f1_weighted'], 0.875)
+        # Flat schema preserved (no nested macro/weighted objects).
+        self.assertNotIn('macro', out['train'])
+        self.assertNotIn('weighted', out['train'])
+        self.assertAlmostEqual(out['train']['accuracy'], 0.8)
+
+    def test_summary_missing_f1_groups_stays_null(self):
+        import ml.experiment_runner as er
+        # Split metrics without macro/weighted groups (e.g. older artifacts):
+        # summary must emit None without raising.
+        out = er._summarize_metrics({'task': 'classification',
+                                     'test': self._fixture(None, None)})
+        self.assertIsNone(out['test']['f1_macro'])
+        self.assertIsNone(out['test']['f1_weighted'])
+
+    def test_regression_summary_unchanged(self):
+        import ml.experiment_runner as er
+        out = er._summarize_metrics({'task': 'regression',
+                                     'test': self._fixture(None, None, task='regression')})
+        self.assertEqual(sorted(out['test'].keys()),
+                         ['mae', 'mse', 'r2', 'rmse'])
+        self.assertNotIn('f1_macro', out['test'])
+        self.assertNotIn('f1_weighted', out['test'])
 
 
 class RunnerImportRobustnessTest(unittest.TestCase):

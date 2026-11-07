@@ -675,6 +675,7 @@ def _summarize_metrics(metrics):
             out[split] = {k: m.get(k) for k in
                           ('accuracy', 'balanced_accuracy', 'roc_auc', 'pr_auc', 'log_loss')}
             out[split]['f1_macro'] = (m.get('macro') or {}).get('f1')
+            out[split]['f1_weighted'] = (m.get('weighted') or {}).get('f1')
         else:
             out[split] = {k: m.get(k) for k in ('mae', 'mse', 'rmse', 'r2')}
     if metrics.get('cv'):

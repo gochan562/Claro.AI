@@ -179,6 +179,54 @@ async function main() {
     assert(nb.cells[3].training && nb.cells[3].training.task_type === 'text-classification');
   });
 
+  // ── 9. metrics table renders flat F1 fields from the summarized API ──
+  // Regression: mlMetricsHtml read nested macro.f1/weighted.f1, but
+  // _summarize_metrics flattens to f1_macro/f1_weighted — the UI showed
+  // dashes even though macro F1 was calculated. Distinct macro/weighted
+  // values catch accidental field swapping.
+  await test('9. metrics table renders f1_macro/f1_weighted (flat API schema)', () => {
+    const { w } = makeWindow();
+    const result = {
+      task: 'classification', experiment_id: 'exp_f10000000000', model_family: 'DummyClassifier',
+      metrics: { train: { accuracy: 0.8, balanced_accuracy: 0.7, roc_auc: 0.85,
+                          pr_auc: 0.75, log_loss: 0.4,
+                          f1_macro: 0.5, f1_weighted: 0.9 } },
+    };
+    const html = w.mlMetricsHtml(result, 1);
+    // mlNum: |v| < 1 → toFixed(5)
+    assert(html.includes('F1 (macro)</td><td>0.50000'), `macro f1 row: ${html.slice(0, 400)}`);
+    assert(html.includes('F1 (weighted)</td><td>0.90000'), `weighted f1 row: ${html.slice(0, 400)}`);
+    assert(!html.includes('undefined') && !html.includes('NaN'), 'no undefined/NaN leaks');
+  });
+
+  await test('10. missing/null F1 values render as dash without throwing', () => {
+    const { w } = makeWindow();
+    const result = {
+      task: 'classification', experiment_id: 'exp_f10000000000', model_family: 'DummyClassifier',
+      metrics: { test: { accuracy: 0.8, balanced_accuracy: 0.7, roc_auc: null,
+                         pr_auc: null, log_loss: null,
+                         f1_macro: null, f1_weighted: undefined } },
+    };
+    const html = w.mlMetricsHtml(result, 2); // must not throw
+    const rows = html.split('\n').find((l) => l.includes('F1 (macro)'));
+    assert(rows && rows.includes('—'), `dash for null f1_macro: ${rows}`);
+    assert(html.includes('n/a'), 'null probability metrics render n/a as before');
+  });
+
+  await test('11. regression metrics rendering unchanged (no F1 rows)', () => {
+    const { w } = makeWindow();
+    const result = {
+      task: 'regression', experiment_id: 'exp_r20000000000', model_family: 'LinearRegression',
+      metrics: { train: { mae: 12.5, mse: 300, rmse: 17.3, r2: 0.65 } },
+    };
+    const html = w.mlMetricsHtml(result, 3);
+    assert(html.includes('MAE</td><td>12.500'), 'MAE row (toFixed(3))');
+    assert(html.includes('MSE</td><td>300.000'), 'MSE row (toFixed(3))');
+    assert(html.includes('RMSE</td><td>17.300'), 'RMSE row (toFixed(3))');
+    assert(html.includes('R²</td><td>0.65000'), 'R² row (toFixed(5))');
+    assert(!html.includes('F1'), 'no F1 rows for regression');
+  });
+
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
   if (failed) process.exit(1);
 }

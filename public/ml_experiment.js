@@ -1322,8 +1322,8 @@ function mlMetricsHtml(result, cellId) {
     if (task === 'classification') {
       h += `<tr><td>Accuracy</td><td>${mlNum(m.accuracy)}</td></tr>` +
         `<tr><td>Balanced accuracy</td><td>${mlNum(m.balanced_accuracy)}</td></tr>` +
-        `<tr><td>F1 (macro)</td><td>${mlNum((m.macro || {}).f1)}</td></tr>` +
-        `<tr><td>F1 (weighted)</td><td>${mlNum((m.weighted || {}).f1)}</td></tr>` +
+        `<tr><td>F1 (macro)</td><td>${mlNum(m.f1_macro)}</td></tr>` +
+        `<tr><td>F1 (weighted)</td><td>${mlNum(m.f1_weighted)}</td></tr>` +
         `<tr><td>ROC-AUC</td><td>${m.roc_auc == null ? 'n/a' : mlNum(m.roc_auc)}</td></tr>` +
         `<tr><td>PR-AUC</td><td>${m.pr_auc == null ? 'n/a' : mlNum(m.pr_auc)}</td></tr>` +
         `<tr><td>Log loss</td><td>${m.log_loss == null ? 'n/a' : mlNum(m.log_loss)}</td></tr>`;

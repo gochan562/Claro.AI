@@ -99,18 +99,24 @@ async function run() {
   // validator rejected it with 'sample needs n or frac.', so split preview
   // never reached ml/split.py.
   {
-    // 1. Empty / blank sample objects are no sampling requests.
-    for (const s of [{}, { n: null }, { n: '' }, { frac: null }, { n: '', frac: null }]) {
+    // 1. Empty / seed-only / blank sample objects are no sampling requests.
+    for (const s of [{}, { seed: 42 }, { n: null }, { n: '' }, { frac: null },
+                     { n: '', frac: null }, { n: null, seed: 42 }]) {
       const v = ml.validateView({ sample: s });
       assert.strictEqual(v.sample, undefined,
         `blank sample ${JSON.stringify(s)} must emit no sample key`);
     }
-    // Reaches Python end-to-end (the exact broken path):
-    const prevEmpty = await ml.splitPreview(ing.workspace_id,
-      { strategy: 'train_val_test', train_frac: 0.7, val_frac: 0.15, test_frac: 0.15, seed: 42, shuffle: true, stratify: true },
+    // Reaches Python end-to-end (the exact broken path), {} and {seed: 42}:
+    const splitCfg = { strategy: 'train_val_test', train_frac: 0.7, val_frac: 0.15,
+      test_frac: 0.15, seed: 42, shuffle: true, stratify: true };
+    const prevEmpty = await ml.splitPreview(ing.workspace_id, splitCfg,
       { sample: {} }, 'bought', 'classification');
     assert.strictEqual(prevEmpty.counts.train + prevEmpty.counts.validation + prevEmpty.counts.test, 150,
       'split preview with sample:{} reaches ml/split.py unsampled');
+    const prevSeedOnly = await ml.splitPreview(ing.workspace_id, splitCfg,
+      { sample: { seed: 42 } }, 'bought', 'classification');
+    assert.strictEqual(prevSeedOnly.counts.train + prevSeedOnly.counts.validation + prevSeedOnly.counts.test, 150,
+      'split preview with sample:{seed:42} reaches ml/split.py unsampled');
     // Same behavior on the experiment-run path:
     const cfgEmpty = ml.validateExperimentConfig({
       workspace_id: ing.workspace_id, task: 'classification', target_column: 'bought',
@@ -120,13 +126,25 @@ async function run() {
     });
     assert.strictEqual(cfgEmpty.dataset_view.sample, undefined,
       'experiment config treats sample:{} as unsampled');
+    const cfgSeedOnly = ml.validateExperimentConfig({
+      workspace_id: ing.workspace_id, task: 'classification', target_column: 'bought',
+      dataset_view: { sample: { seed: 42 } },
+      split: { strategy: 'train_val_test' }, preprocessing: {},
+      model: { family: 'LogisticRegression', params: {} },
+    });
+    assert.strictEqual(cfgSeedOnly.dataset_view.sample, undefined,
+      'experiment config treats sample:{seed:42} as unsampled');
 
-    // 2. A valid sample.n is preserved.
+    // 2. A valid sample.n performs row sampling (seed preserved).
     assert.deepStrictEqual(ml.validateView({ sample: { n: 50 } }).sample,
       { n: 50, frac: null, seed: 42 });
-    // 3. A valid sample.frac is preserved.
+    assert.deepStrictEqual(ml.validateView({ sample: { n: 100, seed: 42 } }).sample,
+      { n: 100, frac: null, seed: 42 });
+    // 3. A valid sample.frac performs fractional sampling (seed preserved).
     assert.deepStrictEqual(ml.validateView({ sample: { frac: 0.25 } }).sample,
       { n: null, frac: 0.25, seed: 42 });
+    assert.deepStrictEqual(ml.validateView({ sample: { frac: 0.5, seed: 42 } }).sample,
+      { n: null, frac: 0.5, seed: 42 });
 
     // 4. Invalid non-empty sampling values still throw.
     for (const bad of [{ n: 0 }, { n: -5 }, { n: 'abc' }, { n: 999999 },
@@ -134,13 +152,12 @@ async function run() {
                        { n: 10, frac: 'x' }]) {
       expectErr(() => ml.validateView({ sample: bad }), 'bad_request');
     }
-    // Non-object samples and non-empty objects without n/frac are rejected,
-    // never silently ignored.
+    // Non-object samples are rejected, never silently ignored. Seed-only
+    // objects are VALID (no sampling) — see case 1 above.
     expectErr(() => ml.validateView({ sample: 5 }), 'bad_request');
     expectErr(() => ml.validateView({ sample: 'half' }), 'bad_request');
     expectErr(() => ml.validateView({ sample: ['a'] }), 'bad_request');
-    expectErr(() => ml.validateView({ sample: { seed: 7 } }), 'bad_request');
-    console.log('✓ sample validation: blank = no sampling; valid n/frac kept; invalid rejected');
+    console.log('✓ sample validation: {} and {seed} = no sampling; valid n/frac kept; invalid rejected');
   }
 
   // ── 5. full experiment: train + CV + evaluate artifacts ──

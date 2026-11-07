@@ -487,11 +487,12 @@ function validateView(view) {
       throw _err('sample must be an object with n or frac.', 'bad_request', 400);
     }
     const s = view.sample;
-    // Blank sampling means "no sampling requested": the dataset cell
-    // initializes view.sample = {} and users must not have to configure
-    // sampling just to split a dataset. Values PRESENT but blank
-    // (null / '') count as blank too, matching _optInt/_optFloat semantics.
-    // Any present non-blank value is validated — invalid ones still throw.
+    // Only a PRESENT, non-blank n or frac constitutes a sampling request.
+    // {} and seed-only objects ({seed: 42}) mean "no sampling" — the seed
+    // is a sampling modifier, not a request — so users never need sampling
+    // parameters just to split a dataset. Blank values (null / '') count as
+    // absent, matching _optInt/_optFloat semantics; invalid supplied values
+    // still throw.
     const hasN = !(s.n == null || s.n === '');
     const hasFrac = !(s.frac == null || s.frac === '');
     if (hasN || hasFrac) {
@@ -505,13 +506,10 @@ function validateView(view) {
       if (out.sample.frac != null && !(out.sample.frac > 0 && out.sample.frac < 1)) {
         throw _err('sample.frac must be between 0 and 1 (exclusive).', 'bad_request', 400);
       }
-    } else if (Object.keys(s).some((k) => s[k] != null && s[k] !== '')) {
-      // Non-empty sample object with no usable n/frac (e.g. {seed: 7}) is a
-      // malformed sampling request — never silently ignored.
-      throw _err('sample needs n or frac.', 'bad_request', 400);
     }
-    // else: blank sample → no `sample` key emitted; Python (view.get('sample')
-    // or {}) treats the view as unsampled.
+    // else: no sampling request ({} / {seed: 42} / blank fields) → no
+    // `sample` key emitted; Python (view.get('sample') or {}) treats the
+    // view as unsampled.
   }
   return out;
 }

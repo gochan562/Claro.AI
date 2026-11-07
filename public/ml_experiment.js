@@ -1748,7 +1748,7 @@ async function mlCompareSelected() {
     const metricKeys = (task, metrics, part) => {
       const m = (metrics || {})[part];
       if (!m) return '—';
-      if (task === 'classification') return `acc ${mlNum(m.accuracy)} · f1 ${mlNum((m.macro || {}).f1)}`;
+      if (task === 'classification') return `acc ${mlNum(m.accuracy)} · f1 ${mlNum(m.f1_macro)}`;
       return `R² ${m.r2 == null ? '—' : mlNum(m.r2)} · RMSE ${mlNum(m.rmse)}`;
     };
     const fields = [

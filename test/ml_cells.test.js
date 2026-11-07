@@ -197,6 +197,11 @@ async function main() {
     assert(html.includes('F1 (macro)</td><td>0.50000'), `macro f1 row: ${html.slice(0, 400)}`);
     assert(html.includes('F1 (weighted)</td><td>0.90000'), `weighted f1 row: ${html.slice(0, 400)}`);
     assert(!html.includes('undefined') && !html.includes('NaN'), 'no undefined/NaN leaks');
+    // No renderer may read the legacy nested shapes — the summarized API
+    // only has flat f1_macro/f1_weighted (this exact bug class: the compare
+    // view showed dashes for months after the metrics table was fixed).
+    assert(!/\(m\.macro \|\| \{\}\)/.test(ML_SRC) && !/\(m\.weighted \|\| \{\}\)/.test(ML_SRC),
+      'no legacy nested macro/weighted reads remain in ml_experiment.js');
   });
 
   await test('10. missing/null F1 values render as dash without throwing', () => {

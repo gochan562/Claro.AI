@@ -4694,35 +4694,165 @@ print(f"Loaded {loaded_class} on {DEVICE}")
     // and the Space).  Used only to warn early — values are never silently clamped.
     const ZEROGPU_MAX_NEW_TOKENS = 2048;
 
-function parsePromptAndMaxTokens(inferenceContent, defaultPrompt) {
-      const text = String(inferenceContent || '');
-      // Simpler/forgiving: first "prompt = <string>" with either kind of quotes.
-      let prompt = defaultPrompt || 'Hello, world!';
-      const m2 = text.match(/^\s*prompt\s*=\s*f?(?:"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'|```([\s\S]*?)```)\s*$/m);
-      if (m2) prompt = m2[1] !== undefined ? m2[1] : (m2[2] !== undefined ? m2[2] : (m2[3] || defaultPrompt));
+// ── Task-aware inference inputs ──────────────────────────────────────────────
+// A model's intended task decides which inputs the inference cell must
+// provide and how they map to the ZeroGPU request. HF pipeline tags map to
+// canonical internal tasks (extensible table — the source of truth for
+// routing); unknown tasks are surfaced to the user, never silently routed
+// to text generation.
+const HF_TASK_TO_INTERNAL = {
+  'text-generation': 'text_generation',
+  'text2text-generation': 'text_generation',
+  'conversational': 'text_generation',
+  'chat': 'text_generation',
+  'summarization': 'summarization',
+  'feature-extraction': 'embeddings',
+  'sentence-similarity': 'sentence_similarity',
+  'sentence-embeddings': 'embeddings',
+  'text-classification': 'classification',
+  'sentiment-analysis': 'classification',
+  'question-answering': 'question_answering',
+  'translation': 'translation',
+};
 
-      let maxNewTokens = 128;
-      const mTok = text.match(/max_new_tokens\s*=\s*(\d+)/);
-      if (mTok) {
-        const n = parseInt(mTok[1], 10);
-        // No silent clamping: the requested value is passed through verbatim.
-        // Values above the server-side hard limit (ZEROGPU_MAX_NEW_TOKENS)
-        // produce a visible validation error from /api/zerogpu-run instead of
-        // being silently reduced.
-        if (Number.isFinite(n) && n >= 1) maxNewTokens = n;
+const ZEROGPU_SUPPORTED_INTERNAL_TASKS = new Set([
+  'text_generation', 'summarization', 'embeddings', 'sentence_similarity',
+  'classification', 'question_answering', 'translation',
+]);
+
+function resolveInternalTask(hfTask) {
+  const t = String(hfTask || '').toLowerCase().trim();
+  return {
+    hfTask: t,
+    internal: HF_TASK_TO_INTERNAL[t] || null,
+    supported: ZEROGPU_SUPPORTED_INTERNAL_TASKS.has(HF_TASK_TO_INTERNAL[t]),
+  };
+}
+
+// Parse `name = "value"` style string assignments from an inference cell.
+function _parseCellString(text, varName) {
+  const re = new RegExp('^\\s*' + varName + '\\s*=\\s*f?(?:"([^"\\\\]*(?:\\\\.[^"\\\\]*)*)"|' + "'" + "([^'" + "\\\\" +"]*(?:\\\\.[^'" + "\\\\" + "]*)*)'" + '|`([\\s\\S]*?)`)' + '\\s*$', 'm');
+  const m = text.match(re);
+  if (!m) return undefined;
+  return m[1] !== undefined ? m[1] : (m[2] !== undefined ? m[2] : (m[3] || ''));
+}
+
+function _parseCellNumber(text, varName) {
+  const m = text.match(new RegExp('^\\s*' + varName + '\\s*=\\s*(\\d+)\\s*$', 'm'));
+  if (!m) return undefined;
+  const n = parseInt(m[1], 10);
+  return Number.isFinite(n) && n >= 1 ? n : undefined;
+}
+
+function _parseCellStringList(text, varName) {
+  const m = text.match(new RegExp('^\\s*' + varName + '\\s*=\\s*\\[([^\\]]*)\\]\\s*$', 'm'));
+  if (!m) return undefined;
+  const items = [];
+  const listRe = /"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'/g;
+  let mm;
+  while ((mm = listRe.exec(m[1])) !== null) {
+    items.push(mm[1] !== undefined ? mm[1] : mm[2]);
+  }
+  return items.length ? items : undefined;
+}
+
+// Parse every task-relevant field from the inference cell. There is NO
+// generic default prompt: missing required fields produce a validation
+// error telling the user what to fill in, and "Once upon a time" is never
+// injected into a specialized task.
+function parseInferenceInputs(inferenceContent) {
+  const text = String(inferenceContent || '');
+  const f = {
+    prompt: _parseCellString(text, 'prompt'),
+    input_text: _parseCellString(text, 'input_text') || _parseCellString(text, 'document'),
+    question: _parseCellString(text, 'question'),
+    context: _parseCellString(text, 'context'),
+    text1: _parseCellString(text, 'text1') || _parseCellString(text, 'sentence1'),
+    text2: _parseCellString(text, 'text2') || _parseCellString(text, 'sentence2'),
+    texts: _parseCellStringList(text, 'texts') || _parseCellStringList(text, 'sentences'),
+    target_language: _parseCellString(text, 'target_language'),
+    prompt_format: _parseCellString(text, 'prompt_format'),
+    max_new_tokens: _parseCellNumber(text, 'max_new_tokens'),
+    max_length: _parseCellNumber(text, 'max_length'),
+    min_length: _parseCellNumber(text, 'min_length'),
+    top_k: _parseCellNumber(text, 'top_k'),
+  };
+  if (f.prompt_format !== undefined) {
+    const v = String(f.prompt_format).trim().toLowerCase();
+    f.prompt_format = ['auto', 'chat', 'raw'].includes(v) ? v : 'auto';
+  }
+  return f;
+}
+
+// Build the ZeroGPU request inputs for a resolved task. Returns
+// { inputs } on success or { error } when a required field is missing or
+// the task is unsupported — never a silently-generated generic prompt.
+function buildTaskAwareInputs(internalTask, fields) {
+  const needPrompt = () => fields.prompt || fields.input_text;
+  const needTexts = () => fields.texts || (needPrompt() ? [needPrompt()] : undefined);
+  switch (internalTask) {
+    case 'text_generation': {
+      const prompt = needPrompt();
+      if (!prompt) {
+        return { error: 'This text-generation model needs a prompt. Add a line like  prompt = "your text"  to the inference cell.' };
       }
-      // Optional prompt_format line in the inference cell:
-      //   prompt_format = "auto" | "chat" | "raw"
-      // 'chat' makes the Space apply the model's own chat template (needed
-      // by instruct models such as MuyaoYuan/LoCo-7B). Default auto.
-      let promptFormat = 'auto';
-      const mFmt = text.match(/^\s*prompt_format\s*=\s*f?(?:"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'|```([\s\S]*?)```)\s*$/m);
-      if (mFmt) {
-        const v = (mFmt[1] !== undefined ? mFmt[1] : (mFmt[2] !== undefined ? mFmt[2] : mFmt[3]) || '').trim().toLowerCase();
-        if (['auto', 'chat', 'raw'].includes(v)) promptFormat = v;
-      }
-      return { prompt, max_new_tokens: maxNewTokens, prompt_format: promptFormat };
+      const inputs = { prompt, max_new_tokens: fields.max_new_tokens || 128 };
+      if (fields.prompt_format) inputs.prompt_format = fields.prompt_format;
+      return { inputs };
     }
+    case 'summarization': {
+      const doc = needPrompt();
+      if (!doc) {
+        return { error: 'This summarization model needs the source document. Add  input_text = "the document to summarize"  to the inference cell.' };
+      }
+      const taskInputs = {};
+      if (fields.max_length) taskInputs.max_length = fields.max_length;
+      if (fields.min_length) taskInputs.min_length = fields.min_length;
+      return { inputs: { prompt: doc, task_inputs: Object.keys(taskInputs).length ? taskInputs : undefined } };
+    }
+    case 'embeddings': {
+      const text = needPrompt() || (fields.texts && fields.texts[0]);
+      if (!text) {
+        return { error: 'This embedding model needs input text. Add  prompt = "the text to embed"  to the inference cell.' };
+      }
+      return { inputs: { prompt: text } };
+    }
+    case 'sentence_similarity': {
+      const t1 = fields.text1, t2 = fields.text2;
+      if (!t1 || !t2) {
+        return { error: 'This sentence-similarity model needs two sentences. Add  text1 = "first sentence"  and  text2 = "second sentence"  to the inference cell.' };
+      }
+      return { inputs: { task_inputs: { text1: t1, text2: t2 } } };
+    }
+    case 'classification': {
+      const texts = needTexts();
+      if (!texts || !texts.length) {
+        return { error: 'This classification model needs input text. Add  texts = ["first text", "second text"]  to the inference cell.' };
+      }
+      const inputs = { prompt: texts.join('\n') };
+      if (fields.top_k) inputs.task_inputs = { top_k: fields.top_k };
+      return { inputs };
+    }
+    case 'question_answering': {
+      if (!fields.question || !fields.context) {
+        return { error: 'This question-answering model needs a question and its context. Add  question = "..."  and  context = "..."  to the inference cell.' };
+      }
+      return { inputs: { prompt: fields.question,
+        task_inputs: { question: fields.question, context: fields.context } } };
+    }
+    case 'translation': {
+      const source = needPrompt();
+      if (!source) {
+        return { error: 'This translation model needs the source text. Add  input_text = "text to translate"  to the inference cell.' };
+      }
+      const inputs = { prompt: source };
+      if (fields.target_language) inputs.task_inputs = { target_language: fields.target_language };
+      return { inputs };
+    }
+    default:
+      return { error: 'This task is not supported by ZeroGPU inference. Supported: text generation, summarization, embeddings, sentence similarity, classification, question answering, translation. Other tasks still run locally via the cell\'s Python when your GPU provider executes cell code.' };
+  }
+}
 
     async function runCellViaZeroGPU(notebook, cell) {
       initGpuTerminal();
@@ -4754,15 +4884,41 @@ function parsePromptAndMaxTokens(inferenceContent, defaultPrompt) {
         return null;
       }
 
-      const { prompt, max_new_tokens, prompt_format } = parsePromptAndMaxTokens(inferenceContent, 'Once upon a time');
-
-      writeGpuLine(`↗ POST /api/zerogpu-run  model=${modelId}  task=${task}  max_new_tokens=${max_new_tokens}` + (prompt_format !== 'auto' ? `  prompt_format=${prompt_format}` : ''), 'gray');
-      if (max_new_tokens > ZEROGPU_MAX_NEW_TOKENS) {
-        writeGpuLine(`⚠️ max_new_tokens=${max_new_tokens} exceeds the hard limit of ${ZEROGPU_MAX_NEW_TOKENS} — the server will reject this with a validation error. Lower it in the inference cell.`, 'yellow');
+      // Task-aware routing: the model's intended task decides which inputs
+      // the request carries. Unknown tasks are surfaced, never silently
+      // routed to generic text generation, and no default prompt is injected.
+      const resolved = resolveInternalTask(task);
+      if (!resolved.internal || !resolved.supported) {
+        writeGpuLine(`❌ Task "${task}" is not supported by ZeroGPU inference.`, 'red');
+        writeGpuLine('   Supported: text generation, summarization, embeddings,', 'gray');
+        writeGpuLine('   sentence similarity, classification, question answering, translation.', 'gray');
+        writeGpuLine("   Other tasks still run locally via the cell's Python.", 'gray');
+        setGpuState('disconnected');
+        return null;
       }
-      writeGpuLine(`  prompt: ${prompt.length > 60 ? prompt.slice(0, 60) + '…' : prompt}`);
+      const fields = parseInferenceInputs(inferenceContent);
+      const built = buildTaskAwareInputs(resolved.internal, fields);
+      if (built.error) {
+        writeGpuLine(`❌ ${built.error}`, 'red');
+        setGpuState('disconnected');
+        return null;
+      }
+      const inputs = built.inputs;
 
-      const body = { model_id: modelId, task, inputs: { prompt, max_new_tokens, prompt_format } };
+      writeGpuLine(`↗ POST /api/zerogpu-run  model=${modelId}  task=${task} (${resolved.internal})` +
+        (inputs.max_new_tokens ? `  max_new_tokens=${inputs.max_new_tokens}` : '') +
+        (inputs.prompt_format && inputs.prompt_format !== 'auto' ? `  prompt_format=${inputs.prompt_format}` : ''), 'gray');
+      if (inputs.max_new_tokens > ZEROGPU_MAX_NEW_TOKENS) {
+        writeGpuLine(`⚠️ max_new_tokens=${inputs.max_new_tokens} exceeds the hard limit of ${ZEROGPU_MAX_NEW_TOKENS} — the server will reject this with a validation error. Lower it in the inference cell.`, 'yellow');
+      }
+      if (inputs.prompt) {
+        writeGpuLine(`  input: ${inputs.prompt.length > 60 ? inputs.prompt.slice(0, 60) + '…' : inputs.prompt}`);
+      }
+      if (inputs.task_inputs) {
+        writeGpuLine(`  task inputs: ${JSON.stringify(inputs.task_inputs)}`);
+      }
+
+      const body = { model_id: modelId, task, inputs };
       try {
         const res  = await fetch('/api/zerogpu-run', {
           method:  'POST',

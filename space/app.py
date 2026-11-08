@@ -193,12 +193,15 @@ def _parse_structured(prompt_or_json: str):
     the local provider send a single structured blob.
     """
     if not isinstance(prompt_or_json, str):
-        return prompt_or_json, None, None, None, None, None, None
+        return prompt_or_json, None, None, None, None, None, None, None
     s = prompt_or_json.strip()
     if s.startswith("{") and s.endswith("}"):
         try:
             obj = json.loads(s)
             if isinstance(obj, dict):
+                ti = obj.get("task_inputs")
+                if isinstance(ti, dict):
+                    ti = json.dumps(ti)
                 return (
                     obj.get("prompt"),
                     obj.get("model_id"),
@@ -207,10 +210,11 @@ def _parse_structured(prompt_or_json: str):
                     obj.get("do_sample"),
                     obj.get("adapter_path") or obj.get("adapter_dir"),
                     obj.get("prompt_format"),
+                    ti,
                 )
         except Exception:
             pass
-    return prompt_or_json, None, None, None, None, None, None
+    return prompt_or_json, None, None, None, None, None, None, None
 
 
 def _gpu_duration(prompt, max_new_tokens, task, model_id, *_args, **_kwargs):
@@ -235,7 +239,7 @@ def _gpu_duration(prompt, max_new_tokens, task, model_id, *_args, **_kwargs):
 
 
 @spaces.GPU(duration=_gpu_duration)
-def _gpu_infer(prompt, max_new_tokens, task, model_id, gguf_file, revision, temperature, top_p, do_sample, adapter_path=None, prompt_format="auto"):
+def _gpu_infer(prompt, max_new_tokens, task, model_id, gguf_file, revision, temperature, top_p, do_sample, adapter_path=None, prompt_format="auto", task_inputs=None):
     """GPU-scoped inference: moves the CPU-cached model onto CUDA, runs the
     requested task, and offloads it again.  Model *loading* deliberately happens
     on the CPU worker (see generate()) so cold loads do not consume GPU seconds.
@@ -259,10 +263,11 @@ def _gpu_infer(prompt, max_new_tokens, task, model_id, gguf_file, revision, temp
         do_sample=do_sample,
         adapter_path=adapter_path,
         prompt_format=prompt_format,
+        task_inputs=task_inputs,
     )
 
 
-def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=None, revision=None, temperature=0.7, top_p=0.9, do_sample=True, adapter_path=None, prompt_format="auto"):
+def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=None, revision=None, temperature=0.7, top_p=0.9, do_sample=True, adapter_path=None, prompt_format="auto", task_inputs=None):
     """Structured endpoint.
 
     Args:
@@ -286,7 +291,7 @@ def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=Non
     """
     # Unwrap an optional structured JSON payload passed through `prompt`.
     if model_id is None and task is None:
-        p, mid, t, mnt, ds, ap, pf = _parse_structured(prompt)
+        p, mid, t, mnt, ds, ap, pf, ti = _parse_structured(prompt)
         if mid is not None:
             model_id = mid
             task = t
@@ -298,6 +303,8 @@ def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=Non
                 adapter_path = ap
             if pf is not None:
                 prompt_format = pf
+            if ti is not None:
+                task_inputs = ti
             prompt = p
 
     model_id = (model_id or DEFAULT_MODEL_ID).strip()
@@ -318,7 +325,9 @@ def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=Non
         elif "/" not in adapter_path and adapter_path:
             # single name not allowed for adapter
             return f"[CLARO:bad_request] invalid adapter_path"
-    if not prompt or not isinstance(prompt, str):
+    if not isinstance(prompt, str):
+        return f"[CLARO:bad_request] prompt must be a string"
+    if not prompt.strip() and not (task_inputs and task_inputs.strip() and task_inputs.strip() != "{}"):
         return f"[CLARO:bad_request] prompt is required"
 
     # Hard limit for max_new_tokens - reject instead of silent clamp
@@ -355,6 +364,16 @@ def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=Non
     prompt_format = str(prompt_format).strip().lower() or "auto"
     if prompt_format not in ("auto", "chat", "raw"):
         return f"[CLARO:bad_request] prompt_format must be one of auto/chat/raw"
+    # Normalize task_inputs: JSON string -> dict (validated) for run_inference
+    if task_inputs is None or task_inputs == "":
+        task_inputs = {}
+    elif isinstance(task_inputs, str):
+        try:
+            task_inputs = json.loads(task_inputs)
+        except Exception:
+            return f"[CLARO:invalid_input] task_inputs must be valid JSON"
+    if not isinstance(task_inputs, dict):
+        return f"[CLARO:invalid_input] task_inputs must be a JSON object"
 
     # Estimate duration for logging (actual quota based on real compute time)
     model_size_hint = model_id.split("/")[-1] if "/" in model_id else model_id
@@ -379,6 +398,7 @@ def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=Non
             do_sample,
             adapter_path,
             prompt_format,
+            task_inputs if task_inputs else None,
         )
         # Return the generated text verbatim on success — the local Claro.AI
         # provider returns it directly to the dashboard.  Debug info (model

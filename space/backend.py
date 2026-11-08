@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import importlib
 import io
+import json
 import logging
 import os
 import re
@@ -1500,6 +1501,310 @@ def _embedding_inference(result: "LoaderResult", model_id: str, prompt: str, tas
     return _format_embedding_result(model_id, vectors, pooling, task, similarities)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Task-aware inference handlers
+# ──────────────────────────────────────────────────────────────────────────────
+# A model's intended task decides how its input is prepared, how inference
+# runs, and how the output is interpreted. Each supported task has its own
+# handler; unsupported tasks raise a clear error instead of falling back to
+# generic text generation or dumping raw model objects.
+
+SUPPORTED_TEXT_TASKS = (
+    "text-generation, text2text-generation, summarization, translation, "
+    "question-answering, text-classification, feature-extraction, "
+    "sentence-similarity"
+)
+
+
+def _parse_task_inputs(task_inputs):
+    """task_inputs arrives as a dict or a JSON string; {} is the safe default."""
+    if task_inputs is None or task_inputs == "" or task_inputs == {}:
+        return {}
+    if isinstance(task_inputs, str):
+        try:
+            task_inputs = json.loads(task_inputs)
+        except Exception:
+            raise ClaroBackendError(
+                "task_inputs must be valid JSON (e.g. {\"question\": ..., \"context\": ...}).",
+                code="invalid_input",
+            )
+    if not isinstance(task_inputs, dict):
+        raise ClaroBackendError(
+            "task_inputs must be a JSON object of task-specific fields.",
+            code="invalid_input",
+        )
+    return task_inputs
+
+
+def _require_field(task_inputs, key, task):
+    val = task_inputs.get(key)
+    if val is None or (isinstance(val, str) and not val.strip()):
+        raise ClaroBackendError(
+            f"The '{key}' field is required for {task}. "
+            f"Fill it in the inference cell or the task inputs.",
+            code="invalid_input",
+        )
+    return str(val)
+
+
+def _split_lines(text):
+    return [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+
+
+def _tokenizer_for(result):
+    tok = result.preprocessor
+    if tok is None:
+        raise ClaroBackendError(
+            "This model has no tokenizer/processor for this task.",
+            code="task_model_mismatch",
+        )
+    return tok
+
+
+def _is_encoder_decoder(result):
+    return bool(getattr(getattr(result.model, "config", None), "is_encoder_decoder", False))
+
+
+def _generate_from_inputs(result, inputs, max_new_tokens=256, do_sample=False,
+                          length_key="max_new_tokens", **extra):
+    """Run model.generate and decode only the newly generated tokens for
+    decoder-only models; encoder-decoders emit the full output sequence.
+    length_key selects the generate() length parameter: causal-LM models
+    take max_new_tokens, encoder-decoders (HF summarization convention)
+    take max_length."""
+    import torch
+    tok = _tokenizer_for(result)
+    gen = dict(**inputs, do_sample=bool(do_sample))
+    gen[length_key] = int(max_new_tokens)
+    gen.update(extra)
+    gen.setdefault("pad_token_id", getattr(tok, "eos_token_id", None))
+    with torch.no_grad():
+        out = result.model.generate(**gen)
+    if _is_encoder_decoder(result):
+        new_ids = out[0]
+    else:
+        new_ids = out[0][inputs["input_ids"].shape[-1]:]
+    return tok.decode(new_ids, skip_special_tokens=True).strip()
+
+
+def run_summarization(result, model_id, prompt, task_inputs):
+    """Summarization: encoder-decoder models use max_length/min_length as
+    summary-length bounds; causal-LM wrappers summarize via an explicit
+    instruction prompt (never bare next-token continuation of a document)."""
+    document = (prompt or "").strip()
+    if not document:
+        raise ClaroBackendError(
+            "Summarization needs the source document. Put it in the "
+            "inference cell (input_text = \"...\").", code="invalid_input")
+    try:
+        max_length = int(task_inputs.get("max_length") or 142)
+        min_length = int(task_inputs.get("min_length") or 56)
+    except (TypeError, ValueError):
+        raise ClaroBackendError("max_length/min_length must be integers.",
+                                code="invalid_input")
+    max_length = max(8, min(max_length, 1024))
+    min_length = max(4, min(min_length, max_length - 1))
+    tok = _tokenizer_for(result)
+    inputs = tok(document, return_tensors="pt", truncation=True,
+                 max_length=1024).to(result.model.device)
+    if _is_encoder_decoder(result):
+        summary = _generate_from_inputs(
+            result, inputs, max_new_tokens=max_length, length_key="max_length",
+            min_length=min_length, num_beams=4, early_stopping=True)
+    else:
+        # Causal-LM wrapper: explicit summarization instruction + new-token slice
+        prompted = ("Summarize the following text.\n\n"
+                    f"{document}\n\nSummary:")
+        pin = tok(prompted, return_tensors="pt", truncation=True,
+                  max_length=1024).to(result.model.device)
+        summary = _generate_from_inputs(result, pin, max_new_tokens=max_length)
+    return f"=== Summary ===\nModel: {model_id}\n\n{summary}"
+
+
+def run_classification(result, model_id, prompt, task_inputs):
+    """Text classification: softmax over the classification head, labels from
+    config.id2label, optional top-k per input text (one per line)."""
+    import torch
+    if result.loaded_class != "AutoModelForSequenceClassification":
+        raise ClaroBackendError(
+            f"Model loaded as {result.loaded_class} has no classification "
+            "head. text-classification requires a sequence-classification model.",
+            code="task_model_mismatch")
+    texts = _split_lines(prompt)
+    if not texts:
+        raise ClaroBackendError(
+            "Classification needs input text (one text per line in the "
+            "inference cell).", code="invalid_input")
+    tok = _tokenizer_for(result)
+    id2label = getattr(getattr(result.model, "config", None), "id2label", None)
+    if not id2label:
+        raise ClaroBackendError(
+            "Model config has no id2label mapping — classification labels "
+            "cannot be resolved.", code="task_model_mismatch")
+    try:
+        top_k = int(task_inputs.get("top_k") or 3)
+    except (TypeError, ValueError):
+        top_k = 3
+    top_k = max(1, min(top_k, 20))
+    enc = tok(texts, padding=True, truncation=True, return_tensors="pt").to(result.model.device)
+    with torch.no_grad():
+        logits = result.model(**enc).logits
+    probs = torch.softmax(logits, dim=-1)
+    lines = ["=== Classification ===", f"Model: {model_id}"]
+    for text, row in zip(texts, probs.tolist()):
+        ranked = sorted(enumerate(row), key=lambda kv: kv[1], reverse=True)[:top_k]
+        best_idx, best_score = ranked[0]
+        label = id2label.get(best_idx, str(best_idx)) if isinstance(id2label, dict) \
+            else (id2label[best_idx] if best_idx < len(id2label) else str(best_idx))
+        lines.append(f"\nText: {text[:120]}")
+        lines.append(f"Predicted: {label} ({best_score:.2%})")
+        lines.append("Top predictions:")
+        for idx, score in ranked:
+            lbl = id2label.get(idx, str(idx)) if isinstance(id2label, dict) \
+                else (id2label[idx] if idx < len(id2label) else str(idx))
+            lines.append(f"  {lbl}: {score:.4f}")
+    return "\n".join(lines)
+
+
+def run_question_answering(result, model_id, prompt, task_inputs):
+    """QA: extractive (QuestionAnswering heads) or generative (causal/seq2seq).
+    Question and context are separate required fields."""
+    question = _require_field(task_inputs, "question", "question-answering")
+    context = _require_field(task_inputs, "context", "question-answering")
+    tok = _tokenizer_for(result)
+    cls_name = result.model.__class__.__name__
+    if "QuestionAnswering" in cls_name:
+        inputs = tok(question, context, return_tensors="pt",
+                     truncation=True).to(result.model.device)
+        import torch
+        with torch.no_grad():
+            out = result.model(**inputs)
+        start = int(out.start_logits.argmax())
+        end = int(out.end_logits.argmax()) + 1
+        input_ids = inputs["input_ids"][0]
+        answer = tok.decode(input_ids[start:end], skip_special_tokens=True).strip()
+        mode = "extractive"
+    else:
+        prompted = f"Context: {context}\n\nQuestion: {question}\n\nAnswer:"
+        pin = tok(prompted, return_tensors="pt", truncation=True,
+                  max_length=1024).to(result.model.device)
+        answer = _generate_from_inputs(result, pin, max_new_tokens=128)
+        mode = "generative"
+    if not answer:
+        answer = "(no answer found in the provided context)"
+    return (f"=== Question answering ({mode}) ===\n"
+            f"Model: {model_id}\n\nQ: {question}\nA: {answer}")
+
+
+def run_translation(result, model_id, prompt, task_inputs):
+    """Translation: seq2seq generation; language-code forcing applied only
+    when the tokenizer actually supports it (M2M100/NLLB style) — otherwise
+    the source text is used verbatim and the limitation is stated."""
+    source = (prompt or "").strip()
+    if not source:
+        raise ClaroBackendError(
+            "Translation needs the source text (input_text = \"...\").",
+            code="invalid_input")
+    target = task_inputs.get("target_language")
+    tok = _tokenizer_for(result)
+    inputs = tok(source, return_tensors="pt", truncation=True,
+                 max_length=1024).to(result.model.device)
+    gen_extra = {}
+    note = None
+    if target:
+        target = str(target).strip()
+        lang_id = None
+        codes = getattr(tok, "lang_code_to_id", None)
+        if codes and target in codes:
+            lang_id = codes[target]
+        toks = getattr(tok, "lang_code_to_token", None)
+        if lang_id is None and toks and target in toks:
+            lang_id = toks[target]
+        if lang_id is not None:
+            gen_extra["forced_bos_token_id"] = lang_id
+        else:
+            note = (f"target language '{target}' noted — this tokenizer does "
+                    "not expose language codes, so the model's own "
+                    "translation convention applies")
+    translated = _generate_from_inputs(result, inputs, max_new_tokens=512,
+                                       num_beams=4, **gen_extra)
+    lines = ["=== Translation ===", f"Model: {model_id}"]
+    if target:
+        lines.append(f"Target language: {target}")
+    if note:
+        lines.append(f"Note: {note}")
+    lines.append(f"\n{translated}")
+    return "\n".join(lines)
+
+
+def run_embeddings_task(result, model_id, prompt, task_inputs):
+    """Feature extraction: architecture-aware pooling + L2-normalized
+    vectors (one per input line). See the embedding section above for the
+    Qwen3 last-token / encoder mean-pooling strategies."""
+    return _embedding_inference(result, model_id, prompt, "feature-extraction")
+
+
+def run_sentence_similarity(result, model_id, prompt, task_inputs):
+    """Sentence similarity: exactly two texts, two embeddings, cosine.
+    Zero/degenerate vectors yield a 0.0 score with an explicit note."""
+    text1 = task_inputs.get("text1")
+    text2 = task_inputs.get("text2")
+    if (not text1 or not text2) and prompt:
+        lines = _split_lines(prompt)
+        if len(lines) >= 2:
+            text1, text2 = lines[0], lines[1]
+    text1 = _require_field({"text1": text1}, "text1", "sentence-similarity")
+    text2 = _require_field({"text2": text2}, "text2", "sentence-similarity")
+    vectors, pooling = _compute_embeddings(result, [text1, text2])
+    sim = _cosine_similarity(vectors[0], vectors[1])
+    notes = []
+    for name, v in (("text 1", vectors[0]), ("text 2", vectors[1])):
+        if sum(x * x for x in v) == 0.0:
+            notes.append(f"{name} produced a zero (degenerate) embedding; "
+                         "similarity is reported as 0.0")
+    preview1 = ", ".join(f"{x:.4f}" for x in vectors[0][:4])
+    preview2 = ", ".join(f"{x:.4f}" for x in vectors[1][:4])
+    lines = [
+        "=== Sentence similarity ===",
+        f"Model: {model_id}",
+        f"Pooling: {pooling}",
+        f"Text 1: {text1[:120]}",
+        f"Text 2: {text2[:120]}",
+        f"Embedding 1 (first 4): [{preview1}]",
+        f"Embedding 2 (first 4): [{preview2}]",
+        f"Cosine similarity: {sim:.4f}",
+    ]
+    for n in notes:
+        lines.append(f"Note: {n}")
+    return "\n".join(lines)
+
+
+def run_text_generation_task(result, model_id, prompt, task_inputs, **gen_opts):
+    """Text generation (causal or seq2seq): the user's actual prompt with the
+    existing chat-template / raw-format handling preserved."""
+    text, _ = _generate_text(result, prompt, gen_opts.get("max_new_tokens", 100),
+                             gen_opts.get("temperature", 0.7),
+                             gen_opts.get("top_p", 0.9),
+                             do_sample=gen_opts.get("do_sample", True),
+                             prompt_format=gen_opts.get("prompt_format", "auto"))
+    return text
+
+
+# Extensible HF task → handler map. Adding a task = adding an entry (plus a
+# handler function), not a new if-chain branch.
+TASK_HANDLERS = {
+    "text-generation": run_text_generation_task,
+    "text2text-generation": run_text_generation_task,
+    "conversational": run_text_generation_task,
+    "chat": run_text_generation_task,
+    "summarization": run_summarization,
+    "translation": run_translation,
+    "question-answering": run_question_answering,
+    "text-classification": run_classification,
+    "feature-extraction": run_embeddings_task,
+    "sentence-similarity": run_sentence_similarity,
+}
+
 def run_inference(
     model_id: str,
     task: str,
@@ -1512,12 +1817,17 @@ def run_inference(
     do_sample: bool = True,
     adapter_path: Optional[str] = None,
     prompt_format: str = "auto",
+    task_inputs: Optional[dict] = None,
 ) -> str:
     """Run inference on GPU. Model is loaded via load_model() which uses CPU cache.
     
     This function is decorated with @spaces.GPU in app.py with dynamic duration.
+    Task routing is driven by the model's intended task: each supported task
+    has its own handler in TASK_HANDLERS, and unsupported tasks raise a clear
+    error instead of falling back to generic text generation.
     """
     task = (task or "text-generation").strip().lower()
+    task_inputs = _parse_task_inputs(task_inputs)
     # Normally a CACHE HIT: app.py loads the model on the CPU worker before
     # entering the @spaces.GPU function, so no download/reload happens here.
     cache_size_before = len(_CACHE)
@@ -1535,14 +1845,23 @@ def run_inference(
         move_in = _to_gpu(result)
         start_time = time.time()
         try:
-            if task in ("text-generation", "text2text-generation", "summarization",
-                        "translation", "question-answering", "conversational", "chat"):
-                if result.modality == "diffusion":
-                    raise ClaroBackendError(
-                        f"Task '{task}' is not compatible with a Diffusion pipeline.",
-                        code="task_model_mismatch",
-                    )
-                text, n_tokens = _generate_text(result, prompt, max_new_tokens, temperature, top_p, do_sample=do_sample, prompt_format=prompt_format)
+            if result.modality == "diffusion" and task in TASK_HANDLERS:
+                raise ClaroBackendError(
+                    f"Task '{task}' is not compatible with a Diffusion pipeline.",
+                    code="task_model_mismatch",
+                )
+
+            handler = TASK_HANDLERS.get(task)
+            if handler is not None:
+                # Task-aware routing: the handler owns input preparation,
+                # inference, and output interpretation for its task.
+                if handler is run_text_generation_task:
+                    text = handler(result, model_id, prompt, task_inputs,
+                                   max_new_tokens=max_new_tokens,
+                                   temperature=temperature, top_p=top_p,
+                                   do_sample=do_sample, prompt_format=prompt_format)
+                else:
+                    text = handler(result, model_id, prompt, task_inputs)
 
             elif task in ("text-to-image", "image-generation"):
                 if result.modality != "diffusion":
@@ -1553,39 +1872,14 @@ def run_inference(
                     )
                 text = _generate_text_to_image(result, prompt, max_new_tokens)
 
-            elif task in ("feature-extraction", "sentence-similarity"):
-                # Dedicated embedding path: pool + L2-normalize hidden
-                # states. Never routed through _generate_text or the
-                # generic fallback (whose str(outputs) dumps logits/cache).
-                text = _embedding_inference(result, model_id, prompt, task)
-
-            elif task == "text-classification":
-                if result.preprocessor is None or result.model is None:
-                    raise ClaroBackendError(
-                        "text-classification requires a model with a tokenizer.",
-                        code="task_model_mismatch",
-                    )
-                import torch
-                inputs = result.preprocessor(prompt, return_tensors="pt").to(result.model.device)
-                with torch.no_grad():
-                    logits = result.model(**inputs).logits
-                idx = int(logits.argmax(-1).item())
-                label = result.model.config.id2label.get(idx, str(idx)) if hasattr(result.model.config, "id2label") else str(idx)
-                text = f"{label}"
-
             else:
-                # Generic fallback: surface forward-pass output as a short string.
-                if result.preprocessor is None or result.model is None:
-                    raise ClaroBackendError(
-                        f"Task '{task}' is not supported for model loaded as "
-                        f"{result.loaded_class} (modality={result.modality}).",
-                        code="task_model_mismatch",
-                    )
-                import torch
-                inputs = result.preprocessor(prompt, return_tensors="pt").to(result.model.device)
-                with torch.no_grad():
-                    outputs = result.model(**inputs)
-                text = str(outputs)[:4000]
+                # No silent generic fallback: unknown/unsupported tasks must
+                # say so instead of dumping raw model output objects.
+                raise ClaroBackendError(
+                    f"Task '{task}' is not supported by this backend. "
+                    f"Supported text tasks: {SUPPORTED_TEXT_TASKS}.",
+                    code="task_not_supported",
+                )
         finally:
             _offload_gpu(result)
 

@@ -105,6 +105,9 @@ class FT:
                   self.device, self.dtype)
 
     def argmax(self, dim=None, **k):
+        if dim is None:
+            flat = list(_flatten(self.data))
+            return flat.index(max(flat))
         return [row.index(max(row)) for row in self.data]
 
     def unsqueeze(self, dim):
@@ -180,9 +183,21 @@ def _flatten(x):
 class FakeTorch:
     def __init__(self):
         self.device = "cpu"
+        self.cuda = types.SimpleNamespace(is_available=lambda: False,
+                                          synchronize=lambda: None)
         self.nn = types.SimpleNamespace(
-            functional=types.SimpleNamespace(normalize=self._normalize))
+            functional=types.SimpleNamespace(normalize=self._normalize,
+                                             softmax=self._softmax))
+        self.softmax = self._softmax  # torch.softmax(...) module-level form
         self.no_grad = contextlib.nullcontext
+
+    def _softmax(self, t, dim=-1, **k):
+        def softmax_row(row):
+            m = max(row)
+            exps = [math.exp(x - m) for x in row]
+            s = sum(exps) or 1.0
+            return [e / s for e in exps]
+        return FT([softmax_row(r) for r in t.data], t.device, t.dtype)
 
     def arange(self, n, device="cpu", **k):
         return FT(list(range(n)), device)
@@ -444,8 +459,8 @@ class EmbeddingTest(unittest.TestCase):
                 {"input_ids": FT([[1], [1]]), "attention_mask": FT([[1], [1]])})
             out2 = backend.run_inference("owner/embed", "sentence-similarity",
                                          "a\nb", max_new_tokens=8)
-            self.assertIn("Vectors: 2", out2)
-            self.assertIn("Similarity(anchor, text 1): 0.0000", out2)
+            self.assertIn("=== Sentence similarity ===", out2)
+            self.assertIn("Cosine similarity: 0.0000", out2)
 
             # text-generation behavior UNCHANGED: still routed to _generate_text
             with unittest.mock.patch.object(

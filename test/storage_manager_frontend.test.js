@@ -210,6 +210,47 @@ async function main() {
     assert(content.getAttribute('style').includes('min(600px'), 'inline width cap present');
   });
 
+  await test('8. notebook editor toolbar keeps the Storage button across re-renders', async () => {
+    const { w } = makeWindow();
+    w.fetch = async (url) => {
+      w.__fetchLog.push(String(url));
+      if (String(url).includes('/api/storage/stats')) {
+        return { ok: true, status: 200, json: async () => STATS };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    };
+    // create a notebook through the app's own API and enter the editor
+    const nbId = w.createNotebook('Storage Test');
+    w.setActiveNotebook(nbId);
+    w.renderNotebookEditor();
+    const toolbar = w.document.querySelector('.notebook-toolbar');
+    const findBtn = () => [...toolbar.querySelectorAll('button')]
+      .find((b) => b.getAttribute('onclick') === 'openStorageManager()');
+    const btn = findBtn();
+    assert(btn, 'Storage button present in the editor toolbar');
+    assert.strictEqual(btn.textContent.trim(), '💾 Storage');
+    // existing toolbar functionality unchanged: neighbors intact
+    const onclk = (sel) => [...toolbar.querySelectorAll('button')].map((b) => b.getAttribute('onclick'));
+    const all = onclk();
+    assert(all.includes('runAllCells()') && all.includes('runMarkdownCells()') &&
+           all.includes('toggleMlExperiments()') && all.includes('backToList()'),
+      'existing toolbar buttons unchanged');
+    // re-render must NOT remove the button (the exact regression concern)
+    w.renderNotebookEditor();
+    w.renderNotebookEditor();
+    assert(findBtn(), 'Storage button survives editor re-render');
+    // The button's wiring is the inline onclick attribute pointing at the
+    // SINGLE global implementation (jsdom outside-only does not execute
+    // inline handlers, so invoke the global the attribute references).
+    assert.strictEqual(typeof w.openStorageManager, 'function',
+      'openStorageManager must be a global the onclick attribute resolves to');
+    await w.openStorageManager();
+    assert(w.document.getElementById('storage-manager-modal').classList.contains('active'),
+      'button target opens the storage manager modal');
+    assert(w.__fetchLog.some((u) => u.includes('/api/storage/stats')),
+      'stats fetched on open');
+  });
+
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
   if (failed) process.exit(1);
 }

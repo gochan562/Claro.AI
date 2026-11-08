@@ -485,6 +485,7 @@ let notebookRegistry = {
         </div>
         <button class="toolbar-btn run-btn" onclick="runAllCells()">▶ Run All</button>
         <button class="toolbar-btn" onclick="runMarkdownCells()">▶ Run Markdown</button>
+        <button class="toolbar-btn" onclick="openStorageManager()" title="Inspect and clean ML caches">💾 Storage</button>
         <button class="toolbar-btn" onclick="toggleMlExperiments()">🧪 Experiments</button>
         <div class="gpu-indicator" id="gpu-indicator">
           <span class="gpu-dot idle" id="gpu-dot"></span>

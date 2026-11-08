@@ -3476,6 +3476,186 @@ print(f"Loaded trained model from {MODEL_DIR}")
       modelListDiv.innerHTML = cards + loadMoreHtml;
     }
 
+    // ── Storage Manager (inspect + clean disposable ML caches) ─────────────
+    let storageStats = null;
+    let storageBusy = false;
+    let storagePendingCategory = null;
+
+    function storageFmt(bytes) {
+      if (bytes == null || !Number.isFinite(Number(bytes))) return '—';
+      const b = Number(bytes);
+      if (b >= 1024 ** 3) return (b / 1024 ** 3).toFixed(2) + ' GB';
+      if (b >= 1024 ** 2) return (b / 1024 ** 2).toFixed(1) + ' MB';
+      if (b >= 1024) return (b / 1024).toFixed(1) + ' KB';
+      return b + ' B';
+    }
+
+    async function openStorageManager() {
+      const modal = document.getElementById('storage-manager-modal');
+      if (!modal) return;
+      modal.classList.add('active');
+      storagePendingCategory = null;
+      document.getElementById('storage-confirm').style.display = 'none';
+      document.getElementById('storage-result').innerHTML = '';
+      await refreshStorageStats();
+    }
+
+    function closeStorageManager() {
+      const modal = document.getElementById('storage-manager-modal');
+      if (modal) modal.classList.remove('active');
+      storagePendingCategory = null;
+    }
+
+    async function refreshStorageStats() {
+      const summary = document.getElementById('storage-summary');
+      const cats = document.getElementById('storage-categories');
+      summary.innerHTML = '<p style="color:#94a3b8;font-size:13px;">Loading storage statistics…</p>';
+      cats.innerHTML = '';
+      try {
+        const res = await fetch('/api/storage/stats');
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        storageStats = data;
+        renderStorageStats(data);
+      } catch (err) {
+        summary.innerHTML = `<p style="color:#f87171;font-size:13px;">Failed to load storage statistics: ${String(err.message)}</p>`;
+      }
+    }
+
+    function renderStorageStats(data) {
+      const summary = document.getElementById('storage-summary');
+      const t = data.totals || {};
+      const parts = [];
+      parts.push(`<div style="font-size:13px;color:#e2e8f0;margin-bottom:6px;">
+        <strong>Claro.AI caches:</strong> ${storageFmt(t.managed_bytes)}
+        &nbsp;·&nbsp; <strong>Available on volume:</strong> ${storageFmt(t.available_bytes)}
+        ${t.volume_percent != null ? `&nbsp;·&nbsp; <span style="color:#94a3b8;">volume ${t.volume_percent}% used</span>` : ''}
+      </div>`);
+      if (t.volume_percent != null && t.total_bytes != null) {
+        parts.push(`<div style="background:#2b2b2b;border-radius:4px;height:10px;overflow:hidden;margin-bottom:4px;">
+          <div style="height:100%;width:${Math.min(100, Math.max(0, t.volume_percent))}%;background:${t.warning ? '#ef4444' : '#3b82f6'};"></div>
+        </div>`);
+        parts.push(`<div style="color:#64748b;font-size:11.5px;margin-bottom:2px;">Volume usage — hosting quotas (e.g. Replit) may enforce a lower limit than the device capacity.</div>`);
+      } else {
+        parts.push(`<div style="color:#64748b;font-size:11.5px;margin-bottom:2px;">Total capacity is not reliably exposed by this environment — only actual available space is shown.</div>`);
+      }
+      summary.innerHTML = parts.join('');
+
+      const warnBox = document.getElementById('storage-warning');
+      if (t.warning && t.warning_reason) {
+        warnBox.textContent = `⚠️ ${t.warning_reason}. Consider cleaning caches below.`;
+        warnBox.style.display = '';
+      } else {
+        warnBox.style.display = 'none';
+      }
+
+      const catDefs = [
+        ['datasets', 'Dataset cache', 'HF dataset downloads + processed Arrow cache. Source datasets in ML workspaces are never touched.'],
+        ['models', 'Model cache', 'Downloaded model weights. You may need to download them again after cleaning.'],
+        ['temp', 'Temporary files', 'Incomplete downloads, stale locks, xet chunks, __pycache__. Results and artifacts are never touched.'],
+      ];
+      const cats = document.getElementById('storage-categories');
+      cats.innerHTML = catDefs.map(([key, label, desc]) => {
+        const c = (data.categories || {})[key] || { bytes: 0 };
+        const busy = storageBusy;
+        return `<div style="display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid #2b2b2b;border-radius:6px;margin-bottom:6px;flex-wrap:wrap;">
+          <div style="flex:1;min-width:180px;">
+            <div style="font-size:13px;color:#e2e8f0;"><strong>${label}</strong> — ${storageFmt(c.bytes)}</div>
+            <div style="color:#64748b;font-size:11.5px;">${desc}</div>
+            ${c.protected_entries ? `<div style="color:#fbbf24;font-size:11px;">${c.protected_entries} protected (active)</div>` : ''}
+          </div>
+          <button class="cell-btn" data-storage-clean="${key}" onclick="requestStorageCleanup('${key}')" ${busy ? 'disabled' : ''}>Clean…</button>
+        </div>`;
+      }).join('');
+    }
+
+    const STORAGE_CLEAN_INFO = {
+      datasets: {
+        title: 'Clean dataset cache?',
+        what: 'Hugging Face dataset download files (hub/datasets--*) and the processed Arrow cache (datasets/).',
+        warning: 'Datasets will be re-downloaded and re-processed the next time you load them. Uploaded datasets and ML workspaces are NOT touched.',
+      },
+      models: {
+        title: 'Clean model cache?',
+        what: 'Downloaded model weight directories (hub/models--*) that are not used by a running training job.',
+        warning: 'Deleted model weights must be downloaded again before the next local training or inference run that needs them.',
+      },
+      temp: {
+        title: 'Clear temporary files?',
+        what: 'Incomplete downloads (*.incomplete), stale locks (*.lock), xet download chunks, and Python __pycache__ directories.',
+        warning: 'Experiment results, metrics, logs, saved artifacts, and uploaded datasets are never touched.',
+      },
+    };
+
+    async function requestStorageCleanup(category) {
+      const info = STORAGE_CLEAN_INFO[category];
+      if (!info || storageBusy) return;
+      let sizeText = 'unknown amount';
+      let protectedNote = '';
+      try {
+        const res = await fetch('/api/storage/stats');
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          storageStats = data;
+          const c = (data.categories || {})[category];
+          if (c) sizeText = storageFmt(c.bytes);
+          if (c && c.protected_entries) protectedNote = `<br><span style="color:#fbbf24;">${c.protected_entries} item(s) are active and will be protected (skipped).</span>`;
+        }
+      } catch (_) { /* stats are advisory for the dialog; cleanup still validates */ }
+      storagePendingCategory = category;
+      document.getElementById('storage-confirm-title').textContent = info.title;
+      document.getElementById('storage-confirm-body').innerHTML =
+        `<strong>Category:</strong> ${info.title.replace('?', '')}<br>` +
+        `<strong>Estimated space to free:</strong> ${sizeText}<br>` +
+        `<strong>What will be deleted:</strong> ${info.what}<br>` +
+        `<span style="color:#fbbf24;">⚠️ ${info.warning}</span>${protectedNote}`;
+      document.getElementById('storage-confirm').style.display = '';
+    }
+
+    function cancelStorageCleanup() {
+      storagePendingCategory = null;
+      document.getElementById('storage-confirm').style.display = 'none';
+    }
+
+    async function confirmStorageCleanup() {
+      const category = storagePendingCategory;
+      if (!category || storageBusy) return;
+      storageBusy = true;
+      const btn = document.getElementById('storage-confirm-btn');
+      const resultEl = document.getElementById('storage-result');
+      btn.disabled = true;
+      btn.textContent = 'Cleaning…';
+      document.querySelectorAll('[data-storage-clean]').forEach((b) => { b.disabled = true; });
+      resultEl.innerHTML = '<span style="color:#94a3b8;">Cleaning…</span>';
+      try {
+        const res = await fetch('/api/storage/cleanup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ category }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        const skipped = (data.skipped || []).length;
+        const failed = (data.errors || []).length;
+        resultEl.innerHTML = `<span style="color:#34d399;">✅ Cleaned ${data.removed_count} item(s), reclaimed ${storageFmt(data.freed_bytes)}.</span>` +
+          (skipped ? ` <span style="color:#fbbf24;">${skipped} protected item(s) skipped.</span>` : '') +
+          (failed ? ` <span style="color:#f87171;">${failed} item(s) failed — see server log.</span>` : '');
+        storagePendingCategory = null;
+        document.getElementById('storage-confirm').style.display = 'none';
+        await refreshStorageStats();
+      } catch (err) {
+        // Failed cleanup: error shown, NO success message, stats refreshed so
+        // the numbers stay truthful about any partial state.
+        resultEl.innerHTML = `<span style="color:#f87171;">❌ Cleanup failed: ${String(err.message)}</span>`;
+        await refreshStorageStats().catch(() => {});
+      } finally {
+        storageBusy = false;
+        btn.disabled = false;
+        btn.textContent = 'Yes, clean it';
+        document.querySelectorAll('[data-storage-clean]').forEach((b) => { b.disabled = false; });
+      }
+    }
+
     function handleModelDragStart(event, modelId) {
       const model = filteredModels.find(m => m.id === modelId);
       if (model) {

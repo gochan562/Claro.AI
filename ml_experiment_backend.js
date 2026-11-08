@@ -703,7 +703,22 @@ async function ingestUpload({ filename, content }) {
   }
 }
 
+// In-flight HF ingestion tracking: the datasets library cache is shared
+// with any running ingest subprocess, so the Storage Manager must treat it
+// as protected while one runs.
+let _activeIngests = 0;
+function hasActiveIngest() { return _activeIngests > 0; }
+
 async function ingestHf({ dataset_id, split, config }) {
+  _activeIngests += 1;
+  try {
+    return await _ingestHfInner({ dataset_id, split, config });
+  } finally {
+    _activeIngests = Math.max(0, _activeIngests - 1);
+  }
+}
+
+async function _ingestHfInner({ dataset_id, split, config }) {
   const ws_id = _genWsId();
   const args = ['ml/experiment_runner.py', 'dataset-ingest-hf',
       '--ws', ws_id, '--workspace-base', path.join(__dirname),
@@ -1071,6 +1086,7 @@ module.exports = {
   validatePredictRequest,
   ingestUpload,
   ingestHf,
+  hasActiveIngest,
   getWorkspace,
   splitPreview,
   createExperimentRecord,

@@ -1725,6 +1725,7 @@
         </div>
         <button class="toolbar-btn run-btn" onclick="runAllCells()">▶ Run All</button>
         <button class="toolbar-btn" onclick="runMarkdownCells()">▶ Run Markdown</button>
+        <button class="toolbar-btn" onclick="openStorageManager()" title="Inspect and clean ML caches">💾 Storage</button>
         <div class="gpu-indicator" id="gpu-indicator">
           <span class="gpu-dot idle" id="gpu-dot"></span>
           <div class="gpu-tooltip" id="gpu-tooltip">⚪ GPU: A10G · Idle (connects when you run a cell)</div>
@@ -1848,6 +1849,31 @@
             Text-only models · Up to 8B parameters
           </div>
           <div id="model-list" class="model-list"></div>
+        </div>
+      </div>
+    </div>
+    <!-- Storage Manager modal -->
+    <div id="storage-manager-modal" class="modal">
+      <div class="modal-content" style="width:min(600px, 94vw);">
+        <div class="modal-header">
+          <h3>💾 Storage Manager</h3>
+          <span class="close-modal" onclick="closeStorageManager()">&times;</span>
+        </div>
+        <div class="modal-body">
+          <div id="storage-summary" style="margin-bottom:10px;">
+            <p style="color:#94a3b8;font-size:13px;">Loading storage statistics…</p>
+          </div>
+          <div id="storage-warning" style="display:none; margin:8px 0; padding:8px 10px; border:1px solid #f59e0b55; background:#f59e0b18; border-radius:6px; color:#fbbf24; font-size:13px;"></div>
+          <div id="storage-categories"></div>
+          <div id="storage-confirm" style="display:none; margin-top:12px; padding:10px 12px; border:1px solid #ef444455; background:#ef444414; border-radius:6px;">
+            <div id="storage-confirm-title" style="font-weight:600; color:#fca5a5; margin-bottom:6px; font-size:13px;"></div>
+            <div id="storage-confirm-body" style="color:#cbd5e1; font-size:12.5px; line-height:1.5;"></div>
+            <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;">
+              <button id="storage-confirm-btn" class="cell-btn run" onclick="confirmStorageCleanup()">Yes, clean it</button>
+              <button class="cell-btn" onclick="cancelStorageCleanup()">Cancel</button>
+            </div>
+          </div>
+          <div id="storage-result" style="margin-top:10px; font-size:12.5px; line-height:1.5;"></div>
         </div>
       </div>
     </div>

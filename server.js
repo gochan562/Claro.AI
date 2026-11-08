@@ -676,6 +676,34 @@ app.post('/api/train', strictLimiter, async (req, res) => {
 // Separate from /api/train/* (Hugging Face fine-tuning). Structured configs
 // only; datasets enter as file text or HF references, never raw code.
 const mlBackend = require('./ml_experiment_backend');
+const storageManager = require('./storage_manager');
+
+// Storage Manager: inspects and cleans DISPOSABLE caches only. Requests
+// carry a category (strict allowlist) — never a filesystem path.
+function _storageErr(res, err) {
+  const status = err.status || 500;
+  const code = err.code || 'storage_error';
+  console.error(`[STORAGE] ${code}: ${err.message}`);
+  return res.status(status).json({ error: err.message, code });
+}
+
+app.get('/api/storage/stats', (req, res) => {
+  try {
+    return res.json(storageManager.getStorageStats());
+  } catch (err) { return _storageErr(res, err); }
+});
+
+app.post('/api/storage/cleanup', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const category = String(body.category || '').trim();
+    if (!category) {
+      return res.status(400).json({ error: 'category is required (models | datasets | temp).', code: 'bad_request' });
+    }
+    const out = await storageManager.cleanup(category, { dryRun: !!body.dry_run });
+    return res.json(out);
+  } catch (err) { return _storageErr(res, err); }
+});
 
 function _mlErr(res, err) {
   const status = err.status || 500;

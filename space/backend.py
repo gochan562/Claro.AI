@@ -1340,6 +1340,166 @@ def _generate_text_to_image(result: LoaderResult, prompt: str, max_new_tokens: i
     )
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Embeddings (feature-extraction / sentence-similarity)
+# ──────────────────────────────────────────────────────────────────────────────
+# Pooling strategy is chosen per architecture — never assumed globally:
+#   - Causal-LM wrappers (Qwen3-Embedding resolves to AutoModelForCausalLM):
+#     LAST-TOKEN pooling per the official Qwen3-Embedding example
+#     (left padding + attention-mask-aware final-token selection + L2 norm).
+#   - Plain AutoModel encoders (BERT/MiniLM/BGE/E5/GTE class): mean pooling
+#     over valid (attention-mask) tokens.
+# An embedding alone is NOT a similarity score; sentence-similarity computes
+# cosine similarity between an anchor text and candidate texts.
+
+_EMBEDDING_CAUSAL_CLASSES = {"AutoModelForCausalLM"}
+
+
+def _pooling_strategy_for(result) -> str:
+    """Pick the pooling strategy from the loaded architecture.
+
+    Raises task_model_mismatch for model classes with no defined embedding
+    contract (diffusion pipelines, classifiers, etc.).
+    """
+    loaded = getattr(result, "loaded_class", "") or ""
+    if loaded in _EMBEDDING_CAUSAL_CLASSES:
+        return "last_token"
+    if loaded == "AutoModel":
+        return "mean"
+    raise ClaroBackendError(
+        f"Model loaded as {loaded or 'unknown class'} does not expose a supported "
+        "embedding interface (expected AutoModel or a causal-LM wrapper such as "
+        "Qwen3-Embedding's AutoModelForCausalLM).",
+        code="task_model_mismatch",
+    )
+
+
+def _select_last_hidden(model_output):
+    """Final hidden states, preferring hidden_states[-1] (causal-LM wrapper
+    loaded with output_hidden_states=True) over last_hidden_state."""
+    hidden = getattr(model_output, "hidden_states", None)
+    if hidden:
+        return hidden[-1]
+    return getattr(model_output, "last_hidden_state")
+
+
+def _qwen3_query_text(text: str, instruction: Optional[str]) -> str:
+    """Official Qwen3-Embedding query format. Instruction is OPTIONAL and
+    must be provided by the caller — no default retrieval instruction is
+    invented for generic embedding use cases."""
+    if not instruction:
+        return text
+    return f"Instruct: {instruction}\nQuery: {text}"
+
+
+def _compute_embeddings(result: "LoaderResult", texts, instruction: Optional[str] = None):
+    """Tokenize, forward under no_grad, pool, and L2-normalize.
+
+    Returns (vectors: list[list[float]], pooling: str). The mask-aware
+    position selection works for BOTH left and right padding, but causal-LM
+    (Qwen3-style) models get tokenizer.padding_side='left' per the official
+    example.
+    """
+    import torch
+    tok = result.preprocessor
+    if tok is None:
+        raise ClaroBackendError(
+            "This model has no tokenizer for embedding extraction.",
+            code="task_model_mismatch",
+        )
+    pooling = _pooling_strategy_for(result)
+    if instruction:
+        texts = [_qwen3_query_text(t, instruction) for t in texts]
+    if pooling == "last_token" and hasattr(tok, "padding_side"):
+        tok.padding_side = "left"
+    # Qwen-class tokenizers ship no pad token; the official Qwen3-Embedding
+    # example uses the EOS token for padding. Without this, padding=True
+    # raises "does not have a padding token".
+    if getattr(tok, "pad_token", None) is None \
+            and getattr(tok, "eos_token", None) is not None:
+        tok.pad_token = tok.eos_token
+    enc = tok(list(texts), padding=True, truncation=True, return_tensors="pt")
+    if hasattr(enc, "to"):
+        enc = enc.to(result.model.device)
+    with torch.no_grad():
+        out = result.model(**enc, output_hidden_states=True)
+    last_hidden = _select_last_hidden(out)
+    mask = enc["attention_mask"]
+    if pooling == "last_token":
+        # Index of the LAST valid token per row (side-agnostic: masked
+        # positions contribute 0 to mask*arange, so argmax lands on the
+        # final attended position whether padding is left or right).
+        positions = (mask * torch.arange(mask.shape[1], device=mask.device)
+                     .unsqueeze(0)).argmax(dim=1)
+        emb = last_hidden[torch.arange(last_hidden.shape[0], device=mask.device), positions]
+    else:
+        m = mask.unsqueeze(-1).to(last_hidden.dtype)
+        emb = (last_hidden * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)
+    emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+    return emb.detach().to("cpu").tolist(), pooling
+
+
+def _cosine_similarity(a, b) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(x * x for x in b) ** 0.5
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def _format_embedding_result(model_id: str, vectors, pooling: str,
+                             task: str = "feature-extraction",
+                             similarities=None, max_preview: int = 8) -> str:
+    """Compact, structured, human-readable summary. Never stringifies raw
+    torch output objects; the full vector stays out of the terminal by
+    default (the existing single-string API surface cannot carry a
+    structured payload)."""
+    lines = [
+        "=== Embedding output ===",
+        f"Model: {model_id}",
+        f"Task: {task}",
+        f"Vectors: {len(vectors)}",
+        f"Dimensions: {len(vectors[0])}",
+        f"Pooling: {pooling}",
+    ]
+    for i, v in enumerate(vectors):
+        norm = sum(x * x for x in v) ** 0.5
+        lines.append(f"Vector[{i}] Norm: {norm:.4f}")
+    preview = ", ".join(f"{x:.4f}" for x in vectors[0][:max_preview])
+    if len(vectors[0]) > max_preview:
+        preview += ", ..."
+    lines.append(f"Preview: [{preview}]")
+    if similarities is not None:
+        for j, s in enumerate(similarities):
+            lines.append(f"Similarity(anchor, text {j + 1}): {s:.4f}")
+    return "\n".join(lines)
+
+
+def _embedding_inference(result: "LoaderResult", model_id: str, prompt: str, task: str) -> str:
+    if result.model is None or result.modality == "diffusion":
+        raise ClaroBackendError(
+            f"Task '{task}' requires a Transformers model, but {model_id} "
+            f"loaded as {result.loaded_class} (modality={result.modality}).",
+            code="task_model_mismatch",
+        )
+    texts = [ln.strip() for ln in (prompt or "").splitlines() if ln.strip()]
+    if not texts:
+        raise ClaroBackendError("prompt is required for embedding tasks.", code="bad_request")
+    if task == "sentence-similarity" and len(texts) < 2:
+        raise ClaroBackendError(
+            "sentence-similarity needs at least two newline-separated texts "
+            "(first line = anchor, remaining lines = candidates). A single "
+            "embedding is not a similarity score.",
+            code="bad_request",
+        )
+    vectors, pooling = _compute_embeddings(result, texts)
+    similarities = None
+    if task == "sentence-similarity":
+        similarities = [_cosine_similarity(vectors[0], v) for v in vectors[1:]]
+    return _format_embedding_result(model_id, vectors, pooling, task, similarities)
+
+
 def run_inference(
     model_id: str,
     task: str,
@@ -1392,6 +1552,12 @@ def run_inference(
                         code="task_model_mismatch",
                     )
                 text = _generate_text_to_image(result, prompt, max_new_tokens)
+
+            elif task in ("feature-extraction", "sentence-similarity"):
+                # Dedicated embedding path: pool + L2-normalize hidden
+                # states. Never routed through _generate_text or the
+                # generic fallback (whose str(outputs) dumps logits/cache).
+                text = _embedding_inference(result, model_id, prompt, task)
 
             elif task == "text-classification":
                 if result.preprocessor is None or result.model is None:

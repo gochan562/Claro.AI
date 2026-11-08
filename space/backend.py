@@ -92,20 +92,45 @@ class LoaderResult:
     device: Any
     dtype: Any
     config_hash: str = ""  # hash of config for cache invalidation
+    model_id: str = ""     # repo id — used by model-specific embedding paths
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Device/dtype
 # ──────────────────────────────────────────────────────────────────────────────
-def _device_dtype():
-    """Loading is ALWAYS done on CPU (fp16 weights) so model loading never
-    consumes ZeroGPU GPU-seconds.  The @spaces.GPU inference path moves the
-    cached model onto CUDA only for the duration of the request, then offloads
-    it again, so VRAM stays free between calls and the CPU-side LRU cache can
-    safely hold several models.
+# Model families whose activations are KNOWN to be FP16-incompatible.
+# Google's EmbeddingGemma documentation explicitly states its activations are
+# incompatible with FP16 and recommends FP32/BF16 — FP16 weights silently
+# produce NaN activations on CUDA (the raw HTTP 500 on sentence-similarity).
+_FP16_INCOMPATIBLE_FAMILIES = ("embeddinggemma",)
+
+
+def _resolve_model_dtype(model_id):
+    """Model-specific weight precision. Defaults to the historical FP16;
+    families with documented FP16 incompatibility get BF16 when the target
+    hardware supports it, else FP32 — never FP16."""
+    import torch
+    mid = str(model_id or "").lower()
+    if any(f in mid for f in _FP16_INCOMPATIBLE_FAMILIES):
+        try:
+            if torch.cuda.is_available() and getattr(
+                    torch.cuda, "is_bf16_supported", lambda: False)():
+                return torch.bfloat16
+        except Exception:
+            pass
+        return torch.float32
+    return torch.float16
+
+
+def _device_dtype(model_id=None):
+    """Loading is ALWAYS done on CPU so model loading never consumes ZeroGPU
+    GPU-seconds.  The @spaces.GPU inference path moves the cached model onto
+    CUDA only for the duration of the request, then offloads it again, so
+    VRAM stays free between calls and the CPU-side LRU cache can safely hold
+    several models.  Precision is model-specific (see _resolve_model_dtype).
     """
     import torch
-    return torch.device("cpu"), torch.float16
+    return torch.device("cpu"), _resolve_model_dtype(model_id)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -457,6 +482,7 @@ def _load_gguf(model_id, files, device, dtype) -> LoaderResult:
         modality="gguf",
         device=device,
         dtype=dtype,
+        model_id=model_id,
     )
 
 
@@ -540,6 +566,7 @@ def _load_diffusers(model_id, device, dtype) -> LoaderResult:
         modality="diffusion",
         device=device,
         dtype=dtype,
+        model_id=model_id,
     )
 
 
@@ -857,6 +884,7 @@ def _load_transformers(model_id, device, dtype) -> LoaderResult:
         modality=modality,
         device=device,
         dtype=dtype,
+        model_id=model_id,
     )
 
 
@@ -949,7 +977,7 @@ def load_model(model_id: str, gguf_file: Optional[str] = None, revision: Optiona
                 _CACHE.move_to_end(key)
                 return _CACHE[key]
 
-        device, dtype = _device_dtype()
+        device, dtype = _device_dtype(model_id)
         gguf_files = _list_gguf_files(model_id)
 
         # If user explicitly requests a specific GGUF file, honor it.
@@ -1393,13 +1421,18 @@ def _qwen3_query_text(text: str, instruction: Optional[str]) -> str:
     return f"Instruct: {instruction}\nQuery: {text}"
 
 
-def _compute_embeddings(result: "LoaderResult", texts, instruction: Optional[str] = None):
-    """Tokenize, forward under no_grad, pool, and L2-normalize.
+def _compute_embeddings(result: "LoaderResult", texts, instruction: Optional[str] = None,
+                        internal_task: Optional[str] = None):
+    """Tokenize, forward under no_grad, pool, apply the model's own
+    projection modules (when its architecture defines them), and
+    L2-normalize.
 
     Returns (vectors: list[list[float]], pooling: str). The mask-aware
     position selection works for BOTH left and right padding, but causal-LM
     (Qwen3-style) models get tokenizer.padding_side='left' per the official
-    example.
+    example. Models with Sentence-Transformers Dense modules (EmbeddingGemma)
+    get mean pooling followed by their learned projection chain — the
+    normalization always happens LAST, after the projection.
     """
     import torch
     tok = result.preprocessor
@@ -1411,6 +1444,11 @@ def _compute_embeddings(result: "LoaderResult", texts, instruction: Optional[str
     pooling = _pooling_strategy_for(result)
     if instruction:
         texts = [_qwen3_query_text(t, instruction) for t in texts]
+    # Model-specific task prefixes (EmbeddingGemma documents them; Qwen3 and
+    # generic encoders deliberately get none).
+    if internal_task:
+        model_id = getattr(result, "model_id", "") or ""
+        texts = [_embedding_prefix(model_id, internal_task, t) for t in texts]
     if pooling == "last_token" and hasattr(tok, "padding_side"):
         tok.padding_side = "left"
     # Qwen-class tokenizers ship no pad token; the official Qwen3-Embedding
@@ -1436,8 +1474,12 @@ def _compute_embeddings(result: "LoaderResult", texts, instruction: Optional[str
     else:
         m = mask.unsqueeze(-1).to(last_hidden.dtype)
         emb = (last_hidden * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)
+    # Model-specific learned projections (EmbeddingGemma 2_Dense/3_Dense)
+    # run BEFORE normalization; normalization is always the final step.
+    emb, projected = _apply_dense_projection(result, emb)
+    pooling_label = pooling if not projected else f"{pooling}+dense_projection"
     emb = torch.nn.functional.normalize(emb, p=2, dim=1)
-    return emb.detach().to("cpu").tolist(), pooling
+    return emb.detach().to("cpu").tolist(), pooling_label
 
 
 def _cosine_similarity(a, b) -> float:
@@ -1585,6 +1627,140 @@ def _generate_from_inputs(result, inputs, max_new_tokens=256, do_sample=False,
     else:
         new_ids = out[0][inputs["input_ids"].shape[-1]:]
     return tok.decode(new_ids, skip_special_tokens=True).strip()
+
+
+# ── Model-specific embedding architectures & task prefixes ──────────────────
+# EmbeddingGemma (google/embeddinggemma-300m) is a Sentence-Transformers
+# model: Gemma3TextModel backbone → attention-mask-aware mean pooling →
+# learned Dense 768→3072 (2_Dense) → learned Dense 3072→768 (3_Dense) →
+# L2 normalization. The Dense projection weights live OUTSIDE the main
+# checkpoint (2_Dense/model.safetensors, 3_Dense/model.safetensors) and are
+# NOT loaded by AutoModel — they must be loaded explicitly or the embeddings
+# are raw backbone outputs (wrong). If those weights cannot be loaded we
+# raise model_load_error rather than emit incorrect embeddings.
+
+# Task-specific input prefixes, keyed by model family then internal task.
+# Sourced from each model's documented usage — never invented per request.
+_EMBEDDING_TASK_PREFIXES = {
+    "embeddinggemma": {
+        "sentence_similarity": "task: sentence similarity | query: ",
+        "retrieval": "task: search result | query: ",
+        "classification": "task: classification | query: ",
+        "clustering": "task: clustering | query: ",
+    },
+}
+
+_DENSE_ACTIVATIONS = {
+    "tanh": "tanh",
+    "gelu": "gelu",
+    "relu": "relu",
+    "linear": None,
+    "identity": None,
+}
+
+
+def _embedding_prefix(model_id, internal_task, text):
+    """Model-specific task prefix. Returns the text unchanged for models
+    without documented prefixes (Qwen3, generic encoders) and never
+    duplicates a prefix that is already present."""
+    mid = str(model_id or "").lower()
+    for family, prefixes in _EMBEDDING_TASK_PREFIXES.items():
+        if family in mid and internal_task in prefixes:
+            prefix = prefixes[internal_task]
+            if text.startswith(prefix):
+                return text
+            return prefix + text
+    return text
+
+
+# Lazily-wrapped hub/safetensors calls (patchable in tests).
+def _hub_download(model_id, filename):
+    from huggingface_hub import hf_hub_download
+    return hf_hub_download(model_id, filename)
+
+
+def _safetensors_load_file(path):
+    from safetensors.torch import load_file
+    return load_file(path)
+
+def _load_dense_projection(result):
+    cached = getattr(result, "_claro_dense_projection", None)
+    if cached is not None:
+        return cached
+    model_id = getattr(result, "model_id", "") or ""
+    layers = []
+    saw_dense = False
+    partial_error = None
+    try:
+        import torch
+        idx = 2
+        while True:
+            prefix = f"{idx}_Dense"
+            try:
+                cfg_path = _hub_download(model_id, f"{prefix}/config.json")
+                saw_dense = True
+            except Exception:
+                break  # no more Dense modules -- normal stop
+            try:
+                with open(cfg_path) as f:
+                    cfg = json.load(f)
+                weights_path = _hub_download(model_id, f"{prefix}/model.safetensors")
+                sd = _safetensors_load_file(weights_path)
+            except Exception as e:
+                partial_error = (
+                    f"Model {model_id} declares a {prefix} projection module but "
+                    f"its weights/config could not be loaded: {e}")
+                break
+            weight = sd.get("linear.weight")
+            bias = sd.get("linear.bias")
+            if weight is None:
+                partial_error = (
+                    f"{prefix}/model.safetensors has no 'linear.weight' -- "
+                    "unexpected projection format.")
+                break
+            act_name = str(cfg.get("activation_function") or "linear").lower()
+            act_name = act_name.split(".")[-1]
+            act = _DENSE_ACTIVATIONS.get(act_name, "unknown")
+            if act == "unknown":
+                partial_error = (
+                    f"{prefix} declares unknown activation_function "
+                    f"{cfg.get('activation_function')!r}.")
+                break
+            act_fn = getattr(torch, act) if act else None
+            # store weight pre-transposed for hidden @ W^T
+            layers.append((torch.transpose(weight, 0, 1),
+                           bias, act_fn, prefix))
+            idx += 1
+    except Exception:
+        pass  # discovery unavailable -> treated as no Dense modules below
+    if saw_dense and partial_error:
+        raise ClaroBackendError(partial_error, code="model_load_error")
+    try:
+        object.__setattr__(result, "_claro_dense_projection", layers)
+    except Exception:
+        pass
+    return layers
+
+def _apply_dense_projection(result, pooled):
+    """Apply the model's Dense projection chain in order (2_Dense → 3_Dense
+    ...). Returns (projected, applied_bool). Weights are moved to the model's
+    device/dtype so they always match the backbone's output."""
+    import torch
+    layers = _load_dense_projection(result)
+    if not layers:
+        return pooled, False
+    x = pooled
+    device = result.model.device
+    dtype = next((p.dtype for p in result.model.parameters()
+                  if hasattr(p, "dtype")), None)
+    for (w_t, bias, act_fn, name) in layers:
+        w = w_t.to(device=device, dtype=dtype) if dtype is not None else w_t.to(device)
+        x = torch.matmul(x.to(device=device, dtype=w.dtype), w)
+        if bias is not None:
+            x = x + bias.to(device=device, dtype=x.dtype)
+        if act_fn is not None:
+            x = act_fn(x)
+    return x, True
 
 
 def run_summarization(result, model_id, prompt, task_inputs):
@@ -1755,7 +1931,8 @@ def run_sentence_similarity(result, model_id, prompt, task_inputs):
             text1, text2 = lines[0], lines[1]
     text1 = _require_field({"text1": text1}, "text1", "sentence-similarity")
     text2 = _require_field({"text2": text2}, "text2", "sentence-similarity")
-    vectors, pooling = _compute_embeddings(result, [text1, text2])
+    vectors, pooling = _compute_embeddings(result, [text1, text2],
+                                           internal_task="sentence_similarity")
     sim = _cosine_similarity(vectors[0], vectors[1])
     notes = []
     for name, v in (("text 1", vectors[0]), ("text 2", vectors[1])):

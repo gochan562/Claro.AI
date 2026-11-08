@@ -411,6 +411,11 @@ def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=Non
         # without relying on Gradio's error-frame title.
         return str(e)
     except Exception as e:
+        # FULL traceback to the Space runtime logs (stderr) — the returned
+        # [CLARO:...] string is truncated for the client, but operators must
+        # be able to see the complete original exception when investigating
+        # inference failures such as the EmbeddingGemma HTTP 500.
+        traceback.print_exc()
         tb = traceback.format_exc(limit=3)
         # Check for CUDA OOM in unexpected errors
         err_msg = str(e)

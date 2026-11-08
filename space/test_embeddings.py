@@ -85,6 +85,11 @@ class FT:
         return FT(_zip_lists(self.data, self._expand(b),
                              lambda x, y: x * y), self.device, self.dtype)
 
+    def __add__(self, other):
+        b = other.data if isinstance(other, FT) else other
+        return FT(_zip_lists(self.data, self._expand(b),
+                             lambda x, y: x + y), self.device, self.dtype)
+
     def __truediv__(self, other):
         b = other.data if isinstance(other, FT) else other
         return FT(_zip_lists(self.data, self._expand(b),
@@ -120,10 +125,16 @@ class FT:
         raise NotImplementedError(dim)
 
     def to(self, *a, **k):
-        if a and isinstance(a[0], str) and a[0] not in ("cpu",):
-            return FT(self.data, a[0], self.dtype)  # device move: keep data
-        return FT(self.data, self.device, getattr(a[0], "dtype", self.dtype)
-                  if a and not isinstance(a[0], str) else self.dtype)
+        device = k.get("device")
+        dtype = k.get("dtype")
+        if device is None and a and isinstance(a[0], str):
+            device = a[0]
+        if dtype is None:
+            for x in a:
+                if not isinstance(x, str):
+                    dtype = x
+                    break
+        return FT(self.data, device or self.device, dtype or self.dtype)
 
     def detach(self):
         return self
@@ -179,17 +190,57 @@ def _flatten(x):
     else:
         yield x
 
+class _Dtype:
+    def __init__(self, name):
+        self.name = name
+    def __repr__(self):
+        return f"torch.{self.name}"
+
 
 class FakeTorch:
     def __init__(self):
-        self.device = "cpu"
+        self.device = lambda s="cpu": (s or "cpu")  # torch.device(...) callable
+        # dtype sentinels (distinct objects so identity checks work)
+        self.float16 = _Dtype("float16")
+        self.float32 = _Dtype("float32")
+        self.bfloat16 = _Dtype("bfloat16")
         self.cuda = types.SimpleNamespace(is_available=lambda: False,
-                                          synchronize=lambda: None)
+                                          synchronize=lambda: None,
+                                          is_bf16_supported=lambda: False)
         self.nn = types.SimpleNamespace(
             functional=types.SimpleNamespace(normalize=self._normalize,
-                                             softmax=self._softmax))
+                                             softmax=self._softmax,
+                                             gelu=self._gelu,
+                                             relu=self._relu))
         self.softmax = self._softmax  # torch.softmax(...) module-level form
+        self.tanh = self._tanh
+        self.relu = self._relu
+        self.gelu = self._gelu
         self.no_grad = contextlib.nullcontext
+
+    def transpose(self, t, d0, d1):
+        assert (d0, d1) == (0, 1) and len(t.shape) == 2
+        return FT([list(col) for col in zip(*t.data)], t.device, t.dtype)
+
+    def matmul(self, a, b):
+        # 2-D @ 2-D over nested lists
+        assert len(a.shape) == 2 and len(b.shape) == 2
+        assert a.shape[1] == b.shape[0], f"matmul shape mismatch {a.shape}x{b.shape}"
+        out = [[sum(x * y for x, y in zip(row, col)) for col in zip(*b.data)]
+               for row in a.data]
+        return FT(out, a.device, a.dtype)
+
+    def _tanh(self, t):
+        return FT([[math.tanh(x) for x in row] for row in t.data], t.device, t.dtype)
+
+    def _relu(self, t):
+        return FT([[max(0.0, x) for x in row] for row in t.data], t.device, t.dtype)
+
+    def _gelu(self, t):
+        import math as _m
+        def gelu1(x):
+            return 0.5 * x * (1.0 + _m.tanh(_m.sqrt(2.0 / _m.pi) * (x + 0.044715 * x ** 3)))
+        return FT([[gelu1(x) for x in row] for row in t.data], t.device, t.dtype)
 
     def _softmax(self, t, dim=-1, **k):
         def softmax_row(row):
@@ -209,6 +260,8 @@ class FakeTorch:
             n = math.sqrt(sum(x * x for x in row)) or 1.0
             return [x / n for x in row]
         return FT([norm_row(r) for r in t.data], t.device, t.dtype)
+
+
 
 
 class FakeBatch(dict):

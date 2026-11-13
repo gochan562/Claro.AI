@@ -196,6 +196,8 @@ app.get('/api/gpu-config', (req, res) => {
     provider: gpuBackend.kind,
     zerogpu: {
       space: gpuBackend.kind === 'zerogpu' ? gpuBackend.spaceId : (process.env.ZEROGPU_SPACE || 'Gochan562/claro_ai_gpu'),
+      // Boolean only — the token itself never leaves the server process.
+      hfTokenConfigured: !!(process.env.HF_TOKEN || process.env.ZEROGPU_TOKEN || process.env.HUGGING_FACE_HUB_TOKEN),
     },
     modal: {
       configured: !!(process.env.MODAL_RUN_URL),

@@ -184,6 +184,45 @@ async function main() {
     ok('frontend mapping table complete; transport has no generic default prompt');
   }
 
+  // ── 8. worker-boundary error codes map to typed client errors ──
+  // Regression for the hs-decide-1-flash 502: worker errors now return
+  // [CLARO:<code>] strings; the transport must surface the ORIGINAL code
+  // and message (task_not_supported → 422, invalid_input → 400).
+  {
+    const frames = [
+      ['task_not_supported',
+       '[CLARO:task_not_supported] hindsight-ai/hs-decide-1-flash is a ' +
+       'hindsight-ai decision model (text-classification requested). It ' +
+       'returns option probabilities through vLLM\'s System One pooling ' +
+       'endpoint.', 422],
+      ['invalid_input', '[CLARO:invalid_input] The context field is required for question-answering.', 400],
+    ];
+    for (const [code, text, expectedStatus] of frames) {
+      setBackendResponses((u, init) => {
+        if (u.endsWith('/gradio_api/call/v2/generate') && init.method === 'POST') {
+          return { status: 200, json: { event_id: 'evt-err' } };
+        }
+        if (u.endsWith('/gradio_api/call/generate/evt-err') && init.method == null) {
+          return { ok: true, status: 200, body: `event: complete\ndata: [${JSON.stringify(text)}]\n\n` };
+        }
+        return { status: 404, text: 'unexpected' };
+      });
+      let thrown = null;
+      try {
+        await new ZeroGPUBackend(infra).run({
+          model_id: 'hindsight-ai/hs-decide-1-flash', task: 'text-classification',
+          inputs: { prompt: 'x', max_new_tokens: 8 },
+        }, new AbortController().signal, () => {});
+      } catch (e) { thrown = e; }
+      assert(thrown instanceof GpuError, `typed error for ${code}`);
+      assert.strictEqual(thrown.code, code, `original code preserved for ${code}`);
+      assert.strictEqual(thrown.status, expectedStatus, `status for ${code}`);
+      assert(thrown.message.includes('hindsight-ai/hs-decide-1-flash') ||
+             thrown.message.includes('context'), `original message preserved for ${code}`);
+    }
+    ok('worker [CLARO:code] frames map to typed errors with original message');
+  }
+
   console.log(`\nAll task-routing backend tests passed (${passed} checks).`);
 }
 

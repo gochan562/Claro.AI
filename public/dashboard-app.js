@@ -3288,6 +3288,19 @@ print(f"Loaded trained model from {MODEL_DIR}")
       if (!model || typeof model !== 'object' || !model.id) {
         return { eligible: false, reason: 'malformed model entry' };
       }
+      // 0. Public, open access — FAIL CLOSED. The HF API reports `gated`
+      //    (false | "auto" | "manual": a public repo can still require
+      //    approval/auth, e.g. google/embeddinggemma-300m) and `private`.
+      //    Both must be EXPLICITLY false. Missing/unknown access metadata
+      //    is never treated as proof of openness.
+      if (model.private !== false) {
+        return { eligible: false, reason: 'private repository' };
+      }
+      if (model.gated !== false) {
+        const gated = model.gated === undefined || model.gated === null
+          ? 'unknown access status' : `gated (${model.gated} approval required)`;
+        return { eligible: false, reason: gated };
+      }
       // 1. Total parameter count (safetensors metadata from the HF API).
       const total = model.safetensors && typeof model.safetensors === 'object'
         ? model.safetensors.total : undefined;
@@ -3325,9 +3338,23 @@ print(f"Loaded trained model from {MODEL_DIR}")
     }
 
     // Apply eligibility filtering to a fetched page (before rendering).
+    // Gated/private/unverifiable models are excluded with a diagnostic —
+    // never presented as accessible.
     function applyModelFilters(models) {
       const list = Array.isArray(models) ? models : [];
-      return list.filter((m) => hfModelEligibility(m).eligible);
+      const kept = [];
+      const excluded = [];
+      for (const m of list) {
+        const verdict = hfModelEligibility(m);
+        if (verdict.eligible) kept.push(m);
+        else if (excluded.length < 5) excluded.push(`${m && m.id} (${verdict.reason})`);
+      }
+      if (excluded.length) {
+        console.warn('[ModelPicker] excluded %d inaccessible/unverified model(s): %s%s',
+          list.length - kept.length, excluded.join(', '),
+          list.length - kept.length > excluded.length ? ', …' : '');
+      }
+      return kept;
     }
 
     function openModelPicker(cellId) {
@@ -3381,12 +3408,15 @@ print(f"Loaded trained model from {MODEL_DIR}")
       // the server filter cannot express modality/tag rules and lets
       // unknown-parameter models through.
       params.set('num_parameters', 'max:8B');
+      // Server-side gating filter: excludes gated repos (manual AND auto
+      // approval) before pagination, so gated models never enter the list.
+      params.set('gated', 'false');
       // NOTE: passing ANY expand[] switches the API to sparse responses, so
       // every field the cards and the eligibility helper use must be
-      // expanded explicitly (safetensors for params; the rest for the cards
-      // and the modality/task checks).
+      // expanded explicitly — including gated/private, which the fail-closed
+      // accessibility check requires to be explicitly present.
       for (const f of ['safetensors', 'pipeline_tag', 'tags', 'library_name',
-                       'downloads', 'likes', 'lastModified']) {
+                       'downloads', 'likes', 'lastModified', 'gated', 'private']) {
         params.append('expand[]', f);
       }
       if (sort && sort !== 'trending') {
@@ -3437,6 +3467,19 @@ print(f"Loaded trained model from {MODEL_DIR}")
 
     function renderModelList() {
       const modelListDiv = document.getElementById('model-list');
+
+      // Defensive re-filter: every render path (initial load, search,
+      // pagination, cached lists) re-runs eligibility, so a model excluded
+      // by one rule can never reappear through another path or a cache.
+      if (filteredModels.length) {
+        const verified = applyModelFilters(filteredModels);
+        if (verified.length !== filteredModels.length) {
+          console.warn('[ModelPicker] re-render dropped %d model(s) that no longer pass eligibility',
+            filteredModels.length - verified.length);
+          filteredModels = verified;
+          hfModels = verified;
+        }
+      }
 
       if (filteredModels.length === 0) {
         modelListDiv.innerHTML = '<p style="color:#94a3b8;">No text-only models up to 8B parameters matched. ' +

@@ -30,7 +30,8 @@ from backend import (
     load_model,
     run_inference,
     estimate_gpu_duration,
-)
+    run_inference_guarded,
+    classify_scheduler_error,)
 from train_api import train as train_fn, cancel_train as cancel_train_fn, unpack_request as _unpack_request
 
 # Defaults used when the local Claro.AI provider does not pass model_id/task
@@ -251,7 +252,20 @@ def _gpu_infer(prompt, max_new_tokens, task, model_id, gguf_file, revision, temp
             print(f"[CLARO] gpu device={torch.cuda.current_device()} name={torch.cuda.get_device_name(0)}", flush=True)
     except Exception as diag_e:
         print(f"[CLARO] gpu diagnostics unavailable: {diag_e}", flush=True)
-    return run_inference(
+    # Errors raised INSIDE the GPU-decorated function cross the ZeroGPU worker
+    # boundary: spaces/zero re-raises them as opaque gradio.exceptions.Error
+    # objects whose str() is just the exception CLASS name (e.g.
+    # "'ClaroBackendError'") — the original message and code are lost, and
+    # generate()'s handlers never see them. Converting to the structured
+    # [CLARO:<code>] STRING here crosses the boundary as a plain return
+    # value, preserving the typed error for the client. This is not a
+    # success-shaped fallback: the client maps [CLARO:<code>] to a typed
+    # error with the original message.
+    # Error containment lives in the guarded wrapper (see its docstring):
+    # worker-side exceptions become structured [CLARO:<code>] return values
+    # with the original message and code, and full tracebacks go to the
+    # Space runtime logs.
+    return run_inference_guarded(
         model_id=model_id,
         task=task,
         prompt=prompt,
@@ -417,8 +431,18 @@ def generate(prompt, max_new_tokens=100, model_id=None, task=None, gguf_file=Non
         # inference failures such as the EmbeddingGemma HTTP 500.
         traceback.print_exc()
         tb = traceback.format_exc(limit=3)
-        # Check for CUDA OOM in unexpected errors
         err_msg = str(e)
+        # ZeroGPU scheduler/auth failures happen BEFORE inference and are
+        # raised as plain Gradio errors. Classify them into actionable codes
+        # so the client can tell quota/auth problems apart from broken models.
+        scheduler_code = classify_scheduler_error(err_msg)
+        if scheduler_code:
+            if scheduler_code == "zerogpu_quota_exceeded":
+                return (f"[CLARO:zerogpu_quota_exceeded] {err_msg.strip()[:300]} "
+                        "(the Space owner's ZeroGPU quota is exhausted; configure "
+                        "HF_TOKEN on the Space server for authenticated quota)")
+            return f"[CLARO:{scheduler_code}] {err_msg.strip()[:300]}"
+        # Check for CUDA OOM in unexpected errors
         if "CUDA out of memory" in err_msg or "out of memory" in err_msg.lower():
             return f"[CLARO:gpu_oom] GPU out of memory: {err_msg}"
         # Scheduler-side GPU denials (quota exhausted, runs limit, no
@@ -526,6 +550,15 @@ demo_infer = gr.Interface(
         gr.Slider(minimum=0.0, maximum=2.0, value=0.7, step=0.1, label="Temperature"),
         gr.Slider(minimum=0.0, maximum=1.0, value=0.9, step=0.05, label="Top-p"),
         gr.Checkbox(label="do_sample (greedy if unchecked)", value=True),
+        # The three trailing parameters of generate(). These components are
+        # REQUIRED: Gradio's /gradio_api/call/v2/<name> endpoint validates
+        # named key-word arguments against the API schema built from this
+        # component list, and rejects any kwarg without a component
+        # ("TypeError: Parameter 'task_inputs' is not a valid key-word
+        # argument"). Empty values keep them optional for older clients.
+        gr.Textbox(label="Adapter path (optional)", value=""),
+        gr.Textbox(label="Prompt format (auto|chat|raw)", value="auto"),
+        gr.Textbox(label="Task inputs (JSON, optional)", value=""),
     ],
     outputs=gr.Textbox(label="Output"),
     title="Claro.AI GPU — generic backend",

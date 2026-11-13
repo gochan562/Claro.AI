@@ -91,11 +91,39 @@ function throwClaroModelError(code, message) {
   if (code === 'model_runtime' && OPAQUE_WORKER_RUNTIME_ERROR_RE.test(String(message || ''))) {
     throw new GpuError(`ZeroGPU model error: ${GPU_UNAVAILABLE_MESSAGE}`, 'gpu_unavailable', 502);
   }
+  // Scheduler/auth phrases carry their own verdict even when a stale Space
+  // wraps them in a generic code.
+  if (code === 'model_runtime') {
+    const msg = String(message || '').toLowerCase();
+    if (msg.includes('runs limit') || msg.includes('zero gpu quota') ||
+        msg.includes('zerogpu quota')) {
+      throw new GpuError(
+        'ZeroGPU quota exceeded: ' + String(message || '').trim(),
+        'zerogpu_quota_exceeded', 429);
+    }
+    if (msg.includes('authenticate with a hugging face token')) {
+      throw new GpuError(
+        'Hugging Face authentication required for ZeroGPU quota: ' +
+        String(message || '').trim(), 'huggingface_auth_required', 403);
+    }
+    if (msg.includes('is not a valid key-word argument') ||
+        msg.includes('not a valid keyword argument')) {
+      throw new GpuError(
+        'Space API mismatch: the deployed Space does not accept this request ' +
+        'shape (task_inputs may be missing — redeploy the Space). ' +
+        String(message || '').trim(), 'space_api_mismatch', 502);
+    }
+  }
   const status =
     code === 'invalid_model_id'   ? 400 :
     code === 'bad_request'         ? 400 :
+    code === 'invalid_input'       ? 400 :
     code === 'task_model_mismatch'  ? 422 :
     code === 'task_not_exposed'     ? 422 :
+    code === 'task_not_supported'   ? 422 :
+    code === 'space_api_mismatch'   ? 502 :
+    code === 'huggingface_auth_required' ? 403 :
+    code === 'zerogpu_quota_exceeded' ? 429 :
     code === 'model_load_error'     ? 502 :
     code === 'gguf_multiple_files'  ? 422 :
     code === 'gpu_oom'              ? 502 :
@@ -327,6 +355,14 @@ class ZeroGPUBackend {
     const { spaceId, base } = safeReadSpaceResolvedUrl(env);
     this.spaceId = spaceId;
     this.base = base;
+    // Server-side Hugging Face token for ZeroGPU scheduling. Without it,
+    // every visitor shares the Space's ANONYMOUS ZeroGPU quota ("exceeded
+    // your ZeroGPU runs limit. Authenticate with a Hugging Face token").
+    // The token lives ONLY in server env — never sent to the frontend and
+    // never logged. A per-request caller token (Authorization header)
+    // overrides it; the frontend sends none today.
+    this.serverHfToken =
+      env.HF_TOKEN || env.ZEROGPU_TOKEN || env.HUGGING_FACE_HUB_TOKEN || null;
     this.timeoutMs = Number(env.ZEROGPU_TIMEOUT_MS || 120000);
   }
 
@@ -394,7 +430,8 @@ class ZeroGPUBackend {
       body.task_inputs = JSON.stringify(taskInputs);
     }
     const headers = { 'Content-Type': 'application/json' };
-    if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+    const hfToken = authToken || this.serverHfToken;
+    if (hfToken) headers['Authorization'] = `Bearer ${hfToken}`;
     const res = await fetch(url, {
       method: 'POST',
       headers,
@@ -449,7 +486,8 @@ class ZeroGPUBackend {
   async _streamResult(eventId, signal, onLine, authToken) {
     const url = `${this.base}/gradio_api/call/generate/${encodeURIComponent(eventId)}`;
     const headers = {};
-    if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+    const hfToken = authToken || this.serverHfToken;
+    if (hfToken) headers['Authorization'] = `Bearer ${hfToken}`;
     const res = await fetch(url, { signal, headers });
     if (res.status === 404) {
       throw new GpuError('ZeroGPU event was not found (event expired or Space restarted).', 'space_unavailable', 502);

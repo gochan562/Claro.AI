@@ -63,6 +63,8 @@ function textModel(overrides = {}) {
     tags: ['transformers', 'safetensors', 'text-generation'],
     library_name: 'transformers',
     downloads: 1000, likes: 50,
+    // explicitly public + open (fail-closed eligibility requires both)
+    gated: false, private: false,
     safetensors: { total: 7 * B, parameters: { F16: 7 * B } },
   }, overrides);
 }
@@ -165,7 +167,7 @@ async function main() {
       'ordinary text models must not be rejected on name wording');
     // and a model with no tags array at all passes on pipeline+params alone
     const r2 = elig({ id: 'owner/min', pipeline_tag: 'text-generation', tags: undefined,
-      safetensors: { total: 3 * B } });
+      gated: false, private: false, safetensors: { total: 3 * B } });
     assert.strictEqual(r2.eligible, true);
   });
 
@@ -287,6 +289,107 @@ async function main() {
     w5.handleModelDragStart(evt, 'owner/draggable');
     assert(evt.payload && JSON.parse(evt.payload).id === 'owner/draggable',
       'drag payload carries the full model object');
+  });
+
+  // ── 15. gating / accessibility: fail-closed public-only selection ──
+  // Regression: google/embeddinggemma-300m (public repo, gated "manual")
+  // appeared in the selector and produced a 403 GatedRepoError at load time.
+  await test('15. only publicly accessible models are selectable', () => {
+    // public + open → eligible
+    assert.strictEqual(elig(textModel()).eligible, true);
+    // manual gate (the EmbeddingGemma case) → excluded
+    const manual = elig(textModel({ id: 'google/embeddinggemma-300m', gated: 'manual' }));
+    assert.strictEqual(manual.eligible, false);
+    assert.match(manual.reason, /gated/);
+    // auto gate (accept-conditions style) → excluded too
+    const auto = elig(textModel({ gated: 'auto' }));
+    assert.strictEqual(auto.eligible, false);
+    // truthy non-string gate value → excluded
+    assert.strictEqual(elig(textModel({ gated: true })).eligible, false);
+    // unknown/missing gating status → FAIL CLOSED
+    assert.strictEqual(elig(textModel({ gated: undefined })).eligible, false);
+    assert.strictEqual(elig(textModel({ gated: null })).eligible, false);
+    const noGate = elig({ id: 'owner/mystery', pipeline_tag: 'text-generation',
+      tags: [], gated: undefined, private: false, safetensors: { total: 1 * B } });
+    assert.strictEqual(noGate.eligible, false);
+    assert.match(noGate.reason, /unknown access status/);
+    // private repos excluded
+    assert.strictEqual(elig(textModel({ private: true })).eligible, false);
+    // missing private flag → excluded (cannot establish openness)
+    const noPrivate = elig(textModel({ private: undefined }));
+    assert.strictEqual(noPrivate.eligible, false);
+    assert.match(noPrivate.reason, /private/);
+    // task compatibility is independent of access: an OPEN model of a
+    // non-text task is still excluded by the task rule
+    assert.strictEqual(elig(textModel({ pipeline_tag: 'text-to-video' })).eligible, false);
+  });
+
+  await test('16. gating excludes models across task categories and pagination', async () => {
+    const { w: w6 } = makeWindow();
+    const gated = (id) => textModel({ id, gated: 'manual' });
+    // page 1 mixes two task categories; every model in it is gated
+    const page1 = page([
+      gated('owner/gated-gen'),
+      gated('owner/gated-embed'),
+    ], 'CUR-G');
+    // page 2 has one open model of each category
+    const page2 = page([
+      textModel({ id: 'owner/open-gen' }),
+      textModel({ id: 'owner/open-embed', pipeline_tag: 'feature-extraction' }),
+    ], null);
+    const urls = [];
+    w6.fetch = async (url) => {
+      urls.push(String(url));
+      const cursor = /[?&]cursor=([^&]*)/.exec(String(url));
+      const key = cursor ? decodeURIComponent(cursor[1]) : '';
+      const resp = key === 'CUR-G' ? page2 : page1;
+      return { ok: true, status: 200, headers: { get: (n) => resp.headers[n] || null },
+        json: async () => resp.json };
+    };
+    await w6.loadHFModels(true);
+    await w6.loadHFModels(false);
+    const rendered = w6.document.getElementById('model-list').innerHTML;
+    assert(!rendered.includes('gated-gen') && !rendered.includes('gated-embed'),
+      'gated models never render, from either task category or page');
+    assert(rendered.includes('owner/open-gen') && rendered.includes('owner/open-embed'),
+      'open models from both categories render');
+    // server-side gated filter was requested
+    assert(urls[0].includes('gated=false'), `server-side gated filter: ${urls[0]}`);
+    assert(urls[0].includes('expand%5B%5D=gated') && urls[0].includes('expand%5B%5D=private'),
+      'gated/private metadata requested');
+  });
+
+  await test('17. cached/rendered lists cannot bypass the eligibility check', async () => {
+    const { w: w7 } = makeWindow();
+    // the cached list is poisoned with a gated entry at fetch time; the
+    // fetch-time filter drops it AND the render-time defensive re-filter
+    // would drop it again -- the gate is structural, not path-dependent
+    w7.fetch = async () => ({ ok: true, status: 200, headers: { get: () => null },
+      json: async () => [textModel({ id: 'owner/fresh' }),
+                         textModel({ id: 'owner/gated-sneaky', gated: 'manual' })] });
+    await w7.loadHFModels(true);
+    // re-render twice from the cached list (modal reopen path)
+    w7.renderModelList();
+    w7.renderModelList();
+    const rendered = w7.document.getElementById('model-list').innerHTML;
+    assert(rendered.includes('owner/fresh'), 'legit cached model renders');
+    assert(!rendered.includes('owner/gated-sneaky'),
+      'gated entry cannot bypass eligibility from a cached list');
+    // render-time defensive filter is structural
+    const appSrc = fs.readFileSync(path.join(__dirname, '..', 'public', 'dashboard-app.js'), 'utf8');
+    assert(/applyModelFilters\(filteredModels\)/.test(appSrc),
+      'renderModelList must re-run eligibility over the cached list');
+  });
+
+  await test('18. API failures never present unverified models as accessible', async () => {
+    const { w: w8 } = makeWindow();
+    w8.fetch = async () => ({ ok: false, status: 503, json: async () => ({}), headers: { get: () => null } });
+    await w8.loadHFModels(true);
+    const rendered = w8.document.getElementById('model-list').innerHTML;
+    assert(rendered.includes('Failed to load models'), 'error surfaced to the user');
+    assert.strictEqual(w8.document.querySelectorAll('#model-list .model-item').length, 0,
+      'no models rendered from a failed metadata request');
+    assert(!rendered.includes('select-model-btn'), 'nothing selectable');
   });
 
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);

@@ -1763,6 +1763,49 @@ def _apply_dense_projection(result, pooled):
     return x, True
 
 
+# ── Decision models (System One protocol) ────────────────────────────────────
+# hindsight-ai/hs-decide-* models return a probability for every answer
+# option in ONE forward pass via vLLM's pooling runner: a score layer built
+# from LM-head rows of option-code tokens, STEP pooling at the ':' slot
+# tokens, and PoolingParams(task="token_classify"). That machinery does not
+# exist in the Transformers/ZeroGPU stack — AutoModelForCausalLM.generate()
+# cannot reproduce it, and routing such models through ordinary
+# classification or generation would produce wrong results. They are
+# therefore identified explicitly and rejected with an actionable error
+# (serve via the model's vLLM plugin or Hindsight Inference instead).
+
+_DECISION_MODEL_ARCHITECTURES = {"Qwen3_5ForCausalLM"}
+_DECISION_MODEL_TYPES = {"qwen3_5_text"}
+_DECISION_MODEL_ID_MARKERS = ("hs-decide",)
+
+
+def is_decision_model(model_id, config) -> bool:
+    """A hindsight-ai hs-decide-* decision model: identified by its repo
+    family together with its Qwen3.5 causal architecture (never by task
+    metadata alone — the Hub labels these text-classification, which the
+    architecture demonstrably does not implement via a classification
+    head)."""
+    mid = str(model_id or "").lower()
+    archs = {str(a) for a in (getattr(config, "architectures", None) or [])}
+    model_type = str(getattr(config, "model_type", "") or "")
+    family = any(m in mid for m in _DECISION_MODEL_ID_MARKERS)
+    arch = bool(archs & _DECISION_MODEL_ARCHITECTURES) or model_type in _DECISION_MODEL_TYPES
+    return family and arch
+
+
+def _reject_decision_model(model_id, task):
+    raise ClaroBackendError(
+        f"'{model_id}' is a hindsight-ai decision model ({task} requested). "
+        "It returns option probabilities through vLLM's System One pooling "
+        "endpoint (its serving/ plugin), which the Transformers/ZeroGPU "
+        "inference stack cannot reproduce — running it as ordinary text "
+        "classification or generation would produce incorrect results. "
+        "Serve it via vLLM with the model's serving plugin, or via Hindsight "
+        "Inference (https://inference.hindsight.vectorize.io).",
+        code="task_not_supported",
+    )
+
+
 def run_summarization(result, model_id, prompt, task_inputs):
     """Summarization: encoder-decoder models use max_length/min_length as
     summary-length bounds; causal-LM wrappers summarize via an explicit
@@ -1982,6 +2025,53 @@ TASK_HANDLERS = {
     "sentence-similarity": run_sentence_similarity,
 }
 
+# ── ZeroGPU scheduler / auth error classification ────────────────────────────
+# The ZeroGPU scheduler raises plain Gradio errors for quota and auth
+# problems BEFORE inference runs ("exceeded your ZeroGPU runs limit.
+# Authenticate with a Hugging Face token for more quota"). classify them
+# into actionable codes instead of the generic model_runtime.
+
+
+def classify_scheduler_error(message: str) -> Optional[str]:
+    """Map ZeroGPU scheduler/auth failure messages to actionable codes.
+    Returns None when the message is not a scheduler/auth failure."""
+    low = str(message or "").lower()
+    if "runs limit" in low or "zero gpu quota" in low or \
+            "zerogpu quota" in low or "gpu quota exceeded" in low:
+        return "zerogpu_quota_exceeded"
+    if "authenticate with a hugging face token" in low or \
+            "hugging face token" in low and "quota" in low:
+        return "huggingface_auth_required"
+    if "is not a valid key-word argument" in low or \
+            "not a valid keyword argument" in low:
+        return "space_api_mismatch"
+    return None
+
+
+def run_inference_guarded(**kwargs) -> str:
+    """run_inference with worker-boundary error containment.
+
+    Exceptions raised inside the @spaces.GPU-decorated function cross the
+    ZeroGPU worker boundary and come back as opaque gradio.exceptions.Error
+    objects whose str() is only the exception CLASS name (e.g.
+    "'ClaroBackendError'") -- the original message and code are lost, and
+    app.py's handlers never see them. Converting the error to the
+    structured [CLARO:<code>] STRING here crosses the boundary as a plain
+    return value, preserving the typed error for the client. Full
+    tracebacks are printed to the Space runtime logs. This is not a
+    success-shaped fallback: [CLARO:<code>] payloads are mapped to typed
+    error responses by the client transport.
+    """
+    try:
+        return run_inference(**kwargs)
+    except ClaroBackendError as e:
+        traceback.print_exc()
+        return str(e)
+    except Exception as e:
+        traceback.print_exc()
+        return f"[CLARO:model_runtime] unexpected error: {e}\n{traceback.format_exc()}"
+
+
 def run_inference(
     model_id: str,
     task: str,
@@ -2027,6 +2117,11 @@ def run_inference(
                     f"Task '{task}' is not compatible with a Diffusion pipeline.",
                     code="task_model_mismatch",
                 )
+
+            if is_decision_model(model_id, getattr(result.model, "config", None)):
+                # System One decision models: vLLM-pooling-only protocol —
+                # never routed through classification/generation handlers.
+                _reject_decision_model(model_id, task)
 
             handler = TASK_HANDLERS.get(task)
             if handler is not None:

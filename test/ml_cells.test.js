@@ -173,8 +173,16 @@ async function main() {
     newNotebook(w);
     w.addCell('code');
     w.addCell('markdown');
-    w.addCell('training');
+    // addCell('training') is refused while fine-tuning is suspended
+    // (TRAINING_SUSPENDED); the legacy-type check uses a training cell as an
+    // EXISTING notebook would have it — the same shape loadAllNotebooks
+    // migrates on restore.
     const nb = w.getActiveNotebook();
+    nb.cells.push({ id: nb.nextCellId++, type: 'training', content: '', output: '',
+      status: 'idle', outputFormat: 'text', modelInfo: null,
+      training: { model_id: 'distilbert-base-uncased', dataset_id: 'stanfordnlp/imdb',
+        task_type: 'text-classification', epochs: 2, batch_size: 8, learning_rate: 0.00002,
+        validation_split: 10, job_id: null, status: 'idle', progress: {}, metrics: [], logs: [] } });
     assert(nb.cells[1].ml === undefined && nb.cells[2].ml === undefined);
     assert(nb.cells[3].training && nb.cells[3].training.task_type === 'text-classification');
   });

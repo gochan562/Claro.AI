@@ -786,7 +786,7 @@ function mlChart(canvasId, cfg) {
   const el = document.getElementById(canvasId);
   if (!el) return;
   if (typeof Chart === 'undefined') {
-    el.outerHTML = `<div class="ml-hint">Charts need Chart.js (already used by Training Cells).</div>`;
+    el.outerHTML = `<div class="ml-hint">Charts need Chart.js.</div>`;
     return;
   }
   try {
@@ -1589,7 +1589,7 @@ async function mlRefreshExperiments() {
   const panel = mlEnsurePanel();
   panel.innerHTML = `<div class="ml-panel-head"><strong>Experiments</strong>` +
     `<button class="cell-btn" onclick="mlCloseExperiments()">Close</button></div>` +
-    `<div class="ml-hint">Classical sklearn runs on this machine (CPU). HF Training Cells are separate.</div>` +
+    `<div class="ml-hint">Classical sklearn runs on this machine (CPU).</div>` +
     `<div id="ml-exp-list"><em>Loading…</em></div><div id="ml-exp-detail"></div>`;
   try {
     const data = await mlApi('/api/ml/experiments');

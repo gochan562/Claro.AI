@@ -3,7 +3,7 @@
 # Claro.AI
 
 
-A browser-based AI workbench for discovering Hugging Face models, building notebooks, running inference, and fine-tuning models without wiring together every piece of ML infrastructure by hand.
+A browser-based AI workbench for discovering Hugging Face models, building notebooks, running inference, and running ML experiments without wiring together every piece of ML infrastructure by hand.
 
 </div>
 
@@ -11,9 +11,9 @@ A browser-based AI workbench for discovering Hugging Face models, building noteb
 
 Claro.AI turns AI experimentation into a visual notebook workflow.
 
-Instead of jumping between model cards, Python scripts, training configs, GPU services, and inference code, Claro.AI brings the main pieces into one browser workspace.
+Instead of jumping between model cards, Python scripts, GPU services, and inference code, Claro.AI brings the main pieces into one browser workspace.
 
-Discover → Configure → Run → Train → Experiment
+Discover → Configure → Run → Experiment
 
 The project is designed around a simple idea:
 
@@ -33,7 +33,6 @@ Make the path from an AI idea to a working experiment shorter and easier to unde
 
 - Parameter Cells : configure inference parameters visually
 
-- Training Cells : configure and monitor fine-tuning jobs
 
 Notebook workspaces are persisted locally in the browser.
 
@@ -65,38 +64,7 @@ This allows different Hugging Face model families to be handled through the same
 
 ### 🏋️ Fine-Tuning
 
-**The Training Cell provides a visual interface for configuring model training.**
-
-Current training options include:
-
-- model and dataset selection
-
-- epochs
-
-- batch size
-
-- learning rate
-
-- validation split
-
-- sample limits
-
-- training-step limits
-
-- training-time limits
-
-- full fine-tuning
-
-- LoRA fine-tuning
-
-Supported task types currently include:
-
-- text-generation
-- text-classification
-- image-classification
-- token-classification
-
-Training jobs expose live progress and metrics such as loss, epoch, step, learning rate, elapsed time, and GPU status.
+Fine-tuning (Training Cells) is **temporarily unavailable** in the current product. The underlying training components remain in the repository for future restoration, but the user-facing interface for configuring and starting fine-tuning jobs has been suspended.
 
 ⚡ Local + Remote Execution
 
@@ -122,7 +90,7 @@ Claro.AI is split into several cooperating layers:
 
 Detailed Architecture ↓
 
-The detailed diagram shows the current relationships between the browser workbench, gateway/composition layer, training and artifact system, Python runtimes, Hugging Face, and remote GPU providers.
+The detailed diagram shows the current relationships between the browser workbench, gateway/composition layer, artifact and job system, Python runtimes, Hugging Face, and remote GPU providers.
 
 <p align="center">
   <img src="docs/diagram-2.png" alt="Claro.AI detailed architecture" width="900">
@@ -256,9 +224,9 @@ Do **not** expose unrestricted code execution to untrusted users without additio
 
 Claro.AI is an evolving prototype.
 
-The core workflow is implemented across model discovery, notebook composition, inference, training orchestration, and remote GPU execution, while some product areas remain under development.
+The core workflow is implemented across model discovery, notebook composition, inference, ML experimentation, and remote GPU execution, while some product areas remain under development. Fine-tuning is temporarily suspended.
 
-Current development is focused on improving model compatibility, training workflows, infrastructure abstraction, and the overall notebook experience.
+Current development is focused on improving model compatibility, the ML experimentation workflow, infrastructure abstraction, and the overall notebook experience.
 
 ### 🗺️ Roadmap
 
@@ -268,7 +236,6 @@ Potential future work includes:
 
 - [ ] improved model compatibility detection
 
-- [ ] more training presets
 
 - [ ] stronger artifact management
 
@@ -299,8 +266,6 @@ Install dependencies
 Write inference code
     ↓
 Find compute
-    ↓
-Configure training
     ↓
 Run and monitor experiments
 

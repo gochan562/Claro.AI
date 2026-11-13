@@ -108,9 +108,18 @@ async function run() {
   }
 
   // ── 4. UI renders backend failure with zero prior logs (jsdom) ──
+  // Training Cells are TEMPORARILY suspended (TRAINING_SUSPENDED in
+  // dashboard-app.js): the config form is not rendered and no SSE stream is
+  // ever opened, so the assertions below are split:
+  //   (a) the SUSPENSION contract is always asserted — restored cells show
+  //       the unavailable notice, open no EventSource, and do not crash;
+  //   (b) the original visibility assertions automatically re-engage as soon
+  //       as the suspension flag is removed, restoring full coverage.
   {
     const { JSDOM } = require('jsdom');
     const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'dashboard.html'), 'utf8');
+    const appSrc = fs.readFileSync(path.join(__dirname, '..', 'public', 'dashboard-app.js'), 'utf8');
+    const suspended = /const TRAINING_SUSPENDED = true;/.test(appSrc);
     const dom = new JSDOM(html, { url: 'http://localhost:5000/dashboard.html', runScripts: 'outside-only' });
     const { window } = dom;
     const instances = [];
@@ -123,7 +132,7 @@ async function run() {
       instances.push(this);
     };
     window.eval(fs.readFileSync(path.join(__dirname, '..', 'public', 'training_ui.js'), 'utf8'));
-    window.eval(fs.readFileSync(path.join(__dirname, '..', 'public', 'dashboard-app.js'), 'utf8'));
+    window.eval(appSrc);
     const registry = { notebooks: { 1: { id: 1, name: 'nb', cells: [
       { id: 7, type: 'training', training: {
         model_preset: 'distilbert-base', dataset_preset: 'imdb',
@@ -139,22 +148,38 @@ async function run() {
     window.localStorage.setItem('claro-notebooks-registry', JSON.stringify(registry));
     window.loadAllNotebooks();
     window.renderNotebookEditor();
+    // data preservation: the mid-job cell survives restore untouched
+    const nbAfter = JSON.parse(window.localStorage.getItem('claro-notebooks-registry')).notebooks[1];
+    const cellAfter = nbAfter.cells.find((c) => c.id === 7);
+    assert.ok(cellAfter && cellAfter.type === 'training' && cellAfter.training.job_id === 'train_vis1',
+      'the suspended cell and its job/config data must be preserved');
     window.attachTrainingSSE(7, 'train_vis1');
-    assert.strictEqual(instances.length, 1, 'EventSource constructed');
-    const es = instances[0];
-    const fire = (type, obj) => {
-      for (const fn of es.handlers[type] || []) fn({ data: JSON.stringify(obj) });
-    };
-    // Backend fails fast with NO prior log frames — the exact silent case.
-    fire('done', { status: 'failed', error: 'training_error', message: 'ZeroGPU call failed (HTTP 500)' });
-    const errBox = window.document.getElementById('tr-7-errorbox');
-    assert.ok(errBox && errBox.style.display !== 'none', 'error box must be visible on backend failure');
-    assert.ok(errBox.innerHTML.includes('training_error'), 'error box names the failure');
-    const logsEl = window.document.getElementById('tr-7-logs');
-    assert.ok(logsEl && logsEl.style.display !== 'none', 'log box must be unhidden');
-    assert.ok(logsEl.textContent.includes('Training failed'), `reason line rendered, got: ${logsEl.textContent.slice(0, 120)}`);
-    assert.ok(logsEl.textContent.includes('HTTP 500'), 'backend message preserved');
-    console.log('✓ 4. failed-with-no-logs renders error box + reason line');
+    if (suspended) {
+      // (a) suspension contract: no stream, notice rendered, nothing crashed
+      assert.strictEqual(instances.length, 0,
+        'while suspended, attachTrainingSSE must not open an EventSource');
+      const cellHtml = window.document.getElementById('notebook-cells').innerHTML;
+      assert.ok(cellHtml.includes('temporarily unavailable'),
+        'the suspended cell must show the unavailability notice');
+      console.log('✓ 4. suspended: restored mid-job cell shows notice, opens no stream, keeps its data');
+    } else {
+      // (b) original assertions — re-engage automatically on restoration
+      assert.strictEqual(instances.length, 1, 'EventSource constructed');
+      const es = instances[0];
+      const fire = (type, obj) => {
+        for (const fn of es.handlers[type] || []) fn({ data: JSON.stringify(obj) });
+      };
+      // Backend fails fast with NO prior log frames — the exact silent case.
+      fire('done', { status: 'failed', error: 'training_error', message: 'ZeroGPU call failed (HTTP 500)' });
+      const errBox = window.document.getElementById('tr-7-errorbox');
+      assert.ok(errBox && errBox.style.display !== 'none', 'error box must be visible on backend failure');
+      assert.ok(errBox.innerHTML.includes('training_error'), 'error box names the failure');
+      const logsEl = window.document.getElementById('tr-7-logs');
+      assert.ok(logsEl && logsEl.style.display !== 'none', 'log box must be unhidden');
+      assert.ok(logsEl.textContent.includes('Training failed'), `reason line rendered, got: ${logsEl.textContent.slice(0, 120)}`);
+      assert.ok(logsEl.textContent.includes('HTTP 500'), 'backend message preserved');
+      console.log('✓ 4. failed-with-no-logs renders error box + reason line');
+    }
   }
 
   console.log('\nAll train error visibility tests passed.');

@@ -10,6 +10,15 @@ let notebookRegistry = {
       currentModelCellId: null
     };
 
+    // ── Fine-tuning suspension ────────────────────────────────────────────
+    // Training Cells are TEMPORARILY removed from the product surface: the
+    // cell picker no longer offers them, no job can be started, and existing
+    // cells render a notice while their configuration data is preserved
+    // untouched. Flip this flag to false to restore the feature — the
+    // TrainingUI module, cell rendering, job lifecycle, and backend routes
+    // are all still in place.
+    const TRAINING_SUSPENDED = true;
+
     // GPU provider config populated from /api/gpu-config.  When provider is
     // "zerogpu" the dashboard sends structured { model_id, task, inputs } to
     // POST /api/zerogpu-run (the Space loads+runs the model); for "modal" it
@@ -315,6 +324,10 @@ let notebookRegistry = {
     function addCell(type) {
       const notebook = getActiveNotebook();
       if (!notebook) return;
+      if (TRAINING_SUSPENDED && type === 'training') {
+        console.warn('[Training] Fine-tuning is temporarily unavailable — Training Cell not created.');
+        return;
+      }
       const cell = buildCell(type);
       if (!cell) return;
       notebook.cells.push(cell);
@@ -472,8 +485,6 @@ let notebookRegistry = {
             <div class="add-cell-menu-sep"></div>
             <div class="add-cell-menu-item" onclick="addCell('model');closeAddCellMenu()"><span class="menu-icon">🤖</span><div><div>Model Cell</div><div class="menu-desc">Load a Hugging Face model</div></div></div>
             <div class="add-cell-menu-item" onclick="addCell('parameter');closeAddCellMenu()"><span class="menu-icon">🎛️</span><div><div>Parameter Cell</div><div class="menu-desc">Sliders for model config</div></div></div>
-            <div class="add-cell-menu-sep"></div>
-            <div class="add-cell-menu-item" onclick="addCell('training');closeAddCellMenu()"><span class="menu-icon">🏋️</span><div><div>Training Cell</div><div class="menu-desc">Fine-tune a model on a dataset</div></div></div>
             <div class="add-cell-menu-sep"></div>
             <div class="add-cell-menu-item" onclick="addCell('dataset');closeAddCellMenu()"><span class="menu-icon">🗂️</span><div><div>Dataset Cell</div><div class="menu-desc">Tabular data for ML experiments</div></div></div>
             <div class="add-cell-menu-item" onclick="addCell('split');closeAddCellMenu()"><span class="menu-icon">✂️</span><div><div>Split Cell</div><div class="menu-desc">Train/validation/test split</div></div></div>
@@ -2355,6 +2366,10 @@ print(f"Loaded trained model from {MODEL_DIR}")
     }
 
     async function startTrainingCell(cellId) {
+      if (TRAINING_SUSPENDED) {
+        console.warn('[Training] Fine-tuning is temporarily unavailable — job not started.');
+        return;
+      }
       const nb = getActiveNotebook();
       const cell = nb?.cells.find(c => c.id === cellId);
       if (!cell || !cell.training) return;
@@ -2483,6 +2498,7 @@ print(f"Loaded trained model from {MODEL_DIR}")
     }
 
     async function stopTrainingCell(cellId, opts = {}) {
+      if (TRAINING_SUSPENDED) return; // no jobs can exist while suspended
       const isUserInitiated = opts.userInitiated !== false; // default true when called from button
       const caller = opts.caller || (isUserInitiated ? 'user-click Stop button' : 'automatic');
       const nb = getActiveNotebook();
@@ -2525,6 +2541,7 @@ print(f"Loaded trained model from {MODEL_DIR}")
     }
 
     function attachTrainingSSE(cellId, jobId) {
+      if (TRAINING_SUSPENDED) return; // no stream/polling for suspended feature
       // close old
       if (trainingStreams[cellId]) {
         try { trainingStreams[cellId].close(); } catch(_) {}
@@ -2925,7 +2942,17 @@ print(f"Loaded trained model from {MODEL_DIR}")
 
       const header = document.createElement('div');
       header.className = 'cell-header';
-      if (cell.type === 'training') {
+      if (cell.type === 'training' && TRAINING_SUSPENDED) {
+        // Suspended feature: existing cells stay in the notebook (their
+        // cell.training config is preserved for restoration) but expose no
+        // controls and run nothing.
+        header.innerHTML = `
+          <span class="cell-type">${typeLabel}</span>
+          <div class="cell-controls">
+            <button class="cell-btn delete" onclick="deleteCell(${cell.id})">Delete</button>
+          </div>
+        `;
+      } else if (cell.type === 'training') {
         const isRunning = cell.training && ['queued','loading','training','evaluating'].includes(cell.training.status);
         header.innerHTML = `
           <span class="cell-type">${typeLabel}</span>
@@ -2950,6 +2977,14 @@ print(f"Loaded trained model from {MODEL_DIR}")
 
       if (cell.type === 'parameter') {
         div.appendChild(buildParamCellBody(cell));
+      } else if (cell.type === 'training' && TRAINING_SUSPENDED) {
+        const notice = document.createElement('div');
+        notice.className = 'cell-input';
+        notice.innerHTML =
+          '<p style="color:#94a3b8;margin:8px 0;">🏋️ Fine-tuning is temporarily unavailable. ' +
+          'This cell\'s configuration has been preserved and will be available again ' +
+          'when the feature returns.</p>';
+        div.appendChild(notice);
       } else if (cell.type === 'training') {
         div.appendChild(buildTrainingCellBody(cell));
       } else {
@@ -3000,6 +3035,7 @@ print(f"Loaded trained model from {MODEL_DIR}")
         return mlRunCell(cellId);
       }
       if (cell.type === 'training') {
+        if (TRAINING_SUSPENDED) return; // feature suspended — never start a job
         return startTrainingCell(cellId);
       }
       if (cell.status === 'running') return;
